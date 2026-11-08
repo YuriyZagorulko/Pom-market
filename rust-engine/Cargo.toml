@@ -1,0 +1,26 @@
+[package]
+name = "pommarket-engine"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Clean-room Multi-Tenant Polymarket Collector, Event Processor, O(1) Account Router, and Execution Hot-Path Engine"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rust_decimal = { version = "1.36", features = ["maths", "serde-with-str"] }
+rust_decimal_macros = "1.36"
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6.1"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+aes-gcm = "0.10"
+hkdf = "0.12"

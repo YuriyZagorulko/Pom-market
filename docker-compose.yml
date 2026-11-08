@@ -1,0 +1,126 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pommarket-postgres
+    environment:
+      POSTGRES_USER: pommarket
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pommarket_dev_pass}
+      POSTGRES_DB: pommarket
+    ports:
+      - "${POSTGRES_PORT:-5440}:5432"
+    volumes:
+      - pommarket_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pommarket -d pommarket"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: pommarket-redis
+    ports:
+      - "${REDIS_PORT:-6390}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: pommarket-nats
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "${NATS_PORT:-4225}:4222"
+      - "${NATS_MONITOR_PORT:-8225}:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: pommarket-api
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL: postgresql+psycopg2://pommarket:${POSTGRES_PASSWORD:-pommarket_dev_pass}@postgres:5432/pommarket
+      REDIS_URL: redis://redis:6379/0
+      NATS_URL: nats://nats:4222
+      NATS_MONITOR_URL: http://nats:8222
+      RUST_ENGINE_INTERNAL_URL: http://rust-engine:8080
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:4319,http://127.0.0.1:4319}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-jwt-secret-key-replace-in-production-32bytes!}
+      MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:-dev-only-master-encryption-key-32-bytes-minimum-seed!}
+      DEFAULT_OPERATING_MODE: MONITORING
+    ports:
+      - "${BACKEND_PORT:-4320}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  rust-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust-engine
+    container_name: pommarket-rust-engine
+    environment:
+      RUST_LOG: info
+      RUST_ENGINE_BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://pommarket:${POSTGRES_PASSWORD:-pommarket_dev_pass}@postgres:5432/pommarket
+      REDIS_URL: redis://redis:6379/0
+      NATS_URL: nats://nats:4222
+    ports:
+      - "${RUST_ENGINE_PORT:-4321}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  web-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: pommarket-dashboard
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:${BACKEND_PORT:-4320}
+      NEXT_PUBLIC_WS_BASE_URL: ws://localhost:${BACKEND_PORT:-4320}
+      INTERNAL_API_BASE_URL: http://api-backend:8000
+    ports:
+      - "${FRONTEND_PORT:-4319}:3000"
+    depends_on:
+      - api-backend
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: pommarket-prometheus
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${PROMETHEUS_PORT:-9095}:9090"
+    depends_on:
+      - api-backend
+      - rust-engine
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: pommarket-grafana
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${GRAFANA_PORT:-3015}:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  pommarket_pgdata:

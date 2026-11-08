@@ -1,0 +1,8 @@
+.env
+*.dump
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.next/
+target/
