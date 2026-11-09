@@ -1,108 +1,88 @@
-# Pom-Market: Multi-Tenant Polymarket Copy-Trading Platform
+# Pom-Market
 
-A self-hosted, production-oriented, multi-tenant Polymarket copy-trading platform supporting multiple registered users, multiple independent Polymarket trading accounts per user (`EOA`, `POLY_PROXY`, `POLY_GNOSIS_SAFE`, `POLY_1271`), 2,000+ monitored source trader wallets, 100,000+ account-to-source-trader mappings, source-attributed virtual positions, and three safety operating modes (`MONITORING` default, `PAPER_TRADING`, and `LIVE_TRADING`).
+Self-hosted, multi-user Polymarket copy-trading platform.
 
----
+- Rust API and worker (`pom-api`, `pom-worker`) on port 4321
+- Admin console at `http://localhost:4322`
+- User dashboard at `http://localhost:4323`
+- PostgreSQL is the source of truth, with row-level security for the application roles
 
-## 1. Architecture Overview
+Garnet (`github.com/AndreySchurko/garnet-polymarket`) is licensed under BUSL-1.1. Its additional use grant does not cover a multi-user product that trades other people's funds. This repository does not copy Garnet source. The engine follows the same safety ideas — one dedup key, FAK-style execution, an intent row committed before a live submit, and no blind retry of an unknown order — implemented independently against the official Polymarket CLOB V2 Rust client and public APIs.
 
-| Service / Component | Responsibility | Location |
-|---|---|---|
-| **API Backend (FastAPI)** | Multi-user Auth (Argon2id + JWT + TOTP 2FA), RBAC (`USER`, `SUPER_ADMIN`), Tenant Isolation, Account & Source Trader CRUD, Dashboard & Admin REST + WebSocket APIs | `backend/app/main.py` |
-| **Credential Vault** | AES-256-GCM authenticated encryption at rest with HKDF-SHA256 per-tenant/per-account AAD binding and key rotation | `backend/app/security.py` |
-| **Market Data Collector** | Normalizes public trades from Polymarket RTDS WebSocket (`wss://ws-live-data.polymarket.com`), Data API (`/v2/activity`), and Polygon CTF Exchange V2 `OrderFilled` logs | `backend/app/services/collector_service.py`, `rust-engine/src/lib.rs` |
-| **Event Processor & Account Router** | Deduplicates on `(tx_hash, source_wallet, token_id, side)`, prevents retroactive copying of historical trades, and routes in $O(1)$ across 100,000+ mappings | `backend/app/services/event_processor.py`, `backend/app/services/account_router.py` |
-| **Copy-Trading Engine** | Implements 4 sizing modes (`FIXED_AMOUNT`, `FIXED_PERCENTAGE`, `PROPORTIONAL_BALANCE`, `MAX_ORDER_SIZE`), source-attributed `virtual_positions`, book-walk simulation, and 10+ risk gates | `backend/app/services/copy_engine.py` |
-| **Live Execution Workers** | Per-account isolated signing (EIP-712 CTF Exchange V2 + L2 URL-safe Base64 HMAC), bounded queues, per-account & global rate limiters, circuit breakers, and ambiguous HTTP outcome protection | `backend/app/services/live_execution_worker.py`, `backend/app/services/polymarket_signer.py` |
-| **Reconciliation Service** | Resolves `AMBIGUOUS` / timed-out orders against Polymarket before any retry, recovers unfinished jobs after restarts, and detects position divergences | `backend/app/services/reconciliation_service.py` |
-| **Web Dashboard (Next.js + TS)** | User Dashboard, Trading Account Page, Source Trader Page, and `SUPER_ADMIN` Operations Console | `frontend/src/app/` |
-
-Full Phase 1 audit findings (including the BUSL-1.1 license analysis of `garnet-polymarket`) are documented in [`docs/PHASE1_AUDIT_AND_ARCHITECTURE.md`](docs/PHASE1_AUDIT_AND_ARCHITECTURE.md), and the Phase 8 independent security & reliability audit is in [`docs/PHASE8_SECURITY_AND_RELIABILITY_AUDIT.md`](docs/PHASE8_SECURITY_AND_RELIABILITY_AUDIT.md).
-
----
-
-## 2. Local Development
-
-To prevent port collisions with other locally running projects, all host-facing development ports use dedicated non-standard assignments while internal Docker container-to-container ports remain standard.
-
-### 2.1 Development Port Allocation Table
-
-| Service | Environment Variable | Host Port | Container Port | Internal Service DNS |
-|---|---|---:|---:|---|
-| **Next.js Frontend** | `FRONTEND_PORT` | `4319` | `3000` | `web-dashboard:3000` |
-| **FastAPI Backend** | `BACKEND_PORT` | `4320` | `8000` | `api-backend:8000` |
-| **Rust Engine** | `RUST_ENGINE_PORT` | `4321` | `8080` | `rust-engine:8080` |
-| **PostgreSQL 16** | `POSTGRES_PORT` | `5440` | `5432` | `postgres:5432` |
-| **Redis 7** | `REDIS_PORT` | `6390` | `6379` | `redis:6379` |
-| **NATS Client** | `NATS_PORT` | `4225` | `4222` | `nats:4222` |
-| **NATS Monitoring** | `NATS_MONITOR_PORT` | `8225` | `8222` | `nats:8222` |
-| **Prometheus** | `PROMETHEUS_PORT` | `9095` | `9090` | `prometheus:9090` |
-| **Grafana** | `GRAFANA_PORT` | `3015` | `3000` | `grafana:3000` |
-
-### 2.2 Local Development Service URLs
-
-- **Web Dashboard (Frontend)**: `http://localhost:4319`
-- **Backend REST API**: `http://localhost:4320`
-- **Backend Swagger / OpenAPI Docs**: `http://localhost:4320/docs`
-- **Backend Real-Time WebSocket**: `ws://localhost:4320/ws/activity`
-- **Rust Engine Health / Metrics**: `http://localhost:4321/health` and `http://localhost:4321/metrics`
-- **Prometheus UI**: `http://localhost:9095`
-- **Grafana UI**: `http://localhost:3015`
-- **NATS Monitoring HTTP**: `http://localhost:8225/varz`
-- **PostgreSQL Host Connection**: `postgresql://pommarket:pommarket_dev_pass@localhost:5440/pommarket`
-- **Redis Host Connection**: `redis://localhost:6390/0`
-
-### 2.3 Environment Setup
+## Start
 
 ```bash
 cp .env.example .env
-# Optional: customize JWT_SECRET_KEY and MASTER_ENCRYPTION_KEY in .env
-```
+./scripts/generate-secrets.sh
+# paste the generated values into .env and set BOOTSTRAP_ADMIN_EMAIL
 
-### 2.4 Startup Instructions
-
-#### Option A: Start Full Stack with Docker Compose
-```bash
 docker compose up -d --build
 ```
 
-#### Option B: Run Infrastructure in Docker + Backend/Frontend Locally on Host
+### Docker development (hot reload)
+
+Production images bake a `next build` output, so UI changes require a rebuild (`docker compose up -d --build user`). For day-to-day work, use the development overlay:
+
 ```bash
-# 1. Start PostgreSQL (5440), Redis (6390), and NATS (4225/8225)
-docker compose up -d postgres redis nats
-
-# 2. Apply Alembic migrations against localhost:5440
-alembic upgrade head
-
-# 3. Start FastAPI Backend on port 4320
-uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 4320
-
-# 4. Start Next.js Frontend on port 4319
-cd frontend && npm install && PORT=4319 npm run dev
+./scripts/docker-dev.sh up --build
+# or: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-### 2.5 Running the Automated Test Suite
+This keeps the same Postgres volume and ports, runs Next.js in dev mode (Fast Refresh) for admin and user, and runs `cargo watch` for the API and worker. Stop with `./scripts/docker-dev.sh down` (omit `-v` so `postgres-data` is preserved).
+
+On an empty database the API applies `backend/migrations/0001_init.sql`, creates login passwords for `pommarket_app` and `pommarket_worker`, and inserts the bootstrap administrator if none exists.
+
+Then:
+
+1. Open `http://localhost:4322` and sign in as the bootstrap admin.
+2. Create a user. Copy the one-time setup URL.
+3. Open that URL on `http://localhost:4323`, set a password, and sign in.
+4. Add a Polymarket account. It starts in monitoring.
+5. Add source wallets and a strategy per account. Strategies start disabled.
+6. Switch an account to paper trading only after you set paper cash and risk limits.
+7. Leave `CONFIRM_LIVE_TRADING=false` until you have checked credentials, balance, and risk and you intend to send real orders.
+
+## Local processes without Docker
+
 ```bash
-pytest -v
+# Postgres must already be running and the URLs in .env must point at it.
+cargo run --manifest-path backend/Cargo.toml --bin pom-api
+cargo run --manifest-path backend/Cargo.toml --bin pom-worker
+pnpm install
+pnpm dev:admin
+pnpm dev:user
 ```
 
-### 2.6 Shutdown Instructions
-```bash
-# Stop containers while preserving PostgreSQL volume data
-docker compose down
+## Checks
 
-# Stop containers and remove volumes (clean reset)
-docker compose down -v
+```bash
+cargo test --manifest-path backend/Cargo.toml --lib
+./scripts/test-integration.sh
+pnpm --filter @pom/admin build
+pnpm --filter @pom/user build
 ```
 
----
+## Encryption rotation
 
-## 3. Backup and Point-in-Time Recovery
+1. Put the current `ENCRYPTION_MASTER_KEY` into `ENCRYPTION_MASTER_KEY_PREVIOUS`.
+2. Put its id into `ENCRYPTION_KEY_ID_PREVIOUS`.
+3. Generate a new master key and set `ENCRYPTION_KEY_ID` to a new id.
+4. Run `pom-api --rotate-keys` before serving traffic with the new key alone.
 
-Use `deploy/scripts/backup_and_restore.sh` (defaults to `POSTGRES_PORT=5440`):
-```bash
-chmod +x deploy/scripts/backup_and_restore.sh
-./deploy/scripts/backup_and_restore.sh backup pommarket_snapshot.dump
-./deploy/scripts/backup_and_restore.sh restore pommarket_snapshot.dump
-```
-After any database restore or ungraceful restart, run the Reconciliation Service before re-enabling `LIVE_TRADING` so all `AMBIGUOUS` or in-flight orders are reconciled with Polymarket.
+Private keys are encrypted with AES-256-GCM. The additional authenticated data binds the ciphertext to the user and the trading account. API responses never include the key.
+
+## Polymarket connectivity
+
+`https://clob.polymarket.com` currently answers `GET /version` with `2`. The name `clob-v2.polymarket.com` has no public DNS record, so the default host is `clob.polymarket.com`. Data API v1 paths return HTTP 410; the worker uses `/v2/activity`, `/v2/trades`, `/v2/positions`, and `/v2/value`.
+
+If the host resolver returns `NOERROR` with an empty answer for these names, glibc reports “no address”. That was the failure on the development machine: systemd-resolved was using `192.168.43.205`, while `1.1.1.1` returned the Cloudflare addresses. Docker services are configured with `1.1.1.1` and `8.8.8.8` for that reason. The application does not invent a successful response when DNS fails.
+
+An order left in `unknown` stays `unknown` until an exchange status is known. A timeout is not treated as `failed`, and the order is not sent again.
+
+## Limits that are intentional
+
+- Invitations are shown once in the admin console. There is no mail transport.
+- Polygon log ingestion is off unless `POLYGON_LOGS_ENABLED=true`. The decoder understands the standard CTF `OrderFilled` event (collateral asset id 0) and ignores logs it cannot decode.
+- Live orders are refused unless the account completed the confirmation phrase, the server has `CONFIRM_LIVE_TRADING=true`, and the global kill switch is off.
+- A timed-out live submit is marked `unknown` and then `failed` after reconciliation. It is not sent again automatically.
+- Taker fees are recorded as unknown when Polymarket does not return a fee schedule and `TAKER_FEE_RATE=0`.

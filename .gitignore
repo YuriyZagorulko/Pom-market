@@ -1,8 +1,9 @@
 .env
+backups/
 *.dump
-__pycache__/
-*.py[cod]
-.pytest_cache/
+target/
 node_modules/
 .next/
-target/
+dist/
+.pnpm-store/
+*.log

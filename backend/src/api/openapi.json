@@ -1,0 +1,27 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Pom-Market API",
+    "version": "0.1.0",
+    "description": "Multi-tenant Polymarket copy-trading API. Trading secrets are never returned."
+  },
+  "paths": {
+    "/api/v1/auth/login": {"post": {"summary": "Login"}},
+    "/api/v1/auth/refresh": {"post": {"summary": "Rotate refresh session"}},
+    "/api/v1/auth/logout": {"post": {"summary": "Revoke session"}},
+    "/api/v1/auth/me": {"get": {"summary": "Current user"}},
+    "/api/v1/auth/password/setup": {"post": {"summary": "Accept invitation or reset token"}},
+    "/api/v1/auth/password/change": {"post": {"summary": "Change password"}},
+    "/api/v1/admin/users": {"get": {"summary": "List users"}, "post": {"summary": "Create invited user"}},
+    "/api/v1/dashboard": {"get": {"summary": "User dashboard"}},
+    "/api/v1/accounts": {"get": {"summary": "List accounts"}, "post": {"summary": "Create account"}},
+    "/api/v1/source-traders": {"get": {"summary": "List source traders"}, "post": {"summary": "Add source wallet"}},
+    "/api/v1/strategies": {"get": {"summary": "List strategies"}, "post": {"summary": "Create disabled strategy"}},
+    "/api/v1/source-trades": {"get": {"summary": "Detected source trades"}},
+    "/api/v1/decisions": {"get": {"summary": "Copy decisions"}},
+    "/api/v1/orders": {"get": {"summary": "Orders"}},
+    "/api/v1/fills": {"get": {"summary": "Fills"}},
+    "/api/v1/positions": {"get": {"summary": "Open positions"}},
+    "/api/v1/trades/{id}": {"get": {"summary": "Trade detail timeline"}}
+  }
+}

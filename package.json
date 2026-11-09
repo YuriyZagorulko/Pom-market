@@ -1,0 +1,10 @@
+{
+  "name": "pom-market",
+  "private": true,
+  "scripts": {
+    "dev:admin": "pnpm --filter @pom/admin dev",
+    "dev:user": "pnpm --filter @pom/user dev",
+    "build:admin": "pnpm --filter @pom/admin build",
+    "build:user": "pnpm --filter @pom/user build"
+  }
+}

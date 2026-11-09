@@ -1,0 +1,50 @@
+:root {
+  color-scheme: light;
+  --bg: #f3efe6;
+  --ink: #1d1a16;
+  --muted: #6d645b;
+  --line: #ddd4c6;
+  --card: #fffdf8;
+  --accent: #9a4318;
+  --good: #1f7a4d;
+  --bad: #9d2c2c;
+  --warn: #8a5a12;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 "Segoe UI", sans-serif; }
+a { color: inherit; }
+button, input, select { font: inherit; }
+.shell { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+nav { padding: 28px 18px; border-right: 1px solid var(--line); background: #ebe4d6; }
+nav strong { display: block; font-family: Georgia, serif; font-size: 22px; margin-bottom: 18px; }
+nav a { display: block; padding: 7px 8px; border-radius: 8px; text-decoration: none; color: var(--muted); }
+nav a.active, nav a:hover { background: #fff; color: var(--ink); }
+main { padding: 28px 32px 64px; }
+.row { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+h1 { font-family: Georgia, serif; font-weight: 500; font-size: 34px; margin: 0 0 8px; }
+.muted { color: var(--muted); }
+.grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
+.card, .panel { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
+.card b { display: block; font-size: 26px; margin-top: 6px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 13px; }
+th { color: var(--muted); font-weight: 600; }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+input, select { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px; }
+button, .button { background: var(--accent); color: white; border: 0; border-radius: 999px; padding: 9px 14px; text-decoration: none; cursor: pointer; }
+button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+.login { min-height: 100vh; display: grid; place-items: center; }
+.login form, .login .panel { width: 380px; display: grid; gap: 10px; }
+.password-field { display: grid; gap: 6px; }
+.password-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+.password-row input { width: 100%; }
+.error { color: var(--bad); }
+.ok { color: var(--good); }
+.pill { display: inline-block; border-radius: 999px; padding: 2px 8px; background: #efe7da; }
+.timeline { border-left: 2px solid var(--line); margin: 12px 0 0 8px; padding-left: 14px; }
+.timeline div { margin: 0 0 10px; }
+@media (max-width: 900px) {
+  .shell { grid-template-columns: 1fr; }
+  nav { border-right: 0; border-bottom: 1px solid var(--line); }
+  .grid { grid-template-columns: 1fr 1fr; }
+}

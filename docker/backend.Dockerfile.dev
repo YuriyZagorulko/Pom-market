@@ -1,0 +1,8 @@
+FROM rust:1-bookworm
+RUN cargo install cargo-watch --locked
+WORKDIR /src
+COPY backend/Cargo.toml backend/Cargo.lock ./
+COPY backend/src ./src
+COPY backend/migrations ./migrations
+COPY backend/tests ./tests
+RUN cargo fetch

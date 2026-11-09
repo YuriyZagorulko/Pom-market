@@ -1,0 +1,10 @@
+FROM node:20-bookworm-slim
+WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY packages ./packages
+COPY apps/admin ./apps/admin
+RUN pnpm install --frozen-lockfile --filter @pom/admin...
+ENV NODE_ENV=development
+EXPOSE 4322
+CMD ["pnpm", "--filter", "@pom/admin", "dev"]

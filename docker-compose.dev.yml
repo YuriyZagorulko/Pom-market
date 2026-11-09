@@ -1,0 +1,96 @@
+# Local development overlay. Keeps postgres volume and ports from docker-compose.yml.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile.dev
+    image: pom-market-api-dev
+    command:
+      [
+        "cargo",
+        "watch",
+        "-q",
+        "-w",
+        "src",
+        "-w",
+        "migrations",
+        "-x",
+        "run --bin pom-api",
+      ]
+    user: root
+    volumes:
+      - ./backend:/src
+      - cargo-target-api:/src/target-api
+      - cargo-registry:/usr/local/cargo/registry
+    environment:
+      CARGO_TARGET_DIR: /src/target-api
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile.dev
+    image: pom-market-worker-dev
+    command:
+      [
+        "cargo",
+        "watch",
+        "-q",
+        "-w",
+        "src",
+        "-x",
+        "run --bin pom-worker",
+      ]
+    user: root
+    volumes:
+      - ./backend:/src
+      - cargo-target-worker:/src/target-worker
+      - cargo-registry:/usr/local/cargo/registry
+    environment:
+      CARGO_TARGET_DIR: /src/target-worker
+
+  admin:
+    build:
+      context: .
+      dockerfile: docker/admin.Dockerfile.dev
+    image: pom-market-admin-dev
+    command: ["pnpm", "--filter", "@pom/admin", "dev"]
+    environment:
+      API_INTERNAL_URL: http://api:4321
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ./apps/admin:/app/apps/admin
+      - ./packages:/app/packages
+      - ./package.json:/app/package.json:ro
+      - ./pnpm-workspace.yaml:/app/pnpm-workspace.yaml:ro
+      - ./pnpm-lock.yaml:/app/pnpm-lock.yaml:ro
+      - /app/node_modules
+      - /app/apps/admin/node_modules
+      - /app/packages/api-client/node_modules
+
+  user:
+    build:
+      context: .
+      dockerfile: docker/user.Dockerfile.dev
+    image: pom-market-user-dev
+    command: ["pnpm", "--filter", "@pom/user", "dev"]
+    environment:
+      API_INTERNAL_URL: http://api:4321
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ./apps/user:/app/apps/user
+      - ./packages:/app/packages
+      - ./package.json:/app/package.json:ro
+      - ./pnpm-workspace.yaml:/app/pnpm-workspace.yaml:ro
+      - ./pnpm-lock.yaml:/app/pnpm-lock.yaml:ro
+      - /app/node_modules
+      - /app/apps/user/node_modules
+      - /app/packages/api-client/node_modules
+
+volumes:
+  cargo-target-api:
+  cargo-target-worker:
+  cargo-registry:
