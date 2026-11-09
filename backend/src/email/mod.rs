@@ -21,6 +21,30 @@ pub enum MailError {
     NotConfigured,
 }
 
+impl MailError {
+    pub fn public_message(&self) -> String {
+        match self {
+            MailError::NotConfigured => {
+                "Email is not configured on the server (set BREVO_API_KEY). Use the invitation link below.".into()
+            }
+            MailError::Timeout => {
+                "The email provider timed out. Check spam or use the invitation link below.".into()
+            }
+            MailError::Transport(_) => {
+                "Could not reach the email provider. Use the invitation link below.".into()
+            }
+            MailError::Api { status, detail } => {
+                let lower = detail.to_lowercase();
+                if lower.contains("sender") {
+                    "Brevo rejected the sender address. Verify BREVO_SENDER_EMAIL in Brevo.".into()
+                } else {
+                    format!("Email provider error (HTTP {status}). Use the invitation link below.")
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 pub trait Mailer: Send + Sync {
     async fn send(

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
 import { Desk } from "@/components/desk";
+import { inviteFeedback, type InviteResult } from "@/lib/invite-feedback";
 import { useSession } from "@/lib/session";
 
 type UserRow = { id: string; email: string; display_name: string; role: string; status: string; created_at: string; last_login_at: string | null; accounts: number; traders: number };
@@ -16,14 +17,32 @@ function Users() {
   const [rows, setRows] = useState<UserRow[]>([]);
   const [invite, setInvite] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   function load() { client.request<UserRow[]>("/api/v1/admin/users").then(setRows).catch((err) => setError(err.message)); }
   useEffect(load, [client]);
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    setError("");
+    setNotice("");
+    setInvite("");
     const body = Object.fromEntries(new FormData(event.currentTarget).entries());
-    const created = await client.request<{ setup_url: string }>("/api/v1/admin/users", { method: "POST", body: JSON.stringify(body) });
-    setInvite(created.setup_url);
-    load();
+    setSubmitting(true);
+    try {
+      const created = await client.request<InviteResult>(
+        "/api/v1/admin/users",
+        { method: "POST", body: JSON.stringify(body) },
+      );
+      const feedback = inviteFeedback(created);
+      if (feedback.ok) setNotice(feedback.message);
+      else setError(feedback.message);
+      if (created.setup_url) setInvite(created.setup_url);
+      load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create user");
+    } finally {
+      setSubmitting(false);
+    }
   }
   return (
     <section>
@@ -32,10 +51,16 @@ function Users() {
         <input name="email" type="email" required placeholder="Email" />
         <input name="display_name" required placeholder="Display name" />
         <select name="role" defaultValue="user"><option value="user">user</option><option value="admin">admin</option></select>
-        <button>Create invitation</button>
+        <button disabled={submitting}>{submitting ? "Sending…" : "Create invitation"}</button>
       </form>
-      {invite && <p>Invitation, shown once: {invite}</p>}
-      {error && <p className="error">{error}</p>}
+      {notice && <p className="panel notice success">{notice}</p>}
+      {invite && (
+        <p className="panel notice">
+          <strong>Invitation link</strong> (shown once):<br />
+          <code style={{ wordBreak: "break-all" }}>{invite}</code>
+        </p>
+      )}
+      {error && <p className="panel notice error">{error}</p>}
       <table>
         <thead><tr><th>Email</th><th>Name</th><th>Role</th><th>Status</th><th>Accounts</th><th>Wallets</th><th>Last login</th></tr></thead>
         <tbody>

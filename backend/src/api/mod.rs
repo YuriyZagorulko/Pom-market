@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::auth::{self, AuthUser};
 use crate::config::Config;
-use crate::email::Email;
+use crate::email::{Email, MailError};
 use crate::db::begin_as;
 use crate::engine::{is_eth_address, is_private_key, normalize_address};
 use crate::polymarket::http::PublicClient;
@@ -411,21 +411,71 @@ struct CreateUser {
     role: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct UserByEmail {
+    id: Uuid,
+    email: String,
+    display_name: String,
+    role: String,
+    status: String,
+}
+
 async fn admin_create_user(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<CreateUser>) -> Result<impl IntoResponse, ApiError> {
     let admin = require_user(&state, &headers, Some("admin"))?;
     let role = body.role.unwrap_or_else(|| "user".into());
     if role != "user" && role != "admin" {
         return Err(bad("role must be user or admin"));
     }
-    if !body.email.contains('@') {
+    let email = body.email.trim().to_lowercase();
+    if !email.contains('@') {
         return Err(bad("email is invalid"));
     }
+    let display_name = body.display_name.trim().to_string();
+    if display_name.is_empty() {
+        return Err(bad("display name is required"));
+    }
     let mut tx = begin_as(&state.pool, Some(admin.id), "admin").await.map_err(internal)?;
-    let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO users (email, display_name, role, status) VALUES (lower($1), $2, $3, 'invited') RETURNING id",
+    if let Some(existing) = sqlx::query_as::<_, UserByEmail>(
+        "SELECT id, email, display_name, role, status FROM users WHERE email = $1",
     )
-    .bind(body.email.trim())
-    .bind(body.display_name.trim())
+    .bind(&email)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal)?
+    {
+        let mut payload = json!({
+            "id": existing.id,
+            "email": existing.email,
+            "display_name": existing.display_name,
+            "role": existing.role,
+            "status": existing.status,
+            "already_exists": true,
+        });
+        if existing.status == "invited" {
+            let token = random_token();
+            sqlx::query("INSERT INTO invitation_tokens (user_id, token_hash, purpose, expires_at) VALUES ($1,$2,'invite', now() + make_interval(hours => $3::int))")
+                .bind(existing.id)
+                .bind(sha256_hex(&token))
+                .bind(state.cfg.invite_ttl_hours)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
+            audit(&mut tx, Some(admin.id), "user_reinvited", &existing.id.to_string()).await;
+            tx.commit().await.map_err(internal)?;
+            let setup_url = state.mail.setup_url(&token);
+            let email_delivery = invitation_delivery(&state.mail, &existing.email, &existing.display_name, &token).await;
+            payload["setup_url"] = json!(setup_url);
+            payload["email_delivery"] = email_delivery;
+        } else {
+            tx.rollback().await.map_err(internal)?;
+        }
+        return Ok((StatusCode::OK, Json(payload)));
+    }
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, display_name, role, status) VALUES ($1, $2, $3, 'invited') RETURNING id",
+    )
+    .bind(&email)
+    .bind(&display_name)
     .bind(&role)
     .fetch_one(&mut *tx)
     .await
@@ -441,19 +491,15 @@ async fn admin_create_user(State(state): State<AppState>, headers: HeaderMap, Js
     audit(&mut tx, Some(admin.id), "user_created", &id.to_string()).await;
     tx.commit().await.map_err(internal)?;
     let setup_url = state.mail.setup_url(&token);
-    dispatch_invitation_email(
-        state.mail.clone(),
-        body.email.trim().to_lowercase(),
-        body.display_name.trim().to_string(),
-        token,
-    );
+    let email_delivery = invitation_delivery(&state.mail, &email, &display_name, &token).await;
     Ok((StatusCode::CREATED, Json(json!({
         "id": id,
-        "email": body.email.trim().to_lowercase(),
-        "display_name": body.display_name.trim(),
+        "email": email,
+        "display_name": display_name,
         "role": role,
         "status": "invited",
-        "setup_url": setup_url
+        "setup_url": setup_url,
+        "email_delivery": email_delivery,
     }))))
 }
 
@@ -560,8 +606,12 @@ async fn admin_invite(State(state): State<AppState>, headers: HeaderMap, Path(id
         .await
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
-    dispatch_invitation_email(state.mail.clone(), profile.email, profile.display_name, token.clone());
-    Ok(Json(json!({"setup_url": state.mail.setup_url(&token)})))
+    let setup_url = state.mail.setup_url(&token);
+    let email_delivery = invitation_delivery(&state.mail, &profile.email, &profile.display_name, &token).await;
+    Ok(Json(json!({
+        "setup_url": setup_url,
+        "email_delivery": email_delivery,
+    })))
 }
 
 async fn admin_health(State(state): State<AppState>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
@@ -1689,6 +1739,34 @@ fn dispatch_invitation_email(mail: Email, email: String, display_name: String, t
             Email::log_failure(&err);
         }
     });
+}
+
+async fn invitation_delivery(mail: &Email, to_email: &str, display_name: &str, token: &str) -> Value {
+    if !mail.enabled() {
+        return json!({
+            "configured": false,
+            "sent": false,
+            "detail": MailError::NotConfigured.public_message(),
+        });
+    }
+    match mail.send_invitation(to_email, display_name, token).await {
+        Ok(()) => {
+            tracing::info!(to = %to_email, "invitation email sent");
+            json!({
+                "configured": true,
+                "sent": true,
+                "detail": format!("Invitation email sent to {to_email}."),
+            })
+        }
+        Err(err) => {
+            Email::log_failure(&err);
+            json!({
+                "configured": true,
+                "sent": false,
+                "detail": err.public_message(),
+            })
+        }
+    }
 }
 
 fn dispatch_password_recovery_email(mail: Email, email: String, display_name: String, token: String) {
