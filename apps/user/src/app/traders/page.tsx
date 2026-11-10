@@ -8,7 +8,8 @@ export default function TradersPage() {
 }
 
 function List() {
-  const { data, error } = useResource<Array<Record<string, unknown>>>("/api/v1/source-traders");
+  const { data, error, loading } = useResource<Array<Record<string, unknown>>>("/api/v1/source-traders");
+  if (loading) return <p>Loading…</p>;
   if (error) return <p className="error">{error}</p>;
   return (
     <section>

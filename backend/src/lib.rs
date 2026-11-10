@@ -1,11 +1,13 @@
 pub mod api;
 pub mod auth;
+pub mod client_ip;
 pub mod config;
-pub mod email;
 pub mod db;
+pub mod email;
 pub mod engine;
 pub mod pipeline;
 pub mod polymarket;
+pub mod rate_limit;
 pub mod security;
 
 use chrono::Utc;
@@ -16,13 +18,20 @@ pub fn init_tracing(format: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,sqlx=warn".into());
     if format == "json" {
-        tracing_subscriber::fmt().with_env_filter(filter).json().init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 }
 
-pub async fn ensure_login_roles(pool: &PgPool, app_password: &str, worker_password: &str) -> anyhow::Result<()> {
+pub async fn ensure_login_roles(
+    pool: &PgPool,
+    app_password: &str,
+    worker_password: &str,
+) -> anyhow::Result<()> {
     for attempt in 0..5 {
         match alter_login_roles(pool, app_password, worker_password).await {
             Ok(()) => return Ok(()),
@@ -35,26 +44,37 @@ pub async fn ensure_login_roles(pool: &PgPool, app_password: &str, worker_passwo
     Ok(())
 }
 
-async fn alter_login_roles(pool: &PgPool, app_password: &str, worker_password: &str) -> anyhow::Result<()> {
-    for (role, password) in [("pommarket_app", app_password), ("pommarket_worker", worker_password)] {
-        let statement: String = sqlx::query_scalar("SELECT format('ALTER ROLE %I LOGIN PASSWORD %L', $1::text, $2::text)")
-            .bind(role)
-            .bind(password)
-            .fetch_one(pool)
-            .await?;
+async fn alter_login_roles(
+    pool: &PgPool,
+    app_password: &str,
+    worker_password: &str,
+) -> anyhow::Result<()> {
+    for (role, password) in [
+        ("pommarket_app", app_password),
+        ("pommarket_worker", worker_password),
+    ] {
+        let statement: String = sqlx::query_scalar(
+            "SELECT format('ALTER ROLE %I LOGIN PASSWORD %L', $1::text, $2::text)",
+        )
+        .bind(role)
+        .bind(password)
+        .fetch_one(pool)
+        .await?;
         sqlx::query(&statement).execute(pool).await?;
     }
     Ok(())
 }
 
 pub async fn bootstrap_admin(pool: &PgPool, cfg: &config::Config) -> anyhow::Result<()> {
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin')")
-        .fetch_one(pool)
-        .await?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin')")
+            .fetch_one(pool)
+            .await?;
     if exists {
         return Ok(());
     }
-    let (Some(email), Some(password)) = (&cfg.bootstrap_admin_email, &cfg.bootstrap_admin_password) else {
+    let (Some(email), Some(password)) = (&cfg.bootstrap_admin_email, &cfg.bootstrap_admin_password)
+    else {
         tracing::warn!("no administrator exists and BOOTSTRAP_ADMIN_EMAIL / BOOTSTRAP_ADMIN_PASSWORD are unset");
         return Ok(());
     };
@@ -106,6 +126,7 @@ pub async fn rotate_encryption_keys(pool: &PgPool, vault: &security::Vault) -> a
 #[derive(sqlx::FromRow)]
 struct Cred {
     trading_account_id: uuid::Uuid,
+    #[allow(dead_code)] // selected for credential_aad and future audit fields
     user_id: uuid::Uuid,
     ciphertext: Vec<u8>,
     nonce: Vec<u8>,

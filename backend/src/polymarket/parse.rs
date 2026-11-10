@@ -16,6 +16,10 @@ pub struct RawTrade {
     pub market_title: Option<String>,
     pub market_slug: Option<String>,
     pub event_title: Option<String>,
+    pub event_slug: Option<String>,
+    pub market_icon: Option<String>,
+    pub activity_type: String,
+    pub usdc_size: Option<Decimal>,
     pub side: String,
     pub price: Decimal,
     pub size_shares: Decimal,
@@ -37,13 +41,18 @@ pub fn parse_activity_payload(payload: &Value, origin: &str) -> Vec<RawTrade> {
         }
         _ => Vec::new(),
     };
-    rows.iter().filter_map(|row| trade_from_value(row, origin)).collect()
+    rows.iter()
+        .filter_map(|row| trade_from_value(row, origin))
+        .collect()
 }
 
 fn trade_from_value(row: &Value, origin: &str) -> Option<RawTrade> {
     let kind = first_str(row, &["type", "activity_type", "event_type"]).unwrap_or_default();
     let kind_l = kind.to_ascii_lowercase();
-    if matches!(kind_l.as_str(), "redeem" | "split" | "merge" | "reward" | "yield" | "conversion") {
+    if matches!(
+        kind_l.as_str(),
+        "redeem" | "split" | "merge" | "reward" | "yield" | "conversion"
+    ) {
         return None;
     }
     let side_raw = first_str(row, &["side"])?;
@@ -52,18 +61,27 @@ fn trade_from_value(row: &Value, origin: &str) -> Option<RawTrade> {
         "sell" | "s" | "1" => "sell",
         _ => return None,
     };
-    let wallet = first_str(row, &["proxy_wallet", "proxyWallet", "user", "maker", "wallet"])?;
+    let wallet = first_str(
+        row,
+        &["proxy_wallet", "proxyWallet", "user", "maker", "wallet"],
+    )?;
     if wallet.len() < 4 {
         return None;
     }
-    let token_id = first_str(row, &["token_id", "tokenId", "asset", "asset_id", "assetId"])?;
+    let token_id = first_str(
+        row,
+        &["token_id", "tokenId", "asset", "asset_id", "assetId"],
+    )?;
     let price = first_decimal(row, &["price"])?;
     let size = first_decimal(row, &["size", "shares", "size_shares"])?;
     if price <= Decimal::ZERO || size <= Decimal::ZERO {
         return None;
     }
-    let tx = first_str(row, &["transaction_hash", "transactionHash", "tx_hash", "txHash"])
-        .filter(|s| !s.is_empty());
+    let tx = first_str(
+        row,
+        &["transaction_hash", "transactionHash", "tx_hash", "txHash"],
+    )
+    .filter(|s| !s.is_empty());
     let event_ts = first_timestamp(row, &["timestamp", "match_time", "matchTime", "created_at"])?;
     let wallet_n = normalize_address(&wallet);
     let dedup = if let Some(tx) = &tx {
@@ -86,7 +104,14 @@ fn trade_from_value(row: &Value, origin: &str) -> Option<RawTrade> {
         outcome: first_str(row, &["outcome", "outcome_name"]),
         market_title: first_str(row, &["title", "market_title", "question"]),
         market_slug: first_str(row, &["slug", "market_slug"]),
-        event_title: first_str(row, &["event_title", "eventTitle", "event_slug", "eventSlug"]),
+        event_title: first_str(row, &["event_title", "eventTitle"]),
+        event_slug: first_str(row, &["event_slug", "eventSlug"]),
+        market_icon: first_str(row, &["icon", "image", "marketImage", "market_image"]),
+        activity_type: first_str(row, &["type", "activity_type", "event_type"])
+            .map(|t| t.to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "trade".to_string()),
+        usdc_size: first_decimal(row, &["usdc_size", "usdcSize"]),
         side: side.to_string(),
         price,
         size_shares: size,
@@ -270,10 +295,41 @@ mod tests {
         assert_eq!(trades[0].side, "buy");
         assert_eq!(trades[0].outcome.as_deref(), Some("Yes"));
         assert_eq!(trades[0].size_shares.normalize().to_string(), "7");
-        assert!(trades[0].dedup_key.contains("0x1bd772b6550efe975d53f9c85d1c56644833aa0debbb52ebbc08ab3e77163b13"));
+        assert!(trades[0]
+            .dedup_key
+            .contains("0x1bd772b6550efe975d53f9c85d1c56644833aa0debbb52ebbc08ab3e77163b13"));
         let again = parse_activity_payload(&payload, "rtds");
         assert_eq!(trades[0].dedup_key, again[0].dedup_key);
         assert_ne!(trades[0].fragment_key, again[0].fragment_key);
+    }
+
+    #[test]
+    fn parses_icon_event_slug_and_usdc_size() {
+        let payload = json!([{
+            "proxy_wallet": "0xAa",
+            "transaction_hash": "0xicon",
+            "token_id": "1",
+            "side": "BUY",
+            "price": "0.40",
+            "size": "25",
+            "usdcSize": 10,
+            "timestamp": 1_700_000_000,
+            "type": "TRADE",
+            "title": "Q",
+            "slug": "market-slug",
+            "eventSlug": "event-slug",
+            "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/test.png"
+        }]);
+        let trades = parse_activity_payload(&payload, "data_api");
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].event_slug.as_deref(), Some("event-slug"));
+        assert_eq!(trades[0].activity_type, "trade");
+        assert_eq!(
+            trades[0].market_icon.as_deref(),
+            Some("https://polymarket-upload.s3.us-east-2.amazonaws.com/test.png")
+        );
+        assert_eq!(trades[0].usdc_size.unwrap().normalize().to_string(), "10");
+        assert!(trades[0].event_title.is_none());
     }
 
     #[test]

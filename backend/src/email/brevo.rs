@@ -41,7 +41,11 @@ struct Recipient<'a> {
 }
 
 impl BrevoMailer {
-    pub fn new(api_key: SecretString, api_base: Option<String>, timeout: Duration) -> anyhow::Result<Self> {
+    pub fn new(
+        api_key: SecretString,
+        api_base: Option<String>,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .user_agent("pommarket-copy-platform")
@@ -56,7 +60,11 @@ impl BrevoMailer {
     }
 
     pub fn arc(api_key: SecretString, api_base: Option<String>) -> anyhow::Result<Arc<dyn Mailer>> {
-        Ok(Arc::new(Self::new(api_key, api_base, Duration::from_secs(20))?))
+        Ok(Arc::new(Self::new(
+            api_key,
+            api_base,
+            Duration::from_secs(20),
+        )?))
     }
 
     async fn post_email(&self, body: &SendEmailRequest<'_>) -> Result<(), MailError> {
@@ -97,7 +105,15 @@ impl BrevoMailer {
 
 #[async_trait]
 impl Mailer for BrevoMailer {
-    async fn send(&self, sender_name: &str, sender_email: &str, to_email: &str, to_name: &str, subject: &str, html: &str) -> Result<(), MailError> {
+    async fn send(
+        &self,
+        sender_name: &str,
+        sender_email: &str,
+        to_email: &str,
+        to_name: &str,
+        subject: &str,
+        html: &str,
+    ) -> Result<(), MailError> {
         let request = SendEmailRequest {
             sender: Sender {
                 name: sender_name,
@@ -135,12 +151,21 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v3/smtp/email"))
             .and(header("api-key", "test-api-key"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"messageId": "abc"})))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"messageId": "abc"})),
+            )
             .mount(&server)
             .await;
         let brevo = client_for(&server);
         brevo
-            .send("POM", "noreply@example.com", "user@example.com", "User", "Hello", "<p>Hi</p>")
+            .send(
+                "POM",
+                "noreply@example.com",
+                "user@example.com",
+                "User",
+                "Hello",
+                "<p>Hi</p>",
+            )
             .await
             .unwrap();
     }
@@ -155,7 +180,14 @@ mod tests {
             .await;
         let brevo = client_for(&server);
         let err = brevo
-            .send("POM", "noreply@example.com", "user@example.com", "User", "Hello", "<p>Hi</p>")
+            .send(
+                "POM",
+                "noreply@example.com",
+                "user@example.com",
+                "User",
+                "Hello",
+                "<p>Hi</p>",
+            )
             .await
             .unwrap_err();
         match err {
@@ -174,7 +206,14 @@ mod tests {
             .await;
         let brevo = client_for(&server);
         let err = brevo
-            .send("POM", "noreply@example.com", "user@example.com", "User", "Hello", "<p>Hi</p>")
+            .send(
+                "POM",
+                "noreply@example.com",
+                "user@example.com",
+                "User",
+                "Hello",
+                "<p>Hi</p>",
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, MailError::Timeout));

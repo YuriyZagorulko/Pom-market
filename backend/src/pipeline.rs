@@ -7,10 +7,10 @@ use uuid::Uuid;
 
 use crate::db::begin_as;
 use crate::engine::{
-    available_after_reserve, conservative_fee_price, limit_price, order_reserves, plan_exit, reconcile_live_status,
-    reserves_after_execution, slippage_bps, target_notional, trace_buy_size, truncate_lot, walk_book, FeeSchedule,
-    OrderBook, RejectReason, RemoteObservation, SizingInput, SizingMode,
-    EXCHANGE_MIN_NOTIONAL,
+    available_after_reserve, conservative_fee_price, limit_price, order_reserves, plan_exit,
+    reconcile_live_status, reserves_after_execution, slippage_bps, target_notional, trace_buy_size,
+    truncate_lot, walk_book, FeeSchedule, OrderBook, RejectReason, RemoteObservation, SizingInput,
+    SizingMode, EXCHANGE_MIN_NOTIONAL,
 };
 use crate::polymarket::live::{place_fak, LiveOrderRequest};
 use crate::polymarket::RawTrade;
@@ -32,13 +32,85 @@ pub struct PipelineConfig {
 
 pub async fn ingest(pool: &PgPool, trade: &RawTrade) -> anyhow::Result<IngestOutcome> {
     let mut tx = begin_as(pool, None, "worker").await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&trade.dedup_key)
+        .execute(&mut *tx)
+        .await?;
+    // Atomic insert: if the dedup_key already exists (inserted by this or a
+    // concurrent transaction), ON CONFLICT DO NOTHING returns no row and we
+    // fall through to SELECT the existing id instead of failing with a unique
+    // constraint violation.
+    let created_id: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO source_events (
+                dedup_key, source_wallet, tx_hash, condition_id, token_id, outcome, market_title,
+                market_slug, event_title, event_slug, market_icon, activity_type, usdc_size,
+                side, price, size_shares, notional_usd, event_ts, origin, status, raw
+             ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'normalized',$20
+             )
+             ON CONFLICT (dedup_key) DO NOTHING
+             RETURNING id",
+    )
+    .bind(&trade.dedup_key)
+    .bind(&trade.source_wallet)
+    .bind(&trade.tx_hash)
+    .bind(&trade.condition_id)
+    .bind(&trade.token_id)
+    .bind(&trade.outcome)
+    .bind(&trade.market_title)
+    .bind(&trade.market_slug)
+    .bind(&trade.event_title)
+    .bind(&trade.event_slug)
+    .bind(&trade.market_icon)
+    .bind(&trade.activity_type)
+    .bind(trade.usdc_size)
+    .bind(&trade.side)
+    .bind(trade.price)
+    .bind(trade.size_shares)
+    .bind(trade.notional_usd)
+    .bind(trade.event_ts)
+    .bind(&trade.origin)
+    .bind(&trade.raw)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (event_id, created) = match created_id {
+        Some(id) => (id, true),
+        None => {
+            let id: Uuid = sqlx::query_scalar("SELECT id FROM source_events WHERE dedup_key = $1")
+                .bind(&trade.dedup_key)
+                .fetch_one(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE source_events SET
+                    market_icon = COALESCE(market_icon, $2),
+                    event_slug = COALESCE(event_slug, $3),
+                    usdc_size = COALESCE(usdc_size, $4),
+                    event_title = COALESCE(event_title, $5),
+                    market_title = COALESCE(market_title, $6),
+                    market_slug = COALESCE(market_slug, $7)
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(&trade.market_icon)
+            .bind(&trade.event_slug)
+            .bind(trade.usdc_size)
+            .bind(&trade.event_title)
+            .bind(&trade.market_title)
+            .bind(&trade.market_slug)
+            .execute(&mut *tx)
+            .await?;
+            (id, false)
+        }
+    };
+
     let inserted: Option<bool> = sqlx::query_scalar::<_, bool>(
         "INSERT INTO source_event_fragments (source_event_id, fragment_key, origin, size_shares, price, raw)
-         SELECT id, $2, $3, $4, $5, $6 FROM source_events WHERE dedup_key = $1
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (fragment_key) DO NOTHING
          RETURNING true",
     )
-    .bind(&trade.dedup_key)
+    .bind(event_id)
     .bind(&trade.fragment_key)
     .bind(&trade.origin)
     .bind(trade.size_shares)
@@ -48,70 +120,28 @@ pub async fn ingest(pool: &PgPool, trade: &RawTrade) -> anyhow::Result<IngestOut
     .await?;
     let inserted = inserted.unwrap_or(false);
 
-    let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM source_events WHERE dedup_key = $1")
-        .bind(&trade.dedup_key)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-    let (event_id, created) = if let Some(id) = existing {
-        if inserted {
-            sqlx::query(
-                "UPDATE source_events
-                 SET size_shares = size_shares + $2,
-                     notional_usd = price * (size_shares + $2),
-                     fragment_count = fragment_count + 1
-                 WHERE id = $1",
-            )
-            .bind(id)
-            .bind(trade.size_shares)
-            .execute(&mut *tx)
-            .await?;
-        }
-        (id, false)
-    } else {
-        let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO source_events (
-                dedup_key, source_wallet, tx_hash, condition_id, token_id, outcome, market_title,
-                market_slug, event_title, side, price, size_shares, notional_usd, event_ts, origin, status, raw
-             ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'normalized',$16
-             ) RETURNING id",
-        )
-        .bind(&trade.dedup_key)
-        .bind(&trade.source_wallet)
-        .bind(&trade.tx_hash)
-        .bind(&trade.condition_id)
-        .bind(&trade.token_id)
-        .bind(&trade.outcome)
-        .bind(&trade.market_title)
-        .bind(&trade.market_slug)
-        .bind(&trade.event_title)
-        .bind(&trade.side)
-        .bind(trade.price)
-        .bind(trade.size_shares)
-        .bind(trade.notional_usd)
-        .bind(trade.event_ts)
-        .bind(&trade.origin)
-        .bind(&trade.raw)
-        .fetch_one(&mut *tx)
-        .await?;
+    // The event already existed and this trade contributed a new fragment:
+    // accumulate size into the parent event.
+    if !created && inserted {
         sqlx::query(
-            "INSERT INTO source_event_fragments (source_event_id, fragment_key, origin, size_shares, price, raw)
-             VALUES ($1,$2,$3,$4,$5,$6)
-             ON CONFLICT (fragment_key) DO NOTHING",
+            "UPDATE source_events
+             SET size_shares = size_shares + $2,
+                 notional_usd = price * (size_shares + $2),
+                 fragment_count = fragment_count + 1
+             WHERE id = $1",
         )
-        .bind(id)
-        .bind(&trade.fragment_key)
-        .bind(&trade.origin)
+        .bind(event_id)
         .bind(trade.size_shares)
-        .bind(trade.price)
-        .bind(&trade.raw)
         .execute(&mut *tx)
         .await?;
-        (id, true)
-    };
+    }
+
     tx.commit().await?;
-    Ok(IngestOutcome { event_id, created, duplicate_fragment: !created && !inserted })
+    Ok(IngestOutcome {
+        event_id,
+        created,
+        duplicate_fragment: !created && !inserted,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -175,10 +205,12 @@ pub async fn process_event(
         decisions.push(id);
     }
     let mut tx = begin_as(pool, None, "worker").await?;
-    sqlx::query("UPDATE source_events SET status = 'processed', processed_at = now() WHERE id = $1")
-        .bind(event_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE source_events SET status = 'processed', processed_at = now() WHERE id = $1",
+    )
+    .bind(event_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "UPDATE source_traders
          SET observed_trade_count = observed_trade_count + 1,
@@ -289,11 +321,19 @@ async fn decide_one(
         reason = Some(RejectReason::EmergencyStop);
     } else if strategy.operating_mode == "monitoring" {
         reason = Some(RejectReason::MonitoringMode);
-    } else if strategy.operating_mode == "live_trading" && (kill || !cfg.confirm_live || strategy.live_confirmed_at.is_none()) {
-        reason = Some(if kill { RejectReason::KillSwitch } else { RejectReason::LiveNotConfirmed });
+    } else if strategy.operating_mode == "live_trading"
+        && (kill || !cfg.confirm_live || strategy.live_confirmed_at.is_none())
+    {
+        reason = Some(if kill {
+            RejectReason::KillSwitch
+        } else {
+            RejectReason::LiveNotConfirmed
+        });
     } else if side_buy && !strategy.copy_buy || !side_buy && !strategy.copy_sell {
         reason = Some(RejectReason::CopySideDisabled);
-    } else if Utc::now().signed_duration_since(event.event_ts) > Duration::seconds(strategy.max_stale_data_seconds as i64) {
+    } else if Utc::now().signed_duration_since(event.event_ts)
+        > Duration::seconds(strategy.max_stale_data_seconds as i64)
+    {
         reason = Some(RejectReason::StaleData);
     } else if !market_allowed(&strategy.allowed_markets, event) {
         reason = Some(RejectReason::MarketNotAllowed);
@@ -302,21 +342,26 @@ async fn decide_one(
     } else if recent_orders >= strategy.max_orders_per_interval as i64 {
         reason = Some(RejectReason::RateLimited);
     } else if last_decision.is_some_and(|at| {
-        strategy.cooldown_seconds > 0 && Utc::now() - at < Duration::seconds(strategy.cooldown_seconds as i64)
+        strategy.cooldown_seconds > 0
+            && Utc::now() - at < Duration::seconds(strategy.cooldown_seconds as i64)
     }) {
         reason = Some(RejectReason::Cooldown);
     }
 
     let cash: Decimal = if strategy.operating_mode == "paper_trading" {
-        sqlx::query_scalar("SELECT paper_cash_usd FROM account_risk_limits WHERE trading_account_id = $1")
-            .bind(strategy.trading_account_id)
-            .fetch_one(&mut *tx)
-            .await?
+        sqlx::query_scalar(
+            "SELECT paper_cash_usd FROM account_risk_limits WHERE trading_account_id = $1",
+        )
+        .bind(strategy.trading_account_id)
+        .fetch_one(&mut *tx)
+        .await?
     } else {
-        sqlx::query_scalar("SELECT COALESCE(last_exchange_balance_usd, 0) FROM trading_accounts WHERE id = $1")
-            .bind(strategy.trading_account_id)
-            .fetch_one(&mut *tx)
-            .await?
+        sqlx::query_scalar(
+            "SELECT COALESCE(last_exchange_balance_usd, 0) FROM trading_accounts WHERE id = $1",
+        )
+        .bind(strategy.trading_account_id)
+        .fetch_one(&mut *tx)
+        .await?
     };
     let open_reserve: Decimal = sqlx::query_scalar(
         "SELECT COALESCE(SUM(position_reserved_usd + fee_reserved_usd), 0) FROM orders
@@ -332,8 +377,14 @@ async fn decide_one(
     let tick = book.as_ref().map(|b| b.tick).unwrap_or(Decimal::new(1, 2));
     let limit = limit_price(side_buy, event.price, slip, tick);
     let fee_price = match book {
-        Ok(book) if side_buy => conservative_fee_price(book.asks.first().map(|level| level.price).unwrap_or(limit), limit),
-        Ok(book) => conservative_fee_price(limit, book.bids.first().map(|level| level.price).unwrap_or(limit)),
+        Ok(book) if side_buy => conservative_fee_price(
+            book.asks.first().map(|level| level.price).unwrap_or(limit),
+            limit,
+        ),
+        Ok(book) => conservative_fee_price(
+            limit,
+            book.bids.first().map(|level| level.price).unwrap_or(limit),
+        ),
         Err(_) => limit,
     };
 
@@ -365,19 +416,31 @@ async fn decide_one(
                 source_notional: event.notional_usd,
                 max_order_usd: strategy.max_order_usd.min(strategy.max_position_usd),
                 min_order_usd: strategy.min_order_usd,
-                strategy_remaining_usd: (strategy.strategy_budget_usd - strategy_exposure).max(Decimal::ZERO),
-                account_exposure_remaining_usd: (strategy.account_max_exposure.min(strategy.max_exposure_usd) - exposure).max(Decimal::ZERO),
+                strategy_remaining_usd: (strategy.strategy_budget_usd - strategy_exposure)
+                    .max(Decimal::ZERO),
+                account_exposure_remaining_usd: (strategy
+                    .account_max_exposure
+                    .min(strategy.max_exposure_usd)
+                    - exposure)
+                    .max(Decimal::ZERO),
                 available_balance_usd: available,
             };
             match target_notional(&sizing) {
                 Ok(notional) => {
                     target_notional_usd = notional;
                     let (min_order_size, liquidity) = match &book {
-                        Ok(book) => (book.min_order_size, book.asks.iter().fold(Decimal::ZERO, |sum, level| sum + level.size)),
+                        Ok(book) => (
+                            book.min_order_size,
+                            book.asks
+                                .iter()
+                                .fold(Decimal::ZERO, |sum, level| sum + level.size),
+                        ),
                         Err(_) => (Decimal::ZERO, Decimal::MAX),
                     };
                     let spend_cap = (strategy.strategy_budget_usd - strategy_exposure)
-                        .min(strategy.account_max_exposure.min(strategy.max_exposure_usd) - exposure)
+                        .min(
+                            strategy.account_max_exposure.min(strategy.max_exposure_usd) - exposure,
+                        )
                         .min(strategy.max_order_usd)
                         .min(available)
                         .max(Decimal::ZERO);
@@ -395,8 +458,14 @@ async fn decide_one(
                     target_shares = trace.sdk_normalized_shares;
                     if trace.fee_unknown {
                         reason = Some(RejectReason::FeeUnknown);
-                    } else if trace.below_min_order_size || target_shares * limit < EXCHANGE_MIN_NOTIONAL {
-                        reason = Some(if spend_cap < notional { RejectReason::StrategyBudget } else { RejectReason::BelowMinimum });
+                    } else if trace.below_min_order_size
+                        || target_shares * limit < EXCHANGE_MIN_NOTIONAL
+                    {
+                        reason = Some(if spend_cap < notional {
+                            RejectReason::StrategyBudget
+                        } else {
+                            RejectReason::BelowMinimum
+                        });
                     }
                     size_trace = Some(trace);
                 }
@@ -425,7 +494,8 @@ async fn decide_one(
         let pos = position.as_ref();
         let plan = plan_exit(
             pos.map(|p| p.open_shares).unwrap_or(Decimal::ZERO),
-            pos.map(|p| p.source_observed_shares).unwrap_or(Decimal::ZERO),
+            pos.map(|p| p.source_observed_shares)
+                .unwrap_or(Decimal::ZERO),
             event.size_shares,
             pos.map(|p| p.pending_exit_shares).unwrap_or(Decimal::ZERO),
             limit,
@@ -473,12 +543,19 @@ async fn decide_one(
     }
 
     let approved = reason.is_none();
-    let status = if approved { "approved" } else if matches!(reason, Some(RejectReason::MonitoringMode) | Some(RejectReason::StrategyDisabled)) {
+    let status = if approved {
+        "approved"
+    } else if matches!(
+        reason,
+        Some(RejectReason::MonitoringMode) | Some(RejectReason::StrategyDisabled)
+    ) {
         "skipped"
     } else {
         "rejected"
     };
-    let reason_text = reason.map(|r| r.as_str().to_string()).unwrap_or_else(|| "approved".into());
+    let reason_text = reason
+        .map(|r| r.as_str().to_string())
+        .unwrap_or_else(|| "approved".into());
     let decision_id: Uuid = sqlx::query_scalar(
         "INSERT INTO copy_decisions (
             user_id, trading_account_id, source_trader_id, source_event_id, strategy_id, status, reason,
@@ -577,9 +654,21 @@ async fn decide_one(
     tx.commit().await?;
 
     if strategy.operating_mode == "paper_trading" {
-        settle_paper(pool, strategy, event, decision_id, order_id, &fill, side_buy).await?;
+        settle_paper(
+            pool,
+            strategy,
+            event,
+            decision_id,
+            order_id,
+            &fill,
+            side_buy,
+        )
+        .await?;
     } else if strategy.operating_mode == "live_trading" {
-        submit_live(pool, vault, cfg, strategy, event, order_id, &fill, side_buy, limit).await?;
+        submit_live(
+            pool, vault, cfg, strategy, event, order_id, &fill, side_buy, limit,
+        )
+        .await?;
     }
     let _ = notify(pool, strategy.user_id, "order", order_id).await;
     Ok(decision_id)
@@ -613,21 +702,45 @@ async fn settle_paper(
     .bind(slippage_bps(event.price, fill.vwap))
     .execute(&mut *tx)
     .await?;
-    apply_position(&mut tx, strategy, event, fill.shares, fill.vwap, fill.notional, fee, side_buy, event.size_shares).await?;
-    let cash_delta = if side_buy { -(fill.notional + fee) } else { fill.notional - fee };
+    apply_position(
+        &mut tx,
+        strategy,
+        event,
+        fill.shares,
+        fill.vwap,
+        fill.notional,
+        fee,
+        side_buy,
+        event.size_shares,
+    )
+    .await?;
+    let cash_delta = if side_buy {
+        -(fill.notional + fee)
+    } else {
+        fill.notional - fee
+    };
     sqlx::query("UPDATE account_risk_limits SET paper_cash_usd = paper_cash_usd + $2, updated_at = now() WHERE trading_account_id = $1")
         .bind(strategy.trading_account_id)
         .bind(cash_delta)
         .execute(&mut *tx)
         .await?;
-    let status = if fill.complete { "filled" } else { "partially_filled" };
-    let (reserved_position, reserved_fee): (Decimal, Decimal) = sqlx::query_as(
-        "SELECT position_reserved_usd, fee_reserved_usd FROM orders WHERE id = $1",
-    )
-    .bind(order_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let (position_left, fee_left) = reserves_after_execution(fill.shares, fill.shares, reserved_position, reserved_fee, fill.fee_usd);
+    let status = if fill.complete {
+        "filled"
+    } else {
+        "partially_filled"
+    };
+    let (reserved_position, reserved_fee): (Decimal, Decimal) =
+        sqlx::query_as("SELECT position_reserved_usd, fee_reserved_usd FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let (position_left, fee_left) = reserves_after_execution(
+        fill.shares,
+        fill.shares,
+        reserved_position,
+        reserved_fee,
+        fill.fee_usd,
+    );
     sqlx::query(
         "UPDATE orders SET status = $2, submitted_at = now(), updated_at = now(), exchange_response = $3,
             position_reserved_usd = $4, fee_reserved_usd = $5
@@ -640,10 +753,12 @@ async fn settle_paper(
         .bind(fee_left)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE source_traders SET copied_trade_count = copied_trade_count + 1 WHERE id = $1")
-        .bind(strategy.source_trader_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE source_traders SET copied_trade_count = copied_trade_count + 1 WHERE id = $1",
+    )
+    .bind(strategy.source_trader_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "INSERT INTO timeline_events (user_id, source_event_id, decision_id, order_id, kind, message)
          VALUES ($1,$2,$3,$4,'fill',$5)",
@@ -659,6 +774,7 @@ async fn settle_paper(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_live(
     pool: &PgPool,
     vault: &Vault,
@@ -679,7 +795,14 @@ async fn submit_live(
     .await?;
     tx.commit().await?;
     let Some(cred) = cred else {
-        mark_order(pool, order_id, "rejected", Some("credentials_missing"), None).await?;
+        mark_order(
+            pool,
+            order_id,
+            "rejected",
+            Some("credentials_missing"),
+            None,
+        )
+        .await?;
         return Ok(());
     };
     let blob = crate::security::SecretBlob {
@@ -690,19 +813,40 @@ async fn submit_live(
     };
     let expected_aad = credential_aad(strategy.user_id, strategy.trading_account_id);
     if cred.aad != expected_aad {
-        mark_order(pool, order_id, "rejected", Some("credential_binding_mismatch"), None).await?;
+        mark_order(
+            pool,
+            order_id,
+            "rejected",
+            Some("credential_binding_mismatch"),
+            None,
+        )
+        .await?;
         return Ok(());
     }
     let plain = match vault.decrypt(&blob) {
         Ok(plain) => plain,
         Err(_) => {
-            mark_order(pool, order_id, "rejected", Some("credential_decrypt_failed"), None).await?;
+            mark_order(
+                pool,
+                order_id,
+                "rejected",
+                Some("credential_decrypt_failed"),
+                None,
+            )
+            .await?;
             return Ok(());
         }
     };
     let secret: Value = serde_json::from_slice(&plain).unwrap_or(json!({}));
     let Some(private_key) = secret.get("private_key").and_then(|v| v.as_str()) else {
-        mark_order(pool, order_id, "rejected", Some("credentials_missing"), None).await?;
+        mark_order(
+            pool,
+            order_id,
+            "rejected",
+            Some("credentials_missing"),
+            None,
+        )
+        .await?;
         return Ok(());
     };
     let request = LiveOrderRequest {
@@ -730,7 +874,9 @@ async fn submit_live(
         order_id,
         status,
         result.error.as_deref(),
-        Some(result.exchange_order_id.unwrap_or_default()).filter(|s| !s.is_empty()).as_deref(),
+        Some(result.exchange_order_id.unwrap_or_default())
+            .filter(|s| !s.is_empty())
+            .as_deref(),
     )
     .await?;
     let mut tx = begin_as(pool, None, "worker").await?;
@@ -744,7 +890,18 @@ async fn submit_live(
         let shares = fill.shares;
         let notional = fill.notional;
         let booked_fee = fill.fee_usd.unwrap_or(Decimal::ZERO);
-        apply_position(&mut tx, strategy, event, shares, fill.vwap, notional, booked_fee, side_buy, event.size_shares).await?;
+        apply_position(
+            &mut tx,
+            strategy,
+            event,
+            shares,
+            fill.vwap,
+            notional,
+            booked_fee,
+            side_buy,
+            event.size_shares,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO fills (user_id, trading_account_id, order_id, price, shares, notional_usd, fee_usd, fee_status, slippage_vs_source_bps, slippage_vs_limit_bps)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
@@ -767,8 +924,13 @@ async fn submit_live(
         .bind(order_id)
         .fetch_one(&mut *tx)
         .await?;
-        let (position_left, fee_left) =
-            reserves_after_execution(order_shares, shares, reserved_position, reserved_fee, fill.fee_usd);
+        let (position_left, fee_left) = reserves_after_execution(
+            order_shares,
+            shares,
+            reserved_position,
+            reserved_fee,
+            fill.fee_usd,
+        );
         sqlx::query("UPDATE orders SET position_reserved_usd = $2, fee_reserved_usd = $3, updated_at = now() WHERE id = $1")
             .bind(order_id)
             .bind(position_left)
@@ -780,7 +942,13 @@ async fn submit_live(
     Ok(())
 }
 
-async fn mark_order(pool: &PgPool, order_id: Uuid, status: &str, error: Option<&str>, exchange_id: Option<&str>) -> anyhow::Result<()> {
+async fn mark_order(
+    pool: &PgPool,
+    order_id: Uuid,
+    status: &str,
+    error: Option<&str>,
+    exchange_id: Option<&str>,
+) -> anyhow::Result<()> {
     let mut tx = begin_as(pool, None, "worker").await?;
     sqlx::query(
         "UPDATE orders SET status = $2, error = $3, exchange_order_id = COALESCE($4, exchange_order_id), updated_at = now(),
@@ -798,6 +966,7 @@ async fn mark_order(pool: &PgPool, order_id: Uuid, status: &str, error: Option<&
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_position(
     tx: &mut crate::db::Tx<'_>,
     strategy: &StrategyRow,
@@ -897,8 +1066,18 @@ pub async fn reconcile_live_orders(
     clob_host: &str,
     wait_seconds: i64,
 ) -> anyhow::Result<()> {
+    type LiveReconcileRow = (
+        Uuid,
+        String,
+        DateTime<Utc>,
+        Option<String>,
+        Uuid,
+        Uuid,
+        String,
+        String,
+    );
     let mut tx = begin_as(pool, None, "worker").await?;
-    let rows: Vec<(Uuid, String, DateTime<Utc>, Option<String>, Uuid, Uuid, String, String)> = sqlx::query_as(
+    let rows: Vec<LiveReconcileRow> = sqlx::query_as(
         "SELECT o.id, o.status, o.updated_at, o.exchange_order_id, o.trading_account_id, o.user_id, a.signature_type, a.funder_address
          FROM orders o
          JOIN trading_accounts a ON a.id = o.trading_account_id
@@ -910,7 +1089,19 @@ pub async fn reconcile_live_orders(
     for (id, status, updated, exchange_id, account_id, user_id, signature_type, funder) in rows {
         let aged = Utc::now() - updated > Duration::seconds(wait_seconds);
         let remote = match exchange_id.as_deref() {
-            Some(exchange_id) => observe_saved_order(pool, vault, clob_host, account_id, user_id, &signature_type, &funder, exchange_id).await,
+            Some(exchange_id) => {
+                observe_saved_order(
+                    pool,
+                    vault,
+                    clob_host,
+                    account_id,
+                    user_id,
+                    &signature_type,
+                    &funder,
+                    exchange_id,
+                )
+                .await
+            }
             None => RemoteObservation::Unreachable,
         };
         let next = reconcile_live_status(&status, aged, remote);
@@ -928,6 +1119,7 @@ pub async fn reconcile_live_orders(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn observe_saved_order(
     pool: &PgPool,
     vault: &Vault,
@@ -951,17 +1143,33 @@ async fn observe_saved_order(
     .ok()
     .flatten();
     drop(tx);
-    let Some(cred) = cred else { return RemoteObservation::Unreachable };
+    let Some(cred) = cred else {
+        return RemoteObservation::Unreachable;
+    };
     let blob = crate::security::SecretBlob {
         ciphertext: cred.ciphertext,
         nonce: cred.nonce,
         key_id: cred.key_id,
         aad: cred.aad,
     };
-    let Ok(plain) = vault.decrypt(&blob) else { return RemoteObservation::Unreachable };
-    let Ok(secret) = serde_json::from_slice::<serde_json::Value>(&plain) else { return RemoteObservation::Unreachable };
-    let Some(private_key) = secret.get("private_key").and_then(|v| v.as_str()) else { return RemoteObservation::Unreachable };
-    match crate::polymarket::live::observe_remote_order(clob_host, private_key, signature_type, Some(funder), exchange_id).await {
+    let Ok(plain) = vault.decrypt(&blob) else {
+        return RemoteObservation::Unreachable;
+    };
+    let Ok(secret) = serde_json::from_slice::<serde_json::Value>(&plain) else {
+        return RemoteObservation::Unreachable;
+    };
+    let Some(private_key) = secret.get("private_key").and_then(|v| v.as_str()) else {
+        return RemoteObservation::Unreachable;
+    };
+    match crate::polymarket::live::observe_remote_order(
+        clob_host,
+        private_key,
+        signature_type,
+        Some(funder),
+        exchange_id,
+    )
+    .await
+    {
         Ok(observation) => observation,
         Err(error) => {
             let lower = error.to_ascii_lowercase();
@@ -1024,6 +1232,7 @@ struct EventRow {
     received_at: DateTime<Utc>,
 }
 
+#[allow(dead_code)] // wide sqlx row; not every selected column is used in every code path
 #[derive(sqlx::FromRow)]
 struct StrategyRow {
     id: Uuid,
@@ -1064,6 +1273,7 @@ struct StrategyRow {
     wallet_address: String,
 }
 
+#[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 struct PositionRow {
     id: Uuid,

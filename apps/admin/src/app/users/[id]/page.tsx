@@ -2,6 +2,7 @@
 
 import { useParams } from "next/navigation";
 import { FormEvent, useEffect, useState } from "react";
+import { ConfirmationModal } from "@/components/confirmation-modal";
 import { Desk } from "@/components/desk";
 import { inviteFeedback, type InviteResult } from "@/lib/invite-feedback";
 import { useSession } from "@/lib/session";
@@ -18,6 +19,9 @@ function Detail({ id }: { id: string }) {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [inviting, setInviting] = useState(false);
+  const [suspendOpen, setSuspendOpen] = useState(false);
+  const [suspendBusy, setSuspendBusy] = useState(false);
+  const [suspendError, setSuspendError] = useState("");
   useEffect(() => { client.request<Record<string, string | number | null>>(`/api/v1/admin/users/${id}`).then(setUser); }, [client, id]);
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -41,8 +45,26 @@ function Detail({ id }: { id: string }) {
         <button>Save</button>
       </form>
       <div className="filters">
-        <button onClick={() => client.request(`/api/v1/admin/users/${id}/activate`, { method: "POST" }).then(() => location.reload())}>Activate</button>
-        <button className="ghost" onClick={() => client.request(`/api/v1/admin/users/${id}/suspend`, { method: "POST" }).then(() => location.reload())}>Suspend</button>
+        <button
+          type="button"
+          onClick={() =>
+            client
+              .request(`/api/v1/admin/users/${id}/activate`, { method: "POST" })
+              .then(() => location.reload())
+          }
+        >
+          Activate
+        </button>
+        <button
+          type="button"
+          className="ghost"
+          onClick={() => {
+            setSuspendError("");
+            setSuspendOpen(true);
+          }}
+        >
+          Suspend
+        </button>
         <button
           className="ghost"
           disabled={inviting}
@@ -75,6 +97,32 @@ function Detail({ id }: { id: string }) {
         </p>
       )}
       {error && <p className="panel notice error">{error}</p>}
+      <ConfirmationModal
+        open={suspendOpen}
+        title="Suspend user?"
+        description={`${user.email} will lose access until an administrator activates the account again.`}
+        confirmLabel="Suspend user"
+        destructive
+        busy={suspendBusy}
+        error={suspendError}
+        onCancel={() => {
+          if (!suspendBusy) setSuspendOpen(false);
+        }}
+        onConfirm={async () => {
+          if (suspendBusy) return;
+          setSuspendBusy(true);
+          setSuspendError("");
+          try {
+            await client.request(`/api/v1/admin/users/${id}/suspend`, { method: "POST" });
+            setSuspendOpen(false);
+            location.reload();
+          } catch (err) {
+            setSuspendError(err instanceof Error ? err.message : "Suspend failed");
+          } finally {
+            setSuspendBusy(false);
+          }
+        }}
+      />
     </section>
   );
 }

@@ -130,7 +130,12 @@ pub fn target_notional(input: &SizingInput) -> Result<Decimal, RejectReason> {
     Ok(capped)
 }
 
-pub fn limit_price(side_buy: bool, source_price: Decimal, slippage_bps: i32, tick: Decimal) -> Decimal {
+pub fn limit_price(
+    side_buy: bool,
+    source_price: Decimal,
+    slippage_bps: i32,
+    tick: Decimal,
+) -> Decimal {
     let bps = Decimal::from(slippage_bps.max(0)) / Decimal::from(10_000);
     let one = Decimal::ONE;
     let raw = if side_buy {
@@ -172,12 +177,7 @@ pub fn signed_order_amounts(side_buy: bool, price: Decimal, shares: Decimal) -> 
 }
 
 fn fixed_6(value: Decimal) -> u128 {
-    value
-        .trunc_with_scale(6)
-        .mantissa()
-        .unsigned_abs()
-        .try_into()
-        .unwrap_or(0)
+    value.trunc_with_scale(6).mantissa().unsigned_abs()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -208,7 +208,11 @@ pub fn conservative_fee_price(low: Decimal, high: Decimal) -> Decimal {
     if low <= Decimal::ZERO && high <= Decimal::ZERO {
         return Decimal::ZERO;
     }
-    let (start, end) = if low <= high { (low.max(Decimal::ZERO), high) } else { (high.max(Decimal::ZERO), low) };
+    let (start, end) = if low <= high {
+        (low.max(Decimal::ZERO), high)
+    } else {
+        (high.max(Decimal::ZERO), low)
+    };
     let half = Decimal::new(5, 1);
     if start <= half && half <= end {
         half
@@ -262,7 +266,11 @@ pub fn reserves_after_execution(
 ) -> (Decimal, Decimal) {
     let remaining = (order_shares - filled_shares).max(Decimal::ZERO);
     if order_shares <= Decimal::ZERO || remaining <= Decimal::ZERO {
-        let fee_left = if booked_fee.is_some() { Decimal::ZERO } else { fee_reserved };
+        let fee_left = if booked_fee.is_some() {
+            Decimal::ZERO
+        } else {
+            fee_reserved
+        };
         return (Decimal::ZERO, fee_left);
     }
     let ratio = remaining / order_shares;
@@ -282,6 +290,7 @@ pub fn fee_reconciliation_delta(booked_estimate: Decimal, actual: Decimal) -> De
 
 /// `spend_cap` is the cash that notional plus the fee reserve must fit in.
 /// Shares stay on the 2-decimal SDK lot and step down by 0.01 when the fee does not fit.
+#[allow(clippy::too_many_arguments)] // sizing inputs are easier to audit when separate
 pub fn trace_buy_size(
     requested: Decimal,
     source_price: Decimal,
@@ -293,16 +302,29 @@ pub fn trace_buy_size(
     schedule: Option<&FeeSchedule>,
     fee_price: Decimal,
 ) -> SizeTrace {
-    let raw = if limit > Decimal::ZERO { requested / limit } else { Decimal::ZERO };
-    let from_source = if source_price > Decimal::ZERO { requested / source_price } else { Decimal::ZERO };
+    let raw = if limit > Decimal::ZERO {
+        requested / limit
+    } else {
+        Decimal::ZERO
+    };
+    let from_source = if source_price > Decimal::ZERO {
+        requested / source_price
+    } else {
+        Decimal::ZERO
+    };
     let liquidity = raw.min(available_shares.max(Decimal::ZERO));
     let fee_unknown = schedule.is_none();
-    let mut shares = if fee_unknown { Decimal::ZERO } else { truncate_lot(liquidity) };
+    let mut shares = if fee_unknown {
+        Decimal::ZERO
+    } else {
+        truncate_lot(liquidity)
+    };
     let mut position = Decimal::ZERO;
     let mut fee_reserved = Decimal::ZERO;
     if let Some(schedule) = schedule {
         while shares > Decimal::ZERO {
-            (position, fee_reserved) = order_reserves(true, limit, shares, fee_price, Some(schedule));
+            (position, fee_reserved) =
+                order_reserves(true, limit, shares, fee_price, Some(schedule));
             if position + fee_reserved <= spend_cap {
                 break;
             }
@@ -390,8 +412,9 @@ pub struct OrderBook {
 
 impl OrderBook {
     pub fn normalized(mut self) -> Self {
-        self.asks.sort_by(|a, b| a.price.cmp(&b.price));
-        self.bids.sort_by(|a, b| b.price.cmp(&a.price));
+        self.asks.sort_by_key(|level| level.price);
+        self.bids
+            .sort_by_key(|level| std::cmp::Reverse(level.price));
         self
     }
 }
@@ -417,9 +440,15 @@ pub fn walk_book(
         return Err(RejectReason::BelowMinimum);
     }
     let levels: Vec<&BookLevel> = if side_buy {
-        book.asks.iter().filter(|l| l.price <= limit && l.price > Decimal::ZERO).collect()
+        book.asks
+            .iter()
+            .filter(|l| l.price <= limit && l.price > Decimal::ZERO)
+            .collect()
     } else {
-        book.bids.iter().filter(|l| l.price >= limit && l.price > Decimal::ZERO).collect()
+        book.bids
+            .iter()
+            .filter(|l| l.price >= limit && l.price > Decimal::ZERO)
+            .collect()
     };
     if levels.is_empty() {
         return Err(RejectReason::NoLiquidity);
@@ -479,7 +508,11 @@ pub struct FeeAssessment {
 
 impl FeeAssessment {
     fn unknown() -> Self {
-        Self { amount: None, status: "unknown", model: FEE_MODEL }
+        Self {
+            amount: None,
+            status: "unknown",
+            model: FEE_MODEL,
+        }
     }
 }
 
@@ -487,7 +520,11 @@ impl FeeAssessment {
 /// A missing schedule stays unknown. A disabled schedule is a known zero, not an assumption.
 pub fn taker_fee(shares: Decimal, price: Decimal, schedule: &FeeSchedule) -> FeeAssessment {
     if !schedule.fees_enabled {
-        return FeeAssessment { amount: Some(Decimal::ZERO), status: "not_charged", model: FEE_MODEL };
+        return FeeAssessment {
+            amount: Some(Decimal::ZERO),
+            status: "not_charged",
+            model: FEE_MODEL,
+        };
     }
     let curve = price * (Decimal::ONE - price);
     if shares <= Decimal::ZERO || price <= Decimal::ZERO || curve < Decimal::ZERO {
@@ -501,12 +538,20 @@ pub fn taker_fee(shares: Decimal, price: Decimal, schedule: &FeeSchedule) -> Fee
     if fee < Decimal::new(1, 5) {
         fee = Decimal::ZERO;
     }
-    FeeAssessment { amount: Some(fee), status: "estimated", model: FEE_MODEL }
+    FeeAssessment {
+        amount: Some(fee),
+        status: "estimated",
+        model: FEE_MODEL,
+    }
 }
 
 pub fn maker_fee(schedule: &FeeSchedule) -> FeeAssessment {
     if !schedule.fees_enabled || schedule.taker_only {
-        FeeAssessment { amount: Some(Decimal::ZERO), status: "not_charged", model: FEE_MODEL }
+        FeeAssessment {
+            amount: Some(Decimal::ZERO),
+            status: "not_charged",
+            model: FEE_MODEL,
+        }
     } else {
         FeeAssessment::unknown()
     }
@@ -534,7 +579,9 @@ pub fn plan_exit(
             reject: Some(RejectReason::NoPosition),
         };
     }
-    let fraction = (source_sold_shares / source_observed_shares).min(Decimal::ONE).max(Decimal::ZERO);
+    let fraction = (source_sold_shares / source_observed_shares)
+        .min(Decimal::ONE)
+        .max(Decimal::ZERO);
     let desired = (open_shares * fraction + pending_exit_shares).min(open_shares);
     let notional = desired * reference_price;
     if desired <= Decimal::ZERO {
@@ -593,7 +640,9 @@ pub fn reconcile_live_status(local: &str, aged: bool, remote: RemoteObservation)
         RemoteObservation::Partial => Some("partially_filled"),
         RemoteObservation::Cancelled => Some("cancelled"),
         RemoteObservation::Open => Some("submitted"),
-        RemoteObservation::Unreachable | RemoteObservation::Unrecognized | RemoteObservation::NotFound => None,
+        RemoteObservation::Unreachable
+        | RemoteObservation::Unrecognized
+        | RemoteObservation::NotFound => None,
     };
     let next = if let Some(status) = confirmed {
         status
@@ -661,7 +710,10 @@ mod tests {
         input.available_balance_usd = d("25");
         assert_eq!(target_notional(&input).unwrap(), d("25"));
         input.available_balance_usd = d("0.5");
-        assert_eq!(target_notional(&input), Err(RejectReason::InsufficientBalance));
+        assert_eq!(
+            target_notional(&input),
+            Err(RejectReason::InsufficientBalance)
+        );
     }
 
     #[test]
@@ -702,10 +754,19 @@ mod tests {
     #[test]
     fn book_walk_is_partial_and_respects_limit() {
         let book = OrderBook {
-            bids: vec![BookLevel { price: d("0.40"), size: d("100") }],
+            bids: vec![BookLevel {
+                price: d("0.40"),
+                size: d("100"),
+            }],
             asks: vec![
-                BookLevel { price: d("0.55"), size: d("10") },
-                BookLevel { price: d("0.45"), size: d("4") },
+                BookLevel {
+                    price: d("0.55"),
+                    size: d("10"),
+                },
+                BookLevel {
+                    price: d("0.45"),
+                    size: d("4"),
+                },
             ],
             tick: d("0.01"),
             min_order_size: Decimal::ZERO,
@@ -729,20 +790,54 @@ mod tests {
 
     #[test]
     fn unknown_is_not_failed_without_exchange_proof() {
-        assert_eq!(reconcile_live_status("submitting", true, RemoteObservation::Unreachable), "unknown");
-        assert_eq!(reconcile_live_status("unknown", true, RemoteObservation::Unreachable), "unknown");
-        assert_eq!(reconcile_live_status("unknown", true, RemoteObservation::Unrecognized), "unknown");
-        assert_eq!(reconcile_live_status("unknown", true, RemoteObservation::Filled), "filled");
-        assert_eq!(reconcile_live_status("unknown", true, RemoteObservation::Partial), "partially_filled");
-        assert_eq!(reconcile_live_status("unknown", true, RemoteObservation::Cancelled), "cancelled");
-        assert_eq!(reconcile_live_status("submitted", false, RemoteObservation::Open), "submitted");
-        assert_ne!(reconcile_live_status("unknown", true, RemoteObservation::Unreachable), "failed");
-        assert_eq!(reconcile_live_status("unknown", true, RemoteObservation::NotFound), "unknown");
+        assert_eq!(
+            reconcile_live_status("submitting", true, RemoteObservation::Unreachable),
+            "unknown"
+        );
+        assert_eq!(
+            reconcile_live_status("unknown", true, RemoteObservation::Unreachable),
+            "unknown"
+        );
+        assert_eq!(
+            reconcile_live_status("unknown", true, RemoteObservation::Unrecognized),
+            "unknown"
+        );
+        assert_eq!(
+            reconcile_live_status("unknown", true, RemoteObservation::Filled),
+            "filled"
+        );
+        assert_eq!(
+            reconcile_live_status("unknown", true, RemoteObservation::Partial),
+            "partially_filled"
+        );
+        assert_eq!(
+            reconcile_live_status("unknown", true, RemoteObservation::Cancelled),
+            "cancelled"
+        );
+        assert_eq!(
+            reconcile_live_status("submitted", false, RemoteObservation::Open),
+            "submitted"
+        );
+        assert_ne!(
+            reconcile_live_status("unknown", true, RemoteObservation::Unreachable),
+            "failed"
+        );
+        assert_eq!(
+            reconcile_live_status("unknown", true, RemoteObservation::NotFound),
+            "unknown"
+        );
     }
 
     #[test]
     fn sell_before_buy_does_not_open_a_position() {
-        let plan = plan_exit(Decimal::ZERO, Decimal::ZERO, d("5"), Decimal::ZERO, d("0.4"), d("1"));
+        let plan = plan_exit(
+            Decimal::ZERO,
+            Decimal::ZERO,
+            d("5"),
+            Decimal::ZERO,
+            d("0.4"),
+            d("1"),
+        );
         assert_eq!(plan.reject, Some(RejectReason::NoPosition));
         assert_eq!(plan.shares, Decimal::ZERO);
     }
@@ -760,7 +855,10 @@ mod tests {
         let fee = taker_fee(d("100"), d("0.80"), &crypto);
         assert_eq!(fee.status, "estimated");
         assert_eq!(fee.amount.unwrap(), d("1.12"));
-        assert_eq!(taker_fee(d("100"), d("0.50"), &crypto).amount.unwrap(), d("1.75"));
+        assert_eq!(
+            taker_fee(d("100"), d("0.50"), &crypto).amount.unwrap(),
+            d("1.75")
+        );
         assert_eq!(maker_fee(&crypto).amount.unwrap(), Decimal::ZERO);
         assert_eq!(maker_fee(&crypto).status, "not_charged");
         let mut free = crypto.clone();
@@ -778,21 +876,47 @@ mod tests {
             rebate_rate: Some(d("0.20")),
             source: "gamma".into(),
         };
-        let gross = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("5"), d("1000"), d("100"), Some(&crypto), d("0.812"));
+        let gross = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("5"),
+            d("1000"),
+            d("100"),
+            Some(&crypto),
+            d("0.812"),
+        );
         assert_eq!(truncate_lot(gross.raw_requested_shares), d("18.47"));
         assert_eq!(gross.sdk_normalized_shares, d("18.47"));
-        let tight = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("5"), d("1000"), d("15"), Some(&crypto), d("0.812"));
+        let tight = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("5"),
+            d("1000"),
+            d("15"),
+            Some(&crypto),
+            d("0.812"),
+        );
         assert_eq!(tight.cent_grid_shares, d("17.5"));
         assert_eq!(tight.sdk_normalized_shares, d("18.23"));
         assert_eq!(tight.position_reserved_usd, d("14.802760"));
         assert_eq!(tight.fee_reserved_usd, d("0.19480"));
-        assert_eq!(tight.sdk_normalized_shares, truncate_lot(tight.sdk_normalized_shares));
+        assert_eq!(
+            tight.sdk_normalized_shares,
+            truncate_lot(tight.sdk_normalized_shares)
+        );
         assert!(tight.position_reserved_usd + tight.fee_reserved_usd <= d("15"));
         assert!(tight.fee_reserved_usd > Decimal::ZERO);
-        let sdk = polymarket_client_sdk_v2::clob::types::Amount::shares(tight.sdk_normalized_shares).unwrap();
+        let sdk =
+            polymarket_client_sdk_v2::clob::types::Amount::shares(tight.sdk_normalized_shares)
+                .unwrap();
         assert_eq!(sdk.as_inner(), tight.sdk_normalized_shares);
         let bumped = tight.sdk_normalized_shares + Decimal::new(1, 2);
-        let bumped_cost = collateral_usd(true, d("0.812"), bumped) + taker_fee(bumped, d("0.812"), &crypto).amount.unwrap();
+        let bumped_cost = collateral_usd(true, d("0.812"), bumped)
+            + taker_fee(bumped, d("0.812"), &crypto).amount.unwrap();
         assert!(bumped_cost > d("15"));
     }
 
@@ -806,15 +930,68 @@ mod tests {
             rebate_rate: None,
             source: "test".into(),
         };
-        let at_80 = trace_buy_size(d("10"), d("0.80"), d("0.812"), d("0.01"), d("1"), d("1000"), d("100"), Some(&crypto), d("0.812"));
-        assert_eq!(truncate_lot(d("10") / d("0.812")), at_80.sdk_normalized_shares);
-        let exact = trace_buy_size(d("15"), d("0.80"), d("0.80"), d("0.01"), d("5"), d("1000"), d("100"), Some(&crypto), d("0.80"));
+        let at_80 = trace_buy_size(
+            d("10"),
+            d("0.80"),
+            d("0.812"),
+            d("0.01"),
+            d("1"),
+            d("1000"),
+            d("100"),
+            Some(&crypto),
+            d("0.812"),
+        );
+        assert_eq!(
+            truncate_lot(d("10") / d("0.812")),
+            at_80.sdk_normalized_shares
+        );
+        let exact = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.80"),
+            d("0.01"),
+            d("5"),
+            d("1000"),
+            d("100"),
+            Some(&crypto),
+            d("0.80"),
+        );
         assert_eq!(exact.sdk_normalized_shares, d("18.75"));
-        let thin = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("5"), d("10"), d("100"), Some(&crypto), d("0.812"));
+        let thin = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("5"),
+            d("10"),
+            d("100"),
+            Some(&crypto),
+            d("0.812"),
+        );
         assert_eq!(thin.sdk_normalized_shares, d("10.00"));
-        let tiny = trace_buy_size(d("0.40"), d("0.50"), d("0.50"), d("0.01"), d("5"), d("100"), d("100"), Some(&crypto), d("0.50"));
+        let tiny = trace_buy_size(
+            d("0.40"),
+            d("0.50"),
+            d("0.50"),
+            d("0.01"),
+            d("5"),
+            d("100"),
+            d("100"),
+            Some(&crypto),
+            d("0.50"),
+        );
         assert!(tiny.below_min_order_size);
-        let unknown = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("1"), d("1000"), d("15"), None, d("0.812"));
+        let unknown = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("1"),
+            d("1000"),
+            d("15"),
+            None,
+            d("0.812"),
+        );
         assert!(unknown.fee_unknown);
         assert_eq!(unknown.sdk_normalized_shares, Decimal::ZERO);
     }
@@ -837,32 +1014,101 @@ mod tests {
             rebate_rate: Some(d("0.25")),
             source: "gamma".into(),
         };
-        let crypto_fit = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("5"), d("1000"), d("15"), Some(&crypto), d("0.80"));
-        let politics_fit = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("5"), d("1000"), d("15"), Some(&politics), d("0.80"));
+        let crypto_fit = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("5"),
+            d("1000"),
+            d("15"),
+            Some(&crypto),
+            d("0.80"),
+        );
+        let politics_fit = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("5"),
+            d("1000"),
+            d("15"),
+            Some(&politics),
+            d("0.80"),
+        );
         assert_eq!(crypto_fit.sdk_normalized_shares, d("18.22"));
         assert_eq!(crypto_fit.fee_reserved_usd, d("0.20406"));
         assert_eq!(politics_fit.sdk_normalized_shares, d("18.32"));
         assert_eq!(politics_fit.fee_reserved_usd, d("0.11725"));
-        assert!(crypto_fit.fee_reserved_usd > politics_fit.fee_reserved_usd || crypto_fit.sdk_normalized_shares < politics_fit.sdk_normalized_shares);
+        assert!(
+            crypto_fit.fee_reserved_usd > politics_fit.fee_reserved_usd
+                || crypto_fit.sdk_normalized_shares < politics_fit.sdk_normalized_shares
+        );
         assert!(crypto_fit.position_reserved_usd + crypto_fit.fee_reserved_usd <= d("15"));
         assert!(politics_fit.position_reserved_usd + politics_fit.fee_reserved_usd <= d("15"));
         assert!(politics_fit.sdk_normalized_shares >= crypto_fit.sdk_normalized_shares);
 
-        let broke = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("5"), d("1000"), d("0.50"), Some(&crypto), d("0.80"));
+        let broke = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("5"),
+            d("1000"),
+            d("0.50"),
+            Some(&crypto),
+            d("0.80"),
+        );
         assert!(broke.below_min_order_size || broke.sdk_normalized_shares * d("0.812") < d("1"));
         assert!(broke.position_reserved_usd + broke.fee_reserved_usd <= d("0.50"));
 
-        let first = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("1"), d("1000"), d("15"), Some(&crypto), d("0.80"));
-        let left = available_after_reserve(d("15"), first.position_reserved_usd + first.fee_reserved_usd);
-        let second = trace_buy_size(d("15"), d("0.80"), d("0.812"), d("0.001"), d("1"), d("1000"), left, Some(&crypto), d("0.80"));
-        assert!(first.position_reserved_usd + first.fee_reserved_usd + second.position_reserved_usd + second.fee_reserved_usd <= d("15"));
+        let first = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("1"),
+            d("1000"),
+            d("15"),
+            Some(&crypto),
+            d("0.80"),
+        );
+        let left = available_after_reserve(
+            d("15"),
+            first.position_reserved_usd + first.fee_reserved_usd,
+        );
+        let second = trace_buy_size(
+            d("15"),
+            d("0.80"),
+            d("0.812"),
+            d("0.001"),
+            d("1"),
+            d("1000"),
+            left,
+            Some(&crypto),
+            d("0.80"),
+        );
+        assert!(
+            first.position_reserved_usd
+                + first.fee_reserved_usd
+                + second.position_reserved_usd
+                + second.fee_reserved_usd
+                <= d("15")
+        );
         assert_eq!(available_after_reserve(d("10"), d("12")), Decimal::ZERO);
 
-        let (position_left, fee_left) = reserves_after_execution(d("10"), d("4"), d("8"), d("0.20"), Some(d("0.08")));
+        let (position_left, fee_left) =
+            reserves_after_execution(d("10"), d("4"), d("8"), d("0.20"), Some(d("0.08")));
         assert_eq!(position_left, d("4.80000000"));
         assert_eq!(fee_left, d("0.12000000"));
-        assert_eq!(reserves_after_execution(d("10"), d("10"), d("8"), d("0.20"), Some(d("0.19"))), (Decimal::ZERO, Decimal::ZERO));
-        assert_eq!(reserves_after_execution(d("10"), d("10"), d("8"), d("0.20"), None).1, d("0.20"));
+        assert_eq!(
+            reserves_after_execution(d("10"), d("10"), d("8"), d("0.20"), Some(d("0.19"))),
+            (Decimal::ZERO, Decimal::ZERO)
+        );
+        assert_eq!(
+            reserves_after_execution(d("10"), d("10"), d("8"), d("0.20"), None).1,
+            d("0.20")
+        );
         assert_eq!(fee_reconciliation_delta(d("0.20"), d("0.17")), d("-0.03"));
         assert_eq!(conservative_fee_price(d("0.80"), d("0.812")), d("0.80"));
         assert_eq!(conservative_fee_price(d("0.40"), d("0.70")), d("0.5"));

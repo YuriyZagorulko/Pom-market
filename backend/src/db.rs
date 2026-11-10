@@ -13,7 +13,11 @@ pub async fn migrate(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn begin_as<'a>(pool: &'a PgPool, user_id: Option<Uuid>, role: &str) -> anyhow::Result<Tx<'a>> {
+pub async fn begin_as<'a>(
+    pool: &'a PgPool,
+    user_id: Option<Uuid>,
+    role: &str,
+) -> anyhow::Result<Tx<'a>> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT set_config('app.user_id', $1, true), set_config('app.role', $2, true)")
         .bind(user_id.map(|id| id.to_string()).unwrap_or_default())

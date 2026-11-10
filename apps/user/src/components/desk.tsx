@@ -11,7 +11,7 @@ const links = [
   ["/traders", "Source traders"],
   ["/strategies", "Strategies"],
   ["/activity", "Activity"],
-  ["/trades", "Source trades"],
+  ["/trades", "Wallet activity"],
   ["/decisions", "Decisions"],
   ["/orders", "Orders"],
   ["/executions", "Executions"],
@@ -42,16 +42,82 @@ export function Desk({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function useResource<T>(path: string) {
+export function useResource<T>(
+  path: string,
+  options?: { refreshMs?: number },
+) {
   const { client, user } = useSession();
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
   const [nonce, setNonce] = useState(0);
+  const [refreshMs] = useState(options?.refreshMs);
+
   useEffect(() => {
-    if (!user) return;
-    client.request<T>(path).then(setData).catch((err) => setError(err.message));
-  }, [client, path, user, nonce]);
-  return { data, error, reload: () => setNonce((n) => n + 1) };
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+
+    const fetchData = async (opts: { initial: boolean }) => {
+      try {
+        const d = await client.request<T>(path);
+        if (cancelled) return;
+        setData(d);
+        setError("");
+        if (opts.initial) setLoading(false);
+      } catch (err) {
+        if (cancelled) return;
+        if (opts.initial) {
+          setError(err instanceof Error ? err.message : String(err));
+          setLoading(false);
+        } else {
+          console.warn(`Resource poll failed for ${path}:`, err);
+        }
+      }
+    };
+
+    void fetchData({ initial: true });
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let handleVisibility = (() => {}) as () => void;
+    if (refreshMs) {
+      const schedule = () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          void fetchData({ initial: false });
+          schedule();
+        }, refreshMs);
+      };
+      handleVisibility = () => {
+        if (document.visibilityState === "hidden") {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        } else {
+          schedule();
+        }
+      };
+      schedule();
+      document.addEventListener("visibilitychange", handleVisibility);
+    }
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [client, path, user, nonce, refreshMs]);
+
+  return {
+    data,
+    error,
+    loading,
+    reload: () => setNonce((n) => n + 1),
+  };
 }
 
 export function Field({ label, children }: { label: string; children: React.ReactNode }) {

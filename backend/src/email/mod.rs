@@ -107,7 +107,10 @@ impl Email {
     }
 
     pub fn setup_url(&self, token: &str) -> String {
-        format!("{}/setup?token={token}", self.app_base_url.trim_end_matches('/'))
+        format!(
+            "{}/setup?token={token}",
+            self.app_base_url.trim_end_matches('/')
+        )
     }
 
     pub fn verify_url(&self, token: &str) -> String {
@@ -124,7 +127,12 @@ impl Email {
         )
     }
 
-    pub async fn send_invitation(&self, email: &str, display_name: &str, token: &str) -> Result<(), MailError> {
+    pub async fn send_invitation(
+        &self,
+        email: &str,
+        display_name: &str,
+        token: &str,
+    ) -> Result<(), MailError> {
         let url = self.setup_url(token);
         let html = format!(
             "<p>Hello {display_name},</p><p>You have been invited to POM Market. \
@@ -135,14 +143,24 @@ impl Email {
             .await
     }
 
-    pub async fn send_password_recovery(&self, email: &str, display_name: &str, token: &str) -> Result<(), MailError> {
+    pub async fn send_password_recovery(
+        &self,
+        email: &str,
+        display_name: &str,
+        token: &str,
+    ) -> Result<(), MailError> {
         let url = self.reset_password_url(token);
         let html = password_reset_email_html(display_name, &url);
         self.deliver(email, display_name, "Reset your POM Market password", &html)
             .await
     }
 
-    pub async fn send_email_verification(&self, email: &str, display_name: &str, token: &str) -> Result<(), MailError> {
+    pub async fn send_email_verification(
+        &self,
+        email: &str,
+        display_name: &str,
+        token: &str,
+    ) -> Result<(), MailError> {
         let url = self.verify_url(token);
         let html = format!(
             "<p>Hello {display_name},</p><p>Please <a href=\"{url}\">verify your email address</a> for POM Market.</p>"
@@ -151,16 +169,30 @@ impl Email {
             .await
     }
 
-    pub async fn send_password_changed(&self, email: &str, display_name: &str) -> Result<(), MailError> {
+    pub async fn send_password_changed(
+        &self,
+        email: &str,
+        display_name: &str,
+    ) -> Result<(), MailError> {
         let html = format!(
             "<p>Hello {display_name},</p><p>Your POM Market password was changed. \
              If this was not you, contact an administrator immediately.</p>"
         );
-        self.deliver(email, display_name, "Your POM Market password was changed", &html)
-            .await
+        self.deliver(
+            email,
+            display_name,
+            "Your POM Market password was changed",
+            &html,
+        )
+        .await
     }
 
-    pub async fn send_security_alert(&self, email: &str, display_name: &str, message: &str) -> Result<(), MailError> {
+    pub async fn send_security_alert(
+        &self,
+        email: &str,
+        display_name: &str,
+        message: &str,
+    ) -> Result<(), MailError> {
         let html = format!(
             "<p>Hello {display_name},</p><p>Security notice for your POM Market account: {message}</p>"
         );
@@ -168,7 +200,13 @@ impl Email {
             .await
     }
 
-    async fn deliver(&self, to_email: &str, to_name: &str, subject: &str, html: &str) -> Result<(), MailError> {
+    async fn deliver(
+        &self,
+        to_email: &str,
+        to_name: &str,
+        subject: &str,
+        html: &str,
+    ) -> Result<(), MailError> {
         if !self.enabled {
             return Err(MailError::NotConfigured);
         }

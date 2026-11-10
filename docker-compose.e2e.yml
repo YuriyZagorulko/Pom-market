@@ -1,0 +1,70 @@
+# Playwright stack: isolated DB pommarket_e2e (does not use primary dev API ports).
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d api-e2e worker-e2e admin-e2e user-e2e
+services:
+  api-e2e:
+    profiles: ["e2e"]
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    command: ["pom-api"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      API_BIND: 0.0.0.0:4321
+      MIGRATION_DATABASE_URL: postgres://pommarket:${POSTGRES_PASSWORD:-pommarket_dev_password}@postgres:5432/pommarket_e2e
+      APP_DATABASE_URL: postgres://pommarket_app:${APP_DB_PASSWORD}@postgres:5432/pommarket_e2e
+      WORKER_DATABASE_URL: postgres://pommarket_worker:${WORKER_DB_PASSWORD}@postgres:5432/pommarket_e2e
+      ADMIN_ORIGIN: http://127.0.0.1:${E2E_ADMIN_PORT:-4325}
+      USER_ORIGIN: http://127.0.0.1:${E2E_USER_PORT:-4326}
+      APP_BASE_URL: http://127.0.0.1:${E2E_USER_PORT:-4326}
+    ports:
+      - "${E2E_API_PORT:-4324}:4321"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker-e2e:
+    profiles: ["e2e"]
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    command: ["pom-worker"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MIGRATION_DATABASE_URL: postgres://pommarket:${POSTGRES_PASSWORD:-pommarket_dev_password}@postgres:5432/pommarket_e2e
+      APP_DATABASE_URL: postgres://pommarket_app:${APP_DB_PASSWORD}@postgres:5432/pommarket_e2e
+      WORKER_DATABASE_URL: postgres://pommarket_worker:${WORKER_DB_PASSWORD}@postgres:5432/pommarket_e2e
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  admin-e2e:
+    profiles: ["e2e"]
+    build:
+      context: .
+      dockerfile: docker/admin.Dockerfile
+      args:
+        API_INTERNAL_URL: http://api-e2e:4321
+    environment:
+      API_INTERNAL_URL: http://api-e2e:4321
+    ports:
+      - "${E2E_ADMIN_PORT:-4325}:4322"
+    depends_on:
+      - api-e2e
+
+  user-e2e:
+    profiles: ["e2e"]
+    build:
+      context: .
+      dockerfile: docker/user.Dockerfile
+      args:
+        API_INTERNAL_URL: http://api-e2e:4321
+    environment:
+      API_INTERNAL_URL: http://api-e2e:4321
+    ports:
+      - "${E2E_USER_PORT:-4326}:4323"
+    depends_on:
+      - api-e2e

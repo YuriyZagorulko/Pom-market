@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::net::SocketAddr;
 
 use axum::http::{HeaderValue, Method};
 use sqlx::postgres::PgListener;
@@ -8,7 +7,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
-use pommarket::api::{router, AppState};
+use pommarket::api::{new_app_state, router};
 use pommarket::config::Config;
 use pommarket::db::{connect, migrate};
 use pommarket::polymarket::http::PublicClient;
@@ -20,8 +19,10 @@ async fn main() -> anyhow::Result<()> {
     pommarket::init_tracing(&cfg.log_format);
     migrate(&cfg.migration_database_url).await?;
     let migration = connect(&cfg.migration_database_url).await?;
-    let app_password = std::env::var("APP_DB_PASSWORD").unwrap_or_else(|_| "pommarket_app".into());
-    let worker_password = std::env::var("WORKER_DB_PASSWORD").unwrap_or_else(|_| "pommarket_worker".into());
+    let app_password = std::env::var("APP_DB_PASSWORD")
+        .map_err(|_| anyhow::anyhow!("missing required environment variable APP_DB_PASSWORD"))?;
+    let worker_password = std::env::var("WORKER_DB_PASSWORD")
+        .map_err(|_| anyhow::anyhow!("missing required environment variable WORKER_DB_PASSWORD"))?;
     pommarket::ensure_login_roles(&migration, &app_password, &worker_password).await?;
     pommarket::bootstrap_admin(&migration, &cfg).await?;
     drop(migration);
@@ -47,25 +48,35 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     let mail = pommarket::email::Email::from_config(&cfg)?;
-    let state = AppState {
+    let state = new_app_state(
         pool,
-        polymarket: PublicClient::new(cfg.data_api_host.clone(), cfg.clob_host.clone(), cfg.gamma_host.clone()),
-        vault: Vault::new(
+        cfg.clone(),
+        Vault::new(
             &cfg.encryption_master_key,
             &cfg.encryption_key_id,
             cfg.previous_encryption_key.as_deref(),
             cfg.previous_encryption_key_id.as_deref(),
         )?,
+        PublicClient::new(
+            cfg.data_api_host.clone(),
+            cfg.clob_host.clone(),
+            cfg.gamma_host.clone(),
+        ),
         activity,
-        login_attempts: Arc::new(Mutex::new(HashMap::new())),
-        recovery_attempts: Arc::new(Mutex::new(HashMap::new())),
-        verify_attempts: Arc::new(Mutex::new(HashMap::new())),
         mail,
-        cfg: cfg.clone(),
-    };
+    );
     let mut cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE, Method::OPTIONS])
-        .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ])
         .allow_credentials(true);
     let mut origins = Vec::new();
     for origin in cfg.cors_origins() {
@@ -79,7 +90,11 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors);
     let listener = tokio::net::TcpListener::bind(&cfg.api_bind).await?;
     tracing::info!(bind = %cfg.api_bind, "api listening");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

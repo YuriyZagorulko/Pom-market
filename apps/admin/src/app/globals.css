@@ -22,7 +22,18 @@ h1 { font-size: 28px; margin: 0 0 8px; }
 .muted { color: var(--muted); }
 .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
 .card, .panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
-.card b { display: block; font-size: 24px; margin-top: 4px; }
+.card .metric-value { display: block; font-size: 24px; margin-top: 4px; font-weight: 700; }
+.kill-badge { font-size: 22px; letter-spacing: 0.04em; }
+.kill-on { color: var(--bad); }
+.kill-off { color: var(--accent); }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); display: grid; place-items: center; padding: 16px; z-index: 50; }
+.modal-panel { width: min(480px, 100%); background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35); }
+.modal-panel-destructive { border-color: #5a3030; }
+.modal-panel h2 { margin: 0 0 12px; font-size: 20px; }
+.modal-description { margin: 0 0 16px; color: var(--muted); line-height: 1.5; }
+.modal-error { margin-bottom: 12px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+button.modal-confirm-destructive { background: #c94a4a; color: #fff; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); font-size: 13px; }
 input, select { background: #0e1512; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }

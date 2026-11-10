@@ -9,8 +9,8 @@ use pommarket::config::Config;
 use pommarket::db::{begin_as, connect, migrate};
 use pommarket::pipeline::{ingest, process_event, Books, PipelineConfig};
 use pommarket::polymarket::http::PublicClient;
-use pommarket::polymarket::{decode_order_filled, decoded_to_trade, order_filled_topic};
 use pommarket::polymarket::rtds;
+use pommarket::polymarket::{decode_order_filled, decoded_to_trade, order_filled_topic};
 use pommarket::security::Vault;
 
 struct HttpBooks(PublicClient);
@@ -31,12 +31,18 @@ async fn main() -> anyhow::Result<()> {
     pommarket::init_tracing(&cfg.log_format);
     migrate(&cfg.migration_database_url).await?;
     let migration = connect(&cfg.migration_database_url).await?;
-    let app_password = std::env::var("APP_DB_PASSWORD").unwrap_or_else(|_| "pommarket_app".into());
-    let worker_password = std::env::var("WORKER_DB_PASSWORD").unwrap_or_else(|_| "pommarket_worker".into());
+    let app_password = std::env::var("APP_DB_PASSWORD")
+        .map_err(|_| anyhow::anyhow!("missing required environment variable APP_DB_PASSWORD"))?;
+    let worker_password = std::env::var("WORKER_DB_PASSWORD")
+        .map_err(|_| anyhow::anyhow!("missing required environment variable WORKER_DB_PASSWORD"))?;
     pommarket::ensure_login_roles(&migration, &app_password, &worker_password).await?;
     drop(migration);
     let pool = connect(&cfg.worker_database_url).await?;
-    let client = PublicClient::new(cfg.data_api_host.clone(), cfg.clob_host.clone(), cfg.gamma_host.clone());
+    let client = PublicClient::new(
+        cfg.data_api_host.clone(),
+        cfg.clob_host.clone(),
+        cfg.gamma_host.clone(),
+    );
     let books = HttpBooks(client.clone());
     let pipeline = PipelineConfig {
         clob_host: cfg.clob_host.clone(),
@@ -76,7 +82,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .await;
     });
-    let mut polygon_cursor = latest_block(&client, cfg.polygon_rpc_url.as_deref()).await.unwrap_or(0);
+    let mut polygon_cursor = latest_block(&client, cfg.polygon_rpc_url.as_deref())
+        .await
+        .unwrap_or(0);
     loop {
         heartbeat(&pool).await;
         if let Err(err) = poll_data_api(&pool, &client, &vault, &books, &pipeline).await {
@@ -87,7 +95,18 @@ async fn main() -> anyhow::Result<()> {
         }
         if cfg.polygon_logs_enabled {
             if let Some(rpc) = &cfg.polygon_rpc_url {
-                match poll_polygon(&pool, &client, &vault, &books, &pipeline, rpc, &cfg, &mut polygon_cursor).await {
+                match poll_polygon(
+                    &pool,
+                    &client,
+                    &vault,
+                    &books,
+                    &pipeline,
+                    rpc,
+                    &cfg,
+                    &mut polygon_cursor,
+                )
+                .await
+                {
                     Ok(()) => set_collector(&pool, "polygon", "ok").await,
                     Err(err) => {
                         tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "polygon poll failed");
@@ -96,7 +115,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        if let Err(err) = pommarket::pipeline::reconcile_live_orders(&pool, &vault, &cfg.clob_host, cfg.reconciliation_seconds as i64).await {
+        if let Err(err) = pommarket::pipeline::reconcile_live_orders(
+            &pool,
+            &vault,
+            &cfg.clob_host,
+            cfg.reconciliation_seconds as i64,
+        )
+        .await
+        {
             tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "reconciliation failed");
         }
         sleep(Duration::from_secs(cfg.worker_poll_seconds)).await;
@@ -167,6 +193,7 @@ async fn poll_data_api(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_polygon(
     pool: &PgPool,
     client: &PublicClient,
@@ -199,10 +226,18 @@ async fn poll_polygon(
             let topics = log
                 .get("topics")
                 .and_then(|v| v.as_array())
-                .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("");
-            let tx = log.get("transactionHash").and_then(|v| v.as_str()).unwrap_or("");
+            let tx = log
+                .get("transactionHash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Some(decoded) = decode_order_filled(&topics, data, tx) {
                 let trade = decoded_to_trade(decoded, log);
                 handle_trade(pool, vault, books, pipeline, trade).await?;
@@ -226,18 +261,24 @@ async fn latest_block(_client: &PublicClient, rpc: Option<&str>) -> anyhow::Resu
 }
 
 async fn heartbeat(pool: &PgPool) {
-    let Ok(mut tx) = begin_as(pool, None, "worker").await else { return };
-    let _ = sqlx::query("UPDATE system_settings SET value = $1, updated_at = now() WHERE key = 'worker_heartbeat'")
-        .bind(json!({"at": Utc::now().to_rfc3339(), "second": Utc::now().second()}))
-        .execute(&mut *tx)
-        .await;
+    let Ok(mut tx) = begin_as(pool, None, "worker").await else {
+        return;
+    };
+    let _ = sqlx::query(
+        "UPDATE system_settings SET value = $1, updated_at = now() WHERE key = 'worker_heartbeat'",
+    )
+    .bind(json!({"at": Utc::now().to_rfc3339(), "second": Utc::now().second()}))
+    .execute(&mut *tx)
+    .await;
     let _ = tx.commit().await;
 }
 
 async fn set_collector(pool: &PgPool, field: &str, status: &str) {
-    let Ok(mut tx) = begin_as(pool, None, "worker").await else { return };
+    let Ok(mut tx) = begin_as(pool, None, "worker").await else {
+        return;
+    };
     let _ = sqlx::query(
-        "UPDATE system_settings SET value = jsonb_set(value, ARRAY[$1]::text[], to_jsonb($2::text), true), updated_at = now() WHERE key = 'collector_status'",
+        "UPDATE system_settings SET value = value || jsonb_build_object($1::text, $2::text), updated_at = now() WHERE key = 'collector_status'",
     )
     .bind(field)
     .bind(status)

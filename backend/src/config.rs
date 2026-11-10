@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::client_ip::TrustedProxies;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub env: String,
@@ -41,10 +43,22 @@ pub struct Config {
     pub brevo_sender_email: String,
     pub brevo_sender_name: String,
     pub app_base_url: String,
+    /// Comma-separated IPs/CIDRs of reverse proxies allowed to set X-Forwarded-For.
+    pub trusted_proxies: String,
+    pub trusted_proxies_parsed: TrustedProxies,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let trusted_proxies = env::var("TRUSTED_PROXIES").unwrap_or_default();
+        let trusted_parse = TrustedProxies::parse_config(&trusted_proxies);
+        if !trusted_parse.errors.is_empty() {
+            anyhow::bail!(
+                "invalid TRUSTED_PROXIES: {}",
+                trusted_parse.errors.join("; ")
+            );
+        }
+        let trusted_proxies_parsed = TrustedProxies::from_parsed(trusted_parse);
         Ok(Self {
             env: var("ENVIRONMENT", "development"),
             api_bind: var("API_BIND", "0.0.0.0:4321"),
@@ -66,7 +80,10 @@ impl Config {
             bootstrap_admin_password: empty_as_none("BOOTSTRAP_ADMIN_PASSWORD"),
             bootstrap_admin_name: var("BOOTSTRAP_ADMIN_NAME", "Administrator"),
             clob_host: var("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com"),
-            data_api_host: var("POLYMARKET_DATA_API_HOST", "https://data-api.polymarket.com"),
+            data_api_host: var(
+                "POLYMARKET_DATA_API_HOST",
+                "https://data-api.polymarket.com",
+            ),
             gamma_host: var("POLYMARKET_GAMMA_HOST", "https://gamma-api.polymarket.com"),
             rtds_url: var("POLYMARKET_RTDS_URL", "wss://ws-live-data.polymarket.com"),
             polygon_rpc_url: empty_as_none("POLYGON_RPC_URL"),
@@ -94,7 +111,37 @@ impl Config {
                 .ok()
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| var("USER_ORIGIN", "http://localhost:4323")),
+            trusted_proxies,
+            trusted_proxies_parsed,
         })
+        .and_then(|cfg| cfg.validate().map(|()| cfg))
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.env != "production" {
+            return Ok(());
+        }
+        for (name, value) in [
+            ("JWT_SECRET", self.jwt_secret.as_str()),
+            ("ENCRYPTION_MASTER_KEY", self.encryption_master_key.as_str()),
+        ] {
+            if value.is_empty() || value.contains("CHANGE_ME") || value.len() < 32 {
+                anyhow::bail!("production requires a strong unique {name}");
+            }
+        }
+        if self.confirm_live_trading {
+            anyhow::bail!("CONFIRM_LIVE_TRADING must stay false until production trading is intentionally enabled");
+        }
+        for url in [
+            self.migration_database_url.as_str(),
+            self.app_database_url.as_str(),
+            self.worker_database_url.as_str(),
+        ] {
+            if url.contains("pommarket_dev_password") || url.contains("CHANGE_ME") {
+                anyhow::bail!("production database URLs must not contain placeholder credentials");
+            }
+        }
+        Ok(())
     }
 
     pub fn cors_origins(&self) -> Vec<String> {
@@ -110,7 +157,10 @@ impl Config {
 }
 
 fn var(name: &str, default: &str) -> String {
-    env::var(name).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
+    env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn required(name: &str) -> anyhow::Result<String> {

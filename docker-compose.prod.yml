@@ -1,12 +1,33 @@
+# Production overlay. Use with the base compose file:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# See docs/DEPLOYMENT.md for secrets, migrations, backup, and rollback.
+
 services:
   postgres:
     restart: unless-stopped
-    ports: []
+    ports: !reset []
+
   api:
     restart: unless-stopped
+    ports: !reset []
+    environment:
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+
   worker:
     restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+      CONFIRM_LIVE_TRADING: "false"
+
   admin:
     restart: unless-stopped
+    environment:
+      NODE_ENV: production
+
   user:
     restart: unless-stopped
+    environment:
+      NODE_ENV: production

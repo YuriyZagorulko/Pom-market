@@ -31,7 +31,10 @@ pub fn trades_from_frame(text: &str) -> Vec<RawTrade> {
     if topic == "activity" && !matches!(kind, "trades" | "orders_matched" | "") {
         return Vec::new();
     }
-    let payload = value.get("payload").or_else(|| value.get("data")).unwrap_or(&value);
+    let payload = value
+        .get("payload")
+        .or_else(|| value.get("data"))
+        .unwrap_or(&value);
     parse_activity_payload(payload, "rtds")
 }
 
@@ -47,7 +50,7 @@ pub fn filter_wallets(trades: Vec<RawTrade>, watched: &[String]) -> Vec<RawTrade
 
 pub fn backoff_with_jitter(attempt: u64) -> Duration {
     let base = (1u64 << attempt.min(5)).min(30);
-    let jitter = (attempt.wrapping_mul(17) % 5) as u64;
+    let jitter = attempt.wrapping_mul(17) % 5;
     Duration::from_secs(base + jitter)
 }
 
@@ -62,7 +65,11 @@ where
             Ok((mut socket, _)) => {
                 info!(%url, "rtds connected");
                 backoff = 1;
-                if socket.send(Message::Text(subscribe_message().into())).await.is_err() {
+                if socket
+                    .send(Message::Text(subscribe_message().into()))
+                    .await
+                    .is_err()
+                {
                     warn!("rtds subscribe failed");
                     continue;
                 }

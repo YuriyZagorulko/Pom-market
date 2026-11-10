@@ -12,7 +12,11 @@ function Table({ title, path, linkPrefix }: { title: string; path: string; linkP
   const [query, setQuery] = useState("");
   const [side, setSide] = useState("");
   const [status, setStatus] = useState("");
-  const { data, error, reload } = useResource<Array<Record<string, unknown>>>(`${path}?limit=50&q=${encodeURIComponent(query)}&side=${side}&status=${status}`);
+  const params = new URLSearchParams({ limit: "50" });
+  if (query) params.set("q", query);
+  if (side) params.set("side", side);
+  if (status) params.set("status", status);
+  const { data, error, reload } = useResource<Array<Record<string, unknown>>>(`${path}?${params.toString()}`);
   const rows = data ?? [];
   const columns = rows[0] ? Object.keys(rows[0]).slice(0, 8) : [];
   return (

@@ -1,10 +1,12 @@
 {
   "name": "pom-market",
   "private": true,
+  "packageManager": "pnpm@9.15.9",
   "scripts": {
     "dev:admin": "pnpm --filter @pom/admin dev",
     "dev:user": "pnpm --filter @pom/user dev",
     "build:admin": "pnpm --filter @pom/admin build",
-    "build:user": "pnpm --filter @pom/user build"
+    "build:user": "pnpm --filter @pom/user build",
+    "test:e2e": "pnpm --filter @pom/e2e test"
   }
 }

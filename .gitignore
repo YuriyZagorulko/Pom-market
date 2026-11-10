@@ -1,9 +1,16 @@
 .env
+.env.prodlike.test
 backups/
 *.dump
+backups/*.sql
 target/
 node_modules/
 .next/
 dist/
 .pnpm-store/
 *.log
+e2e/.env.local
+e2e/.env.user.local
+test-results/
+playwright-report/
+blob-report/

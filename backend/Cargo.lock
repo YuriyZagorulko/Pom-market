@@ -3499,6 +3499,7 @@ dependencies = [
  "hex",
  "hkdf",
  "http",
+ "ipnet",
  "jsonwebtoken",
  "polymarket_client_sdk_v2",
  "rand 0.8.8",

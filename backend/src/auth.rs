@@ -43,14 +43,23 @@ pub struct LoginAttempt {
     pub security_alert: Option<LoginSecurityAlert>,
 }
 
-pub fn issue_access(secret: &str, user: &AuthUser, session_id: Uuid, ttl_seconds: i64) -> anyhow::Result<String> {
+pub fn issue_access(
+    secret: &str,
+    user: &AuthUser,
+    session_id: Uuid,
+    ttl_seconds: i64,
+) -> anyhow::Result<String> {
     let claims = AccessClaims {
         sub: user.id,
         sid: session_id,
         role: user.role.clone(),
         exp: (Utc::now() + Duration::seconds(ttl_seconds)).timestamp(),
     };
-    Ok(encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes()))?)
+    Ok(encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )?)
 }
 
 pub fn read_access(secret: &str, token: &str) -> anyhow::Result<AccessClaims> {
@@ -62,6 +71,7 @@ pub fn read_access(secret: &str, token: &str) -> anyhow::Result<AccessClaims> {
     Ok(data.claims)
 }
 
+#[allow(clippy::too_many_arguments)] // login audit metadata is explicit per caller
 pub async fn login(
     pool: &PgPool,
     secret: &str,
@@ -114,10 +124,11 @@ pub async fn login(
     };
     if !verify_password(password, hash) {
         let prior_failures = row.failed_login_count;
-        let failure = sqlx::query_as::<_, FailureRow>("SELECT * FROM auth_record_login_failure($1)")
-            .bind(row.id)
-            .fetch_one(pool)
-            .await;
+        let failure =
+            sqlx::query_as::<_, FailureRow>("SELECT * FROM auth_record_login_failure($1)")
+                .bind(row.id)
+                .fetch_one(pool)
+                .await;
         let security_alert = match failure {
             Ok(outcome) => {
                 if outcome.failed_login_count >= 8
@@ -145,32 +156,36 @@ pub async fn login(
             security_alert: None,
         };
     }
-    if sqlx::query("SELECT auth_record_login_success($1)").bind(row.id).execute(pool).await.is_err() {
+    if sqlx::query("SELECT auth_record_login_success($1)")
+        .bind(row.id)
+        .execute(pool)
+        .await
+        .is_err()
+    {
         return LoginAttempt {
             result: Err("invalid credentials"),
             security_alert: None,
         };
     }
     let refresh = random_token();
-    let session_id = match sqlx::query_scalar::<_, Uuid>(
-        "SELECT auth_insert_session($1, $2, $3, $4, $5)",
-    )
-    .bind(row.id)
-    .bind(sha256_hex(&refresh))
-    .bind(Utc::now() + Duration::seconds(refresh_ttl))
-    .bind(user_agent)
-    .bind(ip)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(session_id) => session_id,
-        Err(_) => {
-            return LoginAttempt {
-                result: Err("invalid credentials"),
-                security_alert: None,
+    let session_id =
+        match sqlx::query_scalar::<_, Uuid>("SELECT auth_insert_session($1, $2, $3, $4, $5)")
+            .bind(row.id)
+            .bind(sha256_hex(&refresh))
+            .bind(Utc::now() + Duration::seconds(refresh_ttl))
+            .bind(user_agent)
+            .bind(ip)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(session_id) => session_id,
+            Err(_) => {
+                return LoginAttempt {
+                    result: Err("invalid credentials"),
+                    security_alert: None,
+                }
             }
-        }
-    };
+        };
     let user = row.into_user();
     let access_token = match issue_access(secret, &user, session_id, access_ttl) {
         Ok(token) => token,
@@ -192,7 +207,13 @@ pub async fn login(
     }
 }
 
-pub async fn refresh(pool: &PgPool, secret: &str, refresh_token: &str, access_ttl: i64, refresh_ttl: i64) -> anyhow::Result<LoginResult> {
+pub async fn refresh(
+    pool: &PgPool,
+    secret: &str,
+    refresh_token: &str,
+    access_ttl: i64,
+    refresh_ttl: i64,
+) -> anyhow::Result<LoginResult> {
     let row = sqlx::query_as::<_, SessionRow>(
         "SELECT session_id, user_id, expires_at, revoked_at, role, status, email, display_name
          FROM auth_session_by_hash($1)",
@@ -206,7 +227,10 @@ pub async fn refresh(pool: &PgPool, secret: &str, refresh_token: &str, access_tt
     if row.revoked_at.is_some() || row.expires_at < Utc::now() || row.status != "active" {
         anyhow::bail!("invalid session");
     }
-    sqlx::query("SELECT auth_revoke_session($1)").bind(row.session_id).execute(pool).await?;
+    sqlx::query("SELECT auth_revoke_session($1)")
+        .bind(row.session_id)
+        .execute(pool)
+        .await?;
     let user = AuthUser {
         id: row.user_id,
         email: row.email,
@@ -224,15 +248,27 @@ pub async fn refresh(pool: &PgPool, secret: &str, refresh_token: &str, access_tt
         .fetch_one(pool)
         .await?;
     let access_token = issue_access(secret, &user, session_id, access_ttl)?;
-    Ok(LoginResult { user, access_token, refresh_token, session_id })
+    Ok(LoginResult {
+        user,
+        access_token,
+        refresh_token,
+        session_id,
+    })
 }
 
 pub async fn logout(pool: &PgPool, session_id: Uuid) -> anyhow::Result<()> {
-    sqlx::query("SELECT auth_revoke_session($1)").bind(session_id).execute(pool).await?;
+    sqlx::query("SELECT auth_revoke_session($1)")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
-pub async fn consume_invitation(pool: &PgPool, token: &str, password: &str) -> anyhow::Result<String> {
+pub async fn consume_invitation(
+    pool: &PgPool,
+    token: &str,
+    password: &str,
+) -> anyhow::Result<String> {
     let row = sqlx::query_as::<_, InviteRow>(
         "SELECT token_id, user_id, purpose, expires_at, used_at, email, status FROM auth_invitation_by_hash($1)",
     )
@@ -258,7 +294,11 @@ pub async fn consume_invitation(pool: &PgPool, token: &str, password: &str) -> a
     Ok(row.email)
 }
 
-pub async fn consume_password_reset(pool: &PgPool, token: &str, password: &str) -> anyhow::Result<String> {
+pub async fn consume_password_reset(
+    pool: &PgPool,
+    token: &str,
+    password: &str,
+) -> anyhow::Result<String> {
     let row = sqlx::query_as::<_, InviteRow>(
         "SELECT token_id, user_id, purpose, expires_at, used_at, email, status FROM auth_invitation_by_hash($1)",
     )

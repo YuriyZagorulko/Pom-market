@@ -58,9 +58,14 @@ pnpm dev:user
 ```bash
 cargo test --manifest-path backend/Cargo.toml --lib
 ./scripts/test-integration.sh
+bash scripts/run-e2e.sh
 pnpm --filter @pom/admin build
 pnpm --filter @pom/user build
 ```
+
+Test databases: see [docs/TESTING.md](docs/TESTING.md) (`pommarket`, `pommarket_test`, `pommarket_e2e`).
+
+Production deployment notes: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and [.env.production.example](.env.production.example).
 
 ## Encryption rotation
 

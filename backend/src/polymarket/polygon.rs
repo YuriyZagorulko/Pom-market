@@ -25,7 +25,11 @@ pub struct DecodedFill {
     pub tx_hash: String,
 }
 
-pub fn decode_order_filled(topics: &[String], data_hex: &str, tx_hash: &str) -> Option<DecodedFill> {
+pub fn decode_order_filled(
+    topics: &[String],
+    data_hex: &str,
+    tx_hash: &str,
+) -> Option<DecodedFill> {
     if topics.len() < 3 {
         return None;
     }
@@ -85,6 +89,10 @@ pub fn decoded_to_trade(fill: DecodedFill, raw_log: serde_json::Value) -> RawTra
         market_title: None,
         market_slug: None,
         event_title: None,
+        event_slug: None,
+        market_icon: None,
+        activity_type: "trade".into(),
+        usdc_size: None,
         side: fill.side.to_string(),
         price: fill.price,
         size_shares: fill.size_shares,
@@ -121,11 +129,16 @@ fn decode_words(data_hex: &str) -> Option<Vec<[u8; 32]>> {
     if bytes.len() % 32 != 0 {
         return None;
     }
-    Some(bytes.chunks(32).map(|c| {
-        let mut w = [0u8; 32];
-        w.copy_from_slice(c);
-        w
-    }).collect())
+    Some(
+        bytes
+            .chunks(32)
+            .map(|c| {
+                let mut w = [0u8; 32];
+                w.copy_from_slice(c);
+                w
+            })
+            .collect(),
+    )
 }
 
 fn u256_low(word: [u8; 32]) -> Option<u128> {
@@ -142,7 +155,12 @@ fn word_decimal(word: [u8; 32]) -> Option<Decimal> {
     Some(Decimal::from(low))
 }
 
-pub fn synthetic_buy_log(maker: &str, token_id: u128, shares_6dp: u128, collateral_6dp: u128) -> serde_json::Value {
+pub fn synthetic_buy_log(
+    maker: &str,
+    token_id: u128,
+    shares_6dp: u128,
+    collateral_6dp: u128,
+) -> serde_json::Value {
     let topic0 = format!("0x{}", hex::encode(order_filled_topic()));
     let mut maker_topic = [0u8; 32];
     let addr = hex::decode(maker.trim_start_matches("0x")).unwrap();
@@ -174,7 +192,12 @@ mod tests {
     fn decodes_synthetic_collateral_buy() {
         let maker = "0x1111111111111111111111111111111111111111";
         let log = synthetic_buy_log(maker, 99, 10_000_000, 4_200_000);
-        let topics = log["topics"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let topics = log["topics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
         let decoded = decode_order_filled(&topics, log["data"].as_str().unwrap(), "0xabc").unwrap();
         assert_eq!(decoded.side, "buy");
         assert_eq!(decoded.token_id, "99");

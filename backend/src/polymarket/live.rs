@@ -65,19 +65,20 @@ pub async fn probe_account(
     };
     let signer_address = format!("{:?}", signer.address()).to_lowercase();
     let funder_address = funder.unwrap_or(&signer_address).to_string();
-    let client = match authenticated(clob_host, &signer, signature_type, Some(&funder_address)).await {
-        Ok(client) => client,
-        Err(error) => {
-            return ConnectionReport {
-                clob_ok: false,
-                signer_address,
-                funder_address,
-                balance_usd: None,
-                api_credentials_created: false,
-                error: Some(error),
-            };
-        }
-    };
+    let client =
+        match authenticated(clob_host, &signer, signature_type, Some(&funder_address)).await {
+            Ok(client) => client,
+            Err(error) => {
+                return ConnectionReport {
+                    clob_ok: false,
+                    signer_address,
+                    funder_address,
+                    balance_usd: None,
+                    api_credentials_created: false,
+                    error: Some(error),
+                };
+            }
+        };
     let clob_ok = client.ok().await.is_ok();
     let balance_usd = read_balance(&client).await;
     ConnectionReport {
@@ -95,11 +96,22 @@ pub async fn place_fak(clob_host: &str, request: LiveOrderRequest) -> LiveOrderR
         Ok(signer) => signer,
         Err(error) => return failed(error),
     };
-    let client = match authenticated(clob_host, &signer, &request.signature_type, request.funder.as_deref()).await {
+    let client = match authenticated(
+        clob_host,
+        &signer,
+        &request.signature_type,
+        request.funder.as_deref(),
+    )
+    .await
+    {
         Ok(client) => client,
         Err(error) => return unknown(error),
     };
-    let side = if request.side_buy { Side::Buy } else { Side::Sell };
+    let side = if request.side_buy {
+        Side::Buy
+    } else {
+        Side::Sell
+    };
     let token = match U256::from_str(&request.token_id) {
         Ok(token) => token,
         Err(error) => return failed(redact(&error.to_string())),
@@ -143,7 +155,11 @@ pub async fn place_fak(clob_host: &str, request: LiveOrderRequest) -> LiveOrderR
     };
     match client.post_order(signed).await {
         Ok(response) => LiveOrderResult {
-            outcome: if response.success { "accepted".into() } else { "rejected".into() },
+            outcome: if response.success {
+                "accepted".into()
+            } else {
+                "rejected".into()
+            },
             exchange_order_id: Some(response.order_id),
             status: Some(response.status.to_string()),
             error: response.error_msg,
@@ -168,7 +184,11 @@ pub async fn place_fak(clob_host: &str, request: LiveOrderRequest) -> LiveOrderR
     }
 }
 
-pub fn classify_remote_order(status: &str, original: Decimal, matched: Decimal) -> crate::engine::RemoteObservation {
+pub fn classify_remote_order(
+    status: &str,
+    original: Decimal,
+    matched: Decimal,
+) -> crate::engine::RemoteObservation {
     let status = status.to_ascii_lowercase();
     if status.contains("cancel") {
         return crate::engine::RemoteObservation::Cancelled;
@@ -176,10 +196,16 @@ pub fn classify_remote_order(status: &str, original: Decimal, matched: Decimal) 
     if original > Decimal::ZERO && matched > Decimal::ZERO && matched < original {
         return crate::engine::RemoteObservation::Partial;
     }
-    if status == "matched" || status == "filled" || (original > Decimal::ZERO && matched >= original && matched > Decimal::ZERO) {
+    if status == "matched"
+        || status == "filled"
+        || (original > Decimal::ZERO && matched >= original && matched > Decimal::ZERO)
+    {
         return crate::engine::RemoteObservation::Filled;
     }
-    if matches!(status.as_str(), "live" | "delayed" | "unmatched" | "open" | "submitted") {
+    if matches!(
+        status.as_str(),
+        "live" | "delayed" | "unmatched" | "open" | "submitted"
+    ) {
         return crate::engine::RemoteObservation::Open;
     }
     crate::engine::RemoteObservation::Unrecognized
@@ -194,7 +220,10 @@ pub async fn observe_remote_order(
 ) -> Result<crate::engine::RemoteObservation, String> {
     let signer = signer_from_key(private_key)?;
     let client = authenticated(clob_host, &signer, signature_type, funder).await?;
-    let response = client.order(order_id).await.map_err(|e| redact(&e.to_string()))?;
+    let response = client
+        .order(order_id)
+        .await
+        .map_err(|e| redact(&e.to_string()))?;
     Ok(classify_remote_order(
         &response.status.to_string(),
         response.original_size,
@@ -202,10 +231,19 @@ pub async fn observe_remote_order(
     ))
 }
 
-pub async fn lookup_order(clob_host: &str, private_key: &str, signature_type: &str, funder: Option<&str>, order_id: &str) -> Result<serde_json::Value, String> {
+pub async fn lookup_order(
+    clob_host: &str,
+    private_key: &str,
+    signature_type: &str,
+    funder: Option<&str>,
+    order_id: &str,
+) -> Result<serde_json::Value, String> {
     let signer = signer_from_key(private_key)?;
     let client = authenticated(clob_host, &signer, signature_type, funder).await?;
-    let response = client.order(order_id).await.map_err(|e| redact(&e.to_string()))?;
+    let response = client
+        .order(order_id)
+        .await
+        .map_err(|e| redact(&e.to_string()))?;
     Ok(serde_json::json!({"status": format!("{response:?}")}))
 }
 
@@ -238,7 +276,10 @@ where
             builder = builder.funder(address);
         }
     }
-    builder.authenticate().await.map_err(|e| redact(&e.to_string()))
+    builder
+        .authenticate()
+        .await
+        .map_err(|e| redact(&e.to_string()))
 }
 
 fn map_signature(value: &str) -> SignatureType {
@@ -251,7 +292,10 @@ fn map_signature(value: &str) -> SignatureType {
 }
 
 async fn read_balance(client: &Client<Authenticated<Normal>>) -> Option<Decimal> {
-    let response = client.balance_allowance(BalanceAllowanceRequest::default()).await.ok()?;
+    let response = client
+        .balance_allowance(BalanceAllowanceRequest::default())
+        .await
+        .ok()?;
     Some(response.balance)
 }
 

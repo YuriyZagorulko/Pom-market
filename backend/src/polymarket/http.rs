@@ -34,10 +34,18 @@ impl PublicClient {
             .user_agent("pommarket-copy-platform")
             .build()
             .expect("http client");
-        Self { http, data_api, clob, gamma }
+        Self {
+            http,
+            data_api,
+            clob,
+            gamma,
+        }
     }
 
-    async fn send_with_retry(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    async fn send_with_retry(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
         let mut attempt = 0u32;
         loop {
             let prepared = request
@@ -62,7 +70,12 @@ impl PublicClient {
 
     pub async fn clob_ok(&self) -> Result<bool, String> {
         let url = format!("{}/ok", self.clob.trim_end_matches('/'));
-        let response = self.http.get(url).send().await.map_err(|e| redact(&e.to_string()))?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| redact(&e.to_string()))?;
         Ok(response.status().is_success())
     }
 
@@ -87,10 +100,17 @@ impl PublicClient {
         parse_market_fee(&market)
     }
 
-    pub async fn activity_page(&self, wallet: &str, cursor: Option<&str>) -> Result<(Vec<RawTrade>, Option<String>), String> {
+    pub async fn activity_page(
+        &self,
+        wallet: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<RawTrade>, Option<String>), String> {
         let base = self.data_api.trim_end_matches('/');
         let url = format!("{base}/v2/activity");
-        let mut request = self.http.get(url).query(&[("user", wallet), ("limit", "100")]);
+        let mut request = self
+            .http
+            .get(url)
+            .query(&[("user", wallet), ("limit", "100")]);
         if let Some(cursor) = cursor {
             request = request.query(&[("cursor", cursor)]);
         }
@@ -112,7 +132,10 @@ impl PublicClient {
         Ok((trades, next))
     }
 
-    async fn activity_fallback(&self, wallet: &str) -> Result<(Vec<RawTrade>, Option<String>), String> {
+    async fn activity_fallback(
+        &self,
+        wallet: &str,
+    ) -> Result<(Vec<RawTrade>, Option<String>), String> {
         let url = format!("{}/v2/trades", self.data_api.trim_end_matches('/'));
         let response = self
             .http
@@ -128,10 +151,33 @@ impl PublicClient {
         Ok((parse_activity_payload(&body, "data_api"), None))
     }
 
+    pub async fn profile_for_registration(&self, wallet: &str) -> PublicProfile {
+        match tokio::time::timeout(Duration::from_secs(8), self.profile(wallet)).await {
+            Ok(profile) => profile,
+            Err(_) => PublicProfile {
+                wallet: wallet.to_string(),
+                positions: 0,
+                value_usd: None,
+                last_trade_at: None,
+                sample_titles: Vec::new(),
+                error: Some(
+                    "initial Polymarket profile sync timed out; wallet was added and monitoring can continue"
+                        .into(),
+                ),
+            },
+        }
+    }
+
     pub async fn profile(&self, wallet: &str) -> PublicProfile {
         let positions_url = format!("{}/v2/positions", self.data_api.trim_end_matches('/'));
         let value_url = format!("{}/v2/value", self.data_api.trim_end_matches('/'));
-        let positions: Value = match self.http.get(&positions_url).query(&[("user", wallet)]).send().await {
+        let positions: Value = match self
+            .http
+            .get(&positions_url)
+            .query(&[("user", wallet)])
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or(json!([])),
             Ok(resp) => {
                 return PublicProfile {
@@ -162,17 +208,32 @@ impl PublicClient {
             .unwrap_or_default();
         let titles = rows
             .iter()
-            .filter_map(|row| row.get("title").and_then(|v| v.as_str()).map(str::to_string))
+            .filter_map(|row| {
+                row.get("title")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .take(5)
             .collect();
-        let value_usd = match self.http.get(&value_url).query(&[("user", wallet)]).send().await {
-            Ok(resp) if resp.status().is_success() => resp.json::<Value>().await.ok().and_then(|v| {
-                let node = v.get("data").unwrap_or(&v);
-                node.get("value").and_then(json_decimal)
-            }),
+        let value_usd = match self
+            .http
+            .get(&value_url)
+            .query(&[("user", wallet)])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                resp.json::<Value>().await.ok().and_then(|v| {
+                    let node = v.get("data").unwrap_or(&v);
+                    node.get("value").and_then(json_decimal)
+                })
+            }
             _ => None,
         };
-        let (trades, _) = self.activity_page(wallet, None).await.unwrap_or((Vec::new(), None));
+        let (trades, _) = self
+            .activity_page(wallet, None)
+            .await
+            .unwrap_or((Vec::new(), None));
         PublicProfile {
             wallet: wallet.to_string(),
             positions: rows.len(),
@@ -185,7 +246,13 @@ impl PublicClient {
 
     pub async fn market_by_token(&self, token_id: &str) -> Option<Value> {
         let url = format!("{}/markets", self.gamma.trim_end_matches('/'));
-        let response = self.http.get(url).query(&[("clob_token_ids", token_id), ("limit", "1")]).send().await.ok()?;
+        let response = self
+            .http
+            .get(url)
+            .query(&[("clob_token_ids", token_id), ("limit", "1")])
+            .send()
+            .await
+            .ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -212,12 +279,22 @@ impl PublicClient {
                 "topics": [topic0]
             }]
         });
-        let response = self.http.post(rpc).json(&body).send().await.map_err(|e| redact(&e.to_string()))?;
+        let response = self
+            .http
+            .post(rpc)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| redact(&e.to_string()))?;
         let payload: Value = response.json().await.map_err(|e| redact(&e.to_string()))?;
         if let Some(error) = payload.get("error") {
             return Err(redact(&error.to_string()));
         }
-        Ok(payload.get("result").and_then(|v| v.as_array()).cloned().unwrap_or_default())
+        Ok(payload
+            .get("result")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -225,8 +302,14 @@ pub fn parse_market_fee(market: &Value) -> Option<crate::engine::FeeSchedule> {
     let enabled = market.get("feesEnabled").and_then(|v| v.as_bool());
     let schedule = market.get("feeSchedule")?;
     let rate = schedule.get("rate").and_then(json_decimal)?;
-    let exponent = schedule.get("exponent").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-    let taker_only = schedule.get("takerOnly").and_then(|v| v.as_bool()).unwrap_or(true);
+    let exponent = schedule
+        .get("exponent")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    let taker_only = schedule
+        .get("takerOnly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let rebate_rate = schedule.get("rebateRate").and_then(json_decimal);
     Some(crate::engine::FeeSchedule {
         fees_enabled: enabled.unwrap_or(true),
@@ -239,24 +322,10 @@ pub fn parse_market_fee(market: &Value) -> Option<crate::engine::FeeSchedule> {
 }
 
 pub fn fee_rate_from_raw(raw: Decimal) -> Decimal {
-    if raw > Decimal::ONE { raw / Decimal::from(10_000) } else { raw }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base_fee_bps_are_not_used_as_a_multiplier() {
-        assert_eq!(fee_rate_from_raw(Decimal::from(1000)).normalize().to_string(), "0.1");
-        let market = json!({
-            "feesEnabled": true,
-            "feeSchedule": {"exponent": 1, "rate": 0.07, "takerOnly": true, "rebateRate": 0.2}
-        });
-        let parsed = parse_market_fee(&market).unwrap();
-        assert_eq!(parsed.rate, Decimal::new(7, 2));
-        assert!(parsed.taker_only);
-        assert!(parse_market_fee(&json!({"feesEnabled": true})).is_none());
+    if raw > Decimal::ONE {
+        raw / Decimal::from(10_000)
+    } else {
+        raw
     }
 }
 
@@ -265,5 +334,28 @@ fn json_decimal(value: &Value) -> Option<Decimal> {
         Value::String(text) => text.parse().ok(),
         Value::Number(number) => number.to_string().parse().ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_fee_bps_are_not_used_as_a_multiplier() {
+        assert_eq!(
+            fee_rate_from_raw(Decimal::from(1000))
+                .normalize()
+                .to_string(),
+            "0.1"
+        );
+        let market = json!({
+            "feesEnabled": true,
+            "feeSchedule": {"exponent": 1, "rate": 0.07, "takerOnly": true, "rebateRate": 0.2}
+        });
+        let parsed = parse_market_fee(&market).unwrap();
+        assert_eq!(parsed.rate, Decimal::new(7, 2));
+        assert!(parsed.taker_only);
+        assert!(parse_market_fee(&json!({"feesEnabled": true})).is_none());
     }
 }

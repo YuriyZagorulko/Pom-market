@@ -43,7 +43,10 @@ impl Vault {
         let ciphertext = cipher
             .encrypt(
                 nonce,
-                aes_gcm::aead::Payload { msg: plaintext, aad: aad.as_bytes() },
+                aes_gcm::aead::Payload {
+                    msg: plaintext,
+                    aad: aad.as_bytes(),
+                },
             )
             .map_err(|_| anyhow::anyhow!("encryption failed"))?;
         Ok(SecretBlob {
@@ -88,15 +91,16 @@ pub struct SecretBlob {
 }
 
 fn derive_key(master: &str) -> anyhow::Result<[u8; 32]> {
-    let material = if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(master.trim()) {
-        if bytes.len() == 32 {
-            bytes
+    let material =
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(master.trim()) {
+            if bytes.len() == 32 {
+                bytes
+            } else {
+                master.as_bytes().to_vec()
+            }
         } else {
             master.as_bytes().to_vec()
-        }
-    } else {
-        master.as_bytes().to_vec()
-    };
+        };
     let hk = Hkdf::<Sha256>::new(Some(b"pommarket-credential-vault"), &material);
     let mut okm = [0u8; 32];
     hk.expand(b"aes-256-gcm", &mut okm)
@@ -119,7 +123,9 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
     };
-    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
 }
 
 pub fn sha256_hex(value: &str) -> String {
