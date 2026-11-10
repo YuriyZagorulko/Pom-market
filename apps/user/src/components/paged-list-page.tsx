@@ -6,12 +6,15 @@ import { AccountSelect } from "@/components/account-select";
 import { DateRangePresets } from "@/components/date-range-presets";
 import { FilterChips } from "@/components/filter-chips";
 import { PaginationBar } from "@/components/pagination-bar";
+import { SimpleFieldLabel } from "@/components/simple-field-label";
+import { useToast } from "@/components/toast";
 import { useListQuery } from "@/lib/use-list-query";
 import { usePagedList } from "@/lib/use-paged-list";
 
 export type FilterField = {
   type: "text" | "select" | "date" | "account";
   name: string;
+  label?: string;
   placeholder?: string;
   options?: Array<{ value: string; label: string }>;
 };
@@ -33,6 +36,7 @@ function PagedListBody({
   fields: FilterField[];
   render: (ctx: { items: Record<string, unknown>[]; loading: boolean; error: string }) => ReactNode;
 }) {
+  const toast = useToast();
   const list = useListQuery();
   const path = `${apiPath}?${list.apiParams.toString()}`;
   const { items, total, limit, offset, loading, error, reload } = usePagedList<Record<string, unknown>>(path);
@@ -48,7 +52,14 @@ function PagedListBody({
             </p>
           )}
         </div>
-        <button type="button" className="ghost" onClick={reload}>
+        <button
+          type="button"
+          className="ghost"
+          onClick={() => {
+            reload();
+            toast.info("List refreshed");
+          }}
+        >
           Refresh
         </button>
       </div>
@@ -60,40 +71,45 @@ function PagedListBody({
         />
       )}
       <div className="filters list-filters">
-        {fields.map((field) =>
-          field.type === "account" ? (
-            <AccountSelect
-              key={field.name}
-              value={list.read(field.name)}
-              onChange={(id) => list.setParams({ account_id: id }, true)}
-            />
-          ) : field.type === "select" ? (
-            <select
-              key={field.name}
-              value={list.read(field.name)}
-              onChange={(e) => list.setParams({ [field.name]: e.target.value || null }, true)}
-            >
-              {field.options?.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              key={field.name}
-              type={field.type === "date" ? "date" : "text"}
-              placeholder={field.placeholder ?? field.name}
-              defaultValue={list.read(field.name)}
-              onBlur={(e) =>
-                list.setParams(
-                  { [field.name]: (field.type === "date" ? e.target.value : e.target.value.trim()) || null },
-                  true,
-                )
-              }
-            />
-          ),
-        )}
+        {fields.map((field) => {
+          const title = field.label ?? field.placeholder ?? field.name;
+          const id = `filter-${field.name}`;
+          return (
+            <div key={field.name} className="form-field">
+              <SimpleFieldLabel htmlFor={field.type === "account" ? undefined : id}>{title}</SimpleFieldLabel>
+              {field.type === "account" ? (
+                <AccountSelect
+                  value={list.read(field.name)}
+                  onChange={(accountId) => list.setParams({ account_id: accountId }, true)}
+                />
+              ) : field.type === "select" ? (
+                <select
+                  id={id}
+                  value={list.read(field.name)}
+                  onChange={(e) => list.setParams({ [field.name]: e.target.value || null }, true)}
+                >
+                  {field.options?.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  id={id}
+                  type={field.type === "date" ? "date" : "text"}
+                  defaultValue={list.read(field.name)}
+                  onBlur={(e) =>
+                    list.setParams(
+                      { [field.name]: (field.type === "date" ? e.target.value : e.target.value.trim()) || null },
+                      true,
+                    )
+                  }
+                />
+              )}
+            </div>
+          );
+        })}
       </div>
       <FilterChips
         chips={list.chips}

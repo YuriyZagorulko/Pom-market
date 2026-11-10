@@ -216,7 +216,20 @@ async fn paper_workflow_and_tenant_isolation() {
         "PATCH",
         &format!("/api/v1/accounts/{account_id}/risk"),
         &ada_token,
-        json!({"paper_cash_usd": "1000", "max_order_usd": "100", "max_exposure_usd": "1000"}),
+        json!({"max_order_usd": "100", "max_exposure_usd": "1000"}),
+    )
+    .await;
+    send(
+        &http,
+        &base,
+        "POST",
+        &format!("/api/v1/accounts/{account_id}/capital/paper-funding"),
+        &ada_token,
+        json!({
+            "delta_usd": "1000",
+            "reason": "flow_integration_test",
+            "idempotency_key": format!("flow-fund-{account_id}")
+        }),
     )
     .await;
     send(
@@ -263,6 +276,15 @@ async fn paper_workflow_and_tenant_isolation() {
         &http,
         &base,
         "POST",
+        &format!("/api/v1/accounts/{account_id}/capital/bootstrap"),
+        &ada_token,
+        json!({ "apply": true }),
+    )
+    .await;
+    send(
+        &http,
+        &base,
+        "POST",
         &format!("/api/v1/strategies/{strategy_id}/enable"),
         &ada_token,
         json!({"enabled": true}),
@@ -303,6 +325,11 @@ async fn paper_workflow_and_tenant_isolation() {
         default_fee_rate: Decimal::ZERO,
         default_fee_exponent: 1,
     };
+    let data = pommarket::polymarket::http::PublicClient::new(
+        cfg.data_api_host.clone(),
+        cfg.clob_host.clone(),
+        cfg.gamma_host.clone(),
+    );
     let vault = Vault::new(
         &cfg.encryption_master_key,
         &cfg.encryption_key_id,
@@ -310,14 +337,30 @@ async fn paper_workflow_and_tenant_isolation() {
         None,
     )
     .unwrap();
-    process_event(&worker, &vault, &FixedBook, &pipeline, outcome.event_id)
-        .await
-        .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &FixedBook,
+        &pipeline,
+        &data,
+        &cfg,
+        outcome.event_id,
+    )
+    .await
+    .unwrap();
     let again = ingest(&worker, &trade).await.unwrap();
     assert!(!again.created);
-    process_event(&worker, &vault, &FixedBook, &pipeline, outcome.event_id)
-        .await
-        .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &FixedBook,
+        &pipeline,
+        &data,
+        &cfg,
+        outcome.event_id,
+    )
+    .await
+    .unwrap();
 
     let decisions = send(
         &http,
@@ -373,6 +416,8 @@ async fn paper_workflow_and_tenant_isolation() {
         &vault,
         &FixedBook,
         &pipeline,
+        &data,
+        &cfg,
         sell_outcome.event_id,
     )
     .await

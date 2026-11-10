@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { typeInto } from "./helpers/forms";
+import { setGlobalKillSwitch } from "../helpers/admin";
 
 const adminBase = process.env.E2E_ADMIN_BASE_URL ?? "http://127.0.0.1:4322";
 
@@ -47,4 +48,8 @@ test("kill switch toggle requires confirmation and single POST", async ({ page }
   await toggle.click();
   await page.getByRole("button", { name: /Turn Kill Switch (ON|OFF)/ }).click();
   await expect.poll(() => killPosts.length, { timeout: 10_000 }).toBe(1);
+});
+
+test.afterAll(async () => {
+  await setGlobalKillSwitch(false);
 });

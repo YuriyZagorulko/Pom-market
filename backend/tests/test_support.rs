@@ -68,6 +68,26 @@ pub async fn truncate_integration_tables(pool: &PgPool, migration_url: &str) {
     .expect("truncate integration tables");
 }
 
+/// Initialize strategy capital rows for integration copy tests (does not auto-fund the main DB in prod).
+pub async fn bootstrap_paper_capital_for_account(pool: &PgPool, trading_account_id: uuid::Uuid) {
+    pommarket::strategy_accounting::bootstrap_account_strategies(pool, trading_account_id, true)
+        .await
+        .expect("bootstrap paper capital for test account");
+}
+
+pub fn pipeline_runtime() -> (
+    pommarket::polymarket::http::PublicClient,
+    pommarket::config::Config,
+) {
+    let cfg = pommarket::config::Config::from_env().expect("config");
+    let data = pommarket::polymarket::http::PublicClient::new(
+        cfg.data_api_host.clone(),
+        cfg.clob_host.clone(),
+        cfg.gamma_host.clone(),
+    );
+    (data, cfg)
+}
+
 pub async fn truncate_users(pool: &PgPool, migration_url: &str) {
     assert_test_database_url(migration_url);
     sqlx::query("TRUNCATE users RESTART IDENTITY CASCADE")

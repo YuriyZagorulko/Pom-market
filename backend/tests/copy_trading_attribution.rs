@@ -150,8 +150,10 @@ async fn sell_idempotency_and_manual_position_isolation() {
         default_fee_exponent: 1,
     };
     let book = FixedBook;
+    let (data, app_cfg) = test_support::pipeline_runtime();
 
     let (user_id, strategy_id, account_id, wallet) = seed_strategy(&migration).await;
+    test_support::bootstrap_paper_capital_for_account(&migration, account_id).await;
     let token = "shared-tok";
 
     sqlx::query(
@@ -168,9 +170,17 @@ async fn sell_idempotency_and_manual_position_isolation() {
 
     let buy = trade(&wallet, "buy", "1", "1000", token);
     let buy_out = ingest(&worker, &buy).await.unwrap();
-    process_event(&worker, &vault, &book, &pipeline, buy_out.event_id)
-        .await
-        .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &book,
+        &pipeline,
+        &data,
+        &app_cfg,
+        buy_out.event_id,
+    )
+    .await
+    .unwrap();
 
     let mut tx = begin_as(&worker, Some(user_id), "user").await.unwrap();
     let manual: Decimal = sqlx::query_scalar(
@@ -194,12 +204,28 @@ async fn sell_idempotency_and_manual_position_isolation() {
 
     let sell = trade(&wallet, "sell", "1", "500", token);
     let sell_out = ingest(&worker, &sell).await.unwrap();
-    process_event(&worker, &vault, &book, &pipeline, sell_out.event_id)
-        .await
-        .unwrap();
-    process_event(&worker, &vault, &book, &pipeline, sell_out.event_id)
-        .await
-        .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &book,
+        &pipeline,
+        &data,
+        &app_cfg,
+        sell_out.event_id,
+    )
+    .await
+    .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &book,
+        &pipeline,
+        &data,
+        &app_cfg,
+        sell_out.event_id,
+    )
+    .await
+    .unwrap();
 
     let manual_after: Decimal = sqlx::query_scalar(
         "SELECT open_shares FROM positions WHERE trading_account_id = $1 AND strategy_id IS NULL AND token_id = $2",
@@ -255,6 +281,7 @@ async fn two_strategies_same_token_isolated() {
         default_fee_exponent: 1,
     };
     let book = FixedBook;
+    let (data, app_cfg) = test_support::pipeline_runtime();
 
     let (user_id, strategy_a, _account_a, wallet) = seed_strategy(&migration).await;
 
@@ -296,12 +323,23 @@ async fn two_strategies_same_token_isolated() {
     .await
     .unwrap();
 
+    test_support::bootstrap_paper_capital_for_account(&migration, _account_a).await;
+    test_support::bootstrap_paper_capital_for_account(&migration, account_b).await;
+
     let token = "iso-tok";
     let buy = trade(&wallet, "buy", "iso", "100", token);
     let out = ingest(&worker, &buy).await.unwrap();
-    process_event(&worker, &vault, &book, &pipeline, out.event_id)
-        .await
-        .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &book,
+        &pipeline,
+        &data,
+        &app_cfg,
+        out.event_id,
+    )
+    .await
+    .unwrap();
 
     let mut tx = begin_as(&worker, Some(user_id), "user").await.unwrap();
     let shares_a: Decimal = sqlx::query_scalar(
@@ -325,9 +363,17 @@ async fn two_strategies_same_token_isolated() {
 
     let sell = trade(&wallet, "sell", "iso-s", "100", token);
     let sell_out = ingest(&worker, &sell).await.unwrap();
-    process_event(&worker, &vault, &book, &pipeline, sell_out.event_id)
-        .await
-        .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &book,
+        &pipeline,
+        &data,
+        &app_cfg,
+        sell_out.event_id,
+    )
+    .await
+    .unwrap();
 
     let shares_a_after: Decimal = sqlx::query_scalar(
         "SELECT open_shares FROM positions WHERE strategy_id = $1 AND token_id = $2",

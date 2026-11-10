@@ -57,6 +57,8 @@ pub struct TestApi {
     pub vault: Vault,
     pub books: FixedBook,
     pub pipeline: PipelineConfig,
+    pub data: PublicClient,
+    pub app_cfg: Config,
 }
 
 impl TestApi {
@@ -125,6 +127,11 @@ impl TestApi {
             default_fee_rate: Decimal::ZERO,
             default_fee_exponent: 1,
         };
+        let data = PublicClient::new(
+            cfg.data_api_host.clone(),
+            cfg.clob_host.clone(),
+            cfg.gamma_host.clone(),
+        );
 
         Self {
             http: Client::builder().build().unwrap(),
@@ -133,6 +140,8 @@ impl TestApi {
             vault,
             books: FixedBook,
             pipeline,
+            data,
+            app_cfg: cfg,
         }
     }
 
@@ -197,6 +206,30 @@ impl TestApi {
             .status()
     }
 
+    pub async fn fund_paper(&self, token: &str, account_id: &str, delta_usd: &str) {
+        self.send(
+            "POST",
+            &format!("/api/v1/accounts/{account_id}/capital/paper-funding"),
+            token,
+            json!({
+                "delta_usd": delta_usd,
+                "reason": "integration_test",
+                "idempotency_key": format!("test-fund-{account_id}-{delta_usd}")
+            }),
+        )
+        .await;
+    }
+
+    pub async fn bootstrap_capital(&self, token: &str, account_id: &str) {
+        self.send(
+            "POST",
+            &format!("/api/v1/accounts/{account_id}/capital/bootstrap"),
+            token,
+            json!({ "apply": true, }),
+        )
+        .await;
+    }
+
     pub async fn login_user(&self, email: &str, password: &str) -> String {
         let body = self
             .post(
@@ -256,6 +289,8 @@ impl TestApi {
                 &self.vault,
                 &self.books,
                 &self.pipeline,
+                &self.data,
+                &self.app_cfg,
                 outcome.event_id,
             )
             .await

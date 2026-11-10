@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import type { ApiClient } from "@pom/api-client";
+import { useToast } from "@/components/toast";
 
 type ControlState = {
   trading_control_state: string;
@@ -36,6 +37,7 @@ export function DangerZone({
   client: ApiClient;
   onChange?: () => void;
 }) {
+  const toast = useToast();
   const [control, setControl] = useState<ControlState | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -67,15 +69,18 @@ export function DangerZone({
     return () => clearInterval(timer);
   }, [accountId, client, lastOpId]);
 
-  async function post(path: string, body: unknown) {
+  async function post(path: string, body: unknown, successMessage: string) {
     setBusy(true);
     setError("");
     try {
       await client.request(path, { method: "POST", body: JSON.stringify(body) });
       await load();
       onChange?.();
+      toast.success(successMessage);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "request failed");
+      const msg = e instanceof Error ? e.message : "request failed";
+      setError(msg);
+      toast.error(msg);
     } finally {
       setBusy(false);
     }
@@ -84,25 +89,41 @@ export function DangerZone({
   async function onKillActivate(e: FormEvent) {
     e.preventDefault();
     if (!confirm("Stop ALL trading for this account? Outstanding BUY orders will be cancelled.")) return;
-    await post(`/api/v1/accounts/${accountId}/trading-control/kill-switch/activate`, { confirm: true });
+    await post(
+      `/api/v1/accounts/${accountId}/trading-control/kill-switch/activate`,
+      { confirm: true },
+      "Kill switch activated",
+    );
   }
 
   async function onKillDeactivate(e: FormEvent) {
     e.preventDefault();
     if (!confirm("Resume normal trading for this account?")) return;
-    await post(`/api/v1/accounts/${accountId}/trading-control/kill-switch/deactivate`, { confirm: true });
+    await post(
+      `/api/v1/accounts/${accountId}/trading-control/kill-switch/deactivate`,
+      { confirm: true },
+      "Kill switch deactivated",
+    );
   }
 
   async function onSoftActivate(e: FormEvent) {
     e.preventDefault();
     if (!confirm("Block new BUYs while allowing SELLs to close positions?")) return;
-    await post(`/api/v1/accounts/${accountId}/trading-control/soft-close/activate`, { confirm: true });
+    await post(
+      `/api/v1/accounts/${accountId}/trading-control/soft-close/activate`,
+      { confirm: true },
+      "Soft close activated",
+    );
   }
 
   async function onSoftDeactivate(e: FormEvent) {
     e.preventDefault();
     if (!confirm("Return to normal trading?")) return;
-    await post(`/api/v1/accounts/${accountId}/trading-control/soft-close/deactivate`, { confirm: true });
+    await post(
+      `/api/v1/accounts/${accountId}/trading-control/soft-close/deactivate`,
+      { confirm: true },
+      "Soft close deactivated",
+    );
   }
 
   async function loadPreview() {
@@ -116,7 +137,9 @@ export function DangerZone({
   async function onHardClose(e: FormEvent) {
     e.preventDefault();
     if (hardClosePhrase !== "CLOSE ALL") {
-      setError("Type CLOSE ALL to confirm");
+      const msg = "Type CLOSE ALL to confirm";
+      setError(msg);
+      toast.error(msg);
       return;
     }
     setBusy(true);
@@ -133,8 +156,11 @@ export function DangerZone({
       setLastOpId(res.operation_id);
       await load();
       onChange?.();
+      toast.info("Hard close started");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "hard close failed");
+      const msg = e instanceof Error ? e.message : "hard close failed";
+      setError(msg);
+      toast.error(msg);
     } finally {
       setBusy(false);
     }
@@ -143,12 +169,12 @@ export function DangerZone({
   async function onResume(e: FormEvent) {
     e.preventDefault();
     if (!confirm("Confirm you want to resume trading after a restricted state.")) return;
-    await post(`/api/v1/accounts/${accountId}/trading-control/resume`, { confirm: true });
+    await post(`/api/v1/accounts/${accountId}/trading-control/resume`, { confirm: true }, "Trading resumed");
   }
 
   async function onRetry() {
     if (!lastOpId) return;
-    await post(`/api/v1/accounts/${accountId}/hard-close/${lastOpId}/retry`, {});
+    await post(`/api/v1/accounts/${accountId}/hard-close/${lastOpId}/retry`, {}, "Hard close retry requested");
   }
 
   if (!control) return <p className="muted">Loading danger zone…</p>;

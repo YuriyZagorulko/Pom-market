@@ -3,6 +3,8 @@
 import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
 import { Desk } from "@/components/desk";
+import { SimpleFieldLabel } from "@/components/simple-field-label";
+import { useToast } from "@/components/toast";
 import { requestWithTimeout } from "@/lib/request-with-timeout";
 import { useSession } from "@/lib/session";
 
@@ -12,6 +14,7 @@ export default function NewTraderPage() {
 
 function Form() {
   const { client } = useSession();
+  const toast = useToast();
   const router = useRouter();
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -31,6 +34,7 @@ function Form() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Could not add wallet";
       setError(message);
+      toast.error(message);
       if (message.includes("timed out")) {
         try {
           const traders = await client.request<Array<{ id: string; wallet_address: string }>>("/api/v1/source-traders");
@@ -45,10 +49,16 @@ function Form() {
     }
   }
   return (
-    <form className="panel" onSubmit={onSubmit} style={{ display: "grid", gap: 10, maxWidth: 520 }}>
-      <h1>Add source wallet</h1>
-      <input name="alias" placeholder="Alias" required disabled={submitting} />
-      <input name="wallet_address" placeholder="Public 0x address" required disabled={submitting} />
+    <form className="panel form-stack" onSubmit={onSubmit} style={{ maxWidth: 520 }}>
+      <h1 style={{ margin: 0 }}>Add source wallet</h1>
+      <div className="form-field">
+        <SimpleFieldLabel htmlFor="trader-new-alias">Display alias</SimpleFieldLabel>
+        <input id="trader-new-alias" name="alias" required disabled={submitting} />
+      </div>
+      <div className="form-field">
+        <SimpleFieldLabel htmlFor="trader-new-wallet">Polymarket proxy wallet (0x…)</SimpleFieldLabel>
+        <input id="trader-new-wallet" name="wallet_address" required disabled={submitting} />
+      </div>
       {error && <div className="error">{error}</div>}
       <button type="submit" disabled={submitting}>{submitting ? "Adding…" : "Check and add"}</button>
       <p className="muted" style={{ margin: 0 }}>

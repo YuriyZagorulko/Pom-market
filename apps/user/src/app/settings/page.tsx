@@ -2,6 +2,8 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { Desk } from "@/components/desk";
+import { SimpleFieldLabel } from "@/components/simple-field-label";
+import { useToast } from "@/components/toast";
 import { useSession } from "@/lib/session";
 
 export default function SettingsPage() {
@@ -10,7 +12,7 @@ export default function SettingsPage() {
 
 function Settings() {
   const { client, user } = useSession();
-  const [message, setMessage] = useState("");
+  const toast = useToast();
   const [events, setEvents] = useState<string[]>([]);
   useEffect(() => {
     client.refresh().then((result) => {
@@ -22,18 +24,28 @@ function Settings() {
   async function changePassword(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const body = Object.fromEntries(new FormData(event.currentTarget).entries());
-    await client.request("/api/v1/auth/password/change", { method: "POST", body: JSON.stringify(body) });
-    setMessage("Password changed");
+    try {
+      await client.request("/api/v1/auth/password/change", { method: "POST", body: JSON.stringify(body) });
+      toast.success("Password changed");
+      event.currentTarget.reset();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not change password");
+    }
   }
   return (
     <section style={{ display: "grid", gap: 16 }}>
       <h1>Settings</h1>
       <div className="panel">{user?.email} · {user?.display_name}</div>
-      <form className="panel" onSubmit={changePassword} style={{ display: "grid", gap: 8, maxWidth: 420 }}>
-        <input name="current_password" type="password" placeholder="Current password" required />
-        <input name="new_password" type="password" placeholder="New password" minLength={10} required />
-        <button>Change password</button>
-        {message && <div className="ok">{message}</div>}
+      <form className="panel form-stack" onSubmit={changePassword} style={{ maxWidth: 420 }}>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="current_password">Current password</SimpleFieldLabel>
+          <input id="current_password" name="current_password" type="password" required autoComplete="current-password" />
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="new_password">New password</SimpleFieldLabel>
+          <input id="new_password" name="new_password" type="password" minLength={10} required autoComplete="new-password" />
+        </div>
+        <button type="submit">Change password</button>
       </form>
       <div className="panel">
         <h2>Live updates</h2>

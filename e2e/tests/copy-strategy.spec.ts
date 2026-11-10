@@ -1,13 +1,17 @@
+import { execSync } from "node:child_process";
+import * as path from "node:path";
 import { test, expect } from "@playwright/test";
 import { injectPaperTrade } from "../helpers/inject";
 import { loginUser, typeInto } from "./helpers/forms";
 import { apiLogin } from "../helpers/api";
 
+const repoRoot = path.resolve(__dirname, "../..");
+
 const adminEmail = process.env.E2E_ADMIN_EMAIL;
 const adminPassword = process.env.E2E_ADMIN_PASSWORD;
 const invitePassword = process.env.E2E_INVITED_USER_PASSWORD;
-const adminBase = process.env.E2E_ADMIN_BASE_URL ?? "http://127.0.0.1:4322";
-const apiBase = process.env.E2E_API_BASE_URL ?? "http://127.0.0.1:4321";
+const adminBase = process.env.E2E_ADMIN_BASE_URL ?? "http://127.0.0.1:4325";
+const apiBase = process.env.E2E_API_BASE_URL ?? "http://127.0.0.1:4324";
 const PAPER_API_XFF = "203.0.113.31";
 
 async function userToken(email: string, password: string) {
@@ -73,31 +77,63 @@ test("copy strategy wizard, preview, paper copies, utilization, live rejected", 
     method: "PATCH",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      paper_cash_usd: "5000",
       max_order_usd: "500",
       max_exposure_usd: "5000",
     }),
   });
+  await fetch(`${apiBase}/api/v1/accounts/${acct.id}/capital/paper-funding`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      delta_usd: "5000",
+      reason: "e2e_copy_strategy",
+      idempotency_key: `e2e-copy-fund-${stamp}`,
+    }),
+  });
+  await fetch(`${apiBase}/api/v1/accounts/${acct.id}/capital/bootstrap`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ apply: true }),
+  });
 
   await user.goto("/traders/new");
-  await typeInto(user.getByPlaceholder("Alias"), "E2E Leader");
-  await typeInto(user.getByPlaceholder("Public 0x address"), wallet);
+  await typeInto(user.getByLabel("Display alias"), "E2E Leader");
+  await typeInto(user.getByLabel(/Polymarket proxy wallet/), wallet);
   await user.getByRole("button", { name: "Check and add" }).click();
   await expect(user).toHaveURL(/\/traders\/[0-9a-f-]+/, { timeout: 30_000 });
   const traderId = user.url().split("/").pop()!;
+  const monRes = await fetch(`${apiBase}/api/v1/source-traders/${traderId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ monitoring_enabled: true }),
+  });
+  expect(monRes.ok).toBeTruthy();
 
   await user.goto(`/traders/${traderId}/strategy/new`);
-  await user.locator("select").first().selectOption({ label: "Copy Paper" });
+  const accountSelect = user.locator("select").filter({ has: user.locator("option", { hasText: "Copy Paper" }) });
+  await expect(accountSelect.locator("option")).toHaveCount(2, { timeout: 30_000 });
+  await accountSelect.selectOption({ index: 1 });
   await user.getByRole("button", { name: "$2,000" }).click();
+  await user.locator("select:has(option[value='proportional'])").selectOption("proportional");
   await user.getByRole("button", { name: "10%" }).click();
-  await user.getByPlaceholder("Max per trade USD").fill("200");
+  await typeInto(user.getByLabel(/Max position \/ per trade/), "200");
+  const previewResp = user.waitForResponse(
+    (r) => r.url().includes("/copy-preview") && r.request().method() === "POST",
+    { timeout: 30_000 },
+  );
   await user.getByRole("button", { name: "Preview recent trades" }).click();
-  await expect(user.getByRole("heading", { name: "Trade preview" })).toBeVisible({ timeout: 15_000 });
+  const previewHttp = await previewResp;
+  expect(previewHttp.ok()).toBeTruthy();
+  await expect(user.getByRole("heading", { name: "Trade preview (estimate)" })).toBeVisible({
+    timeout: 15_000,
+  });
 
+  user.once("dialog", (d) => d.accept());
   await user.getByRole("button", { name: "Create disabled strategy" }).click();
   await user.waitForURL(/\/strategies\/[a-f0-9-]+/, { timeout: 15_000 });
   const strategyId = user.url().split("/").pop()!;
-  await expect(user.getByRole("heading", { name: "Budget overview" })).toBeVisible();
+  await expect(user.getByRole("button", { name: "Overview" })).toBeVisible({ timeout: 15_000 });
+  await expect(user.getByText(/Partial equity/i).first()).toBeVisible({ timeout: 15_000 });
 
   user.once("dialog", (d) => d.accept());
   await user.getByRole("button", { name: /Enable strategy/ }).click();
@@ -115,12 +151,7 @@ test("copy strategy wizard, preview, paper copies, utilization, live rejected", 
   injectPaperTrade(wallet, "sell", `${stamp}-sell1`);
   await user.waitForTimeout(2000);
 
-  const liveRes = await fetch(`${apiBase}/api/v1/strategies/${strategyId}/enable`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled: true }),
-  });
-  await fetch(`${apiBase}/api/v1/accounts/${acct.id}/mode`, {
+  const modeRes = await fetch(`${apiBase}/api/v1/accounts/${acct.id}/mode`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -129,12 +160,20 @@ test("copy strategy wizard, preview, paper copies, utilization, live rejected", 
       confirmation: "ENABLE LIVE TRADING",
     }),
   });
+  expect(modeRes.status).toBeGreaterThanOrEqual(400);
+
+  execSync(
+    `docker compose exec -T postgres psql -U pommarket -d pommarket_e2e -c "UPDATE trading_accounts SET operating_mode = 'live_trading' WHERE id = '${acct.id}'"`,
+    { cwd: repoRoot, stdio: "pipe" },
+  );
   const liveEnable = await fetch(`${apiBase}/api/v1/strategies/${strategyId}/enable`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ enabled: true }),
   });
   expect(liveEnable.status).toBeGreaterThanOrEqual(400);
+  const liveBody = (await liveEnable.json()) as { error?: string };
+  expect(liveBody.error ?? "").toMatch(/live copy/i);
 
   await user.close();
 });

@@ -1,8 +1,10 @@
+pub mod account_allocation;
 pub mod api;
 pub mod auth;
 pub mod client_ip;
 pub mod config;
 pub mod copy_preview;
+pub mod copy_sizing;
 pub mod db;
 pub mod email;
 pub mod engine;
@@ -11,6 +13,9 @@ pub mod pipeline;
 pub mod polymarket;
 pub mod rate_limit;
 pub mod security;
+pub mod source_equity;
+pub mod strategy_accounting;
+pub mod strategy_analytics;
 pub mod strategy_budget;
 pub mod trading_control;
 

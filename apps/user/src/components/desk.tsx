@@ -44,7 +44,7 @@ export function Desk({ children }: { children: React.ReactNode }) {
 
 export function useResource<T>(
   path: string,
-  options?: { refreshMs?: number },
+  options?: { refreshMs?: number; enabled?: boolean },
 ) {
   const { client, user } = useSession();
   const [data, setData] = useState<T | null>(null);
@@ -52,8 +52,13 @@ export function useResource<T>(
   const [loading, setLoading] = useState(true);
   const [nonce, setNonce] = useState(0);
   const [refreshMs] = useState(options?.refreshMs);
+  const enabled = options?.enabled !== false;
 
   useEffect(() => {
+    if (!enabled || !path) {
+      setLoading(false);
+      return;
+    }
     if (!user) {
       setLoading(false);
       return;
@@ -110,7 +115,7 @@ export function useResource<T>(
       if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [client, path, user, nonce, refreshMs]);
+  }, [client, path, user, nonce, refreshMs, enabled]);
 
   return {
     data,

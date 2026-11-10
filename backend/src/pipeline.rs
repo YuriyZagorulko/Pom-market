@@ -5,17 +5,17 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::copy_sizing::{capped_copy_notional, BuyNotionalLimits, StrategyModeParams};
 use crate::db::begin_as;
 use crate::engine::{
     available_after_reserve, conservative_fee_price, limit_price, order_reserves, plan_exit,
-    reconcile_live_status, reserves_after_execution, slippage_bps, target_notional, trace_buy_size,
-    truncate_lot, walk_book, FeeSchedule, OrderBook, RejectReason, RemoteObservation, SizingInput,
-    SizingMode, EXCHANGE_MIN_NOTIONAL,
+    reconcile_live_status, reserves_after_execution, slippage_bps, trace_buy_size, truncate_lot,
+    walk_book, FeeSchedule, OrderBook, RejectReason, RemoteObservation, EXCHANGE_MIN_NOTIONAL,
 };
 use crate::polymarket::live::{place_fak, LiveOrderRequest};
 use crate::polymarket::RawTrade;
 use crate::security::{credential_aad, redact, Vault};
-use crate::strategy_budget::strategy_exposure_usd;
+use crate::strategy_budget::strategy_exposure_with_cap;
 use crate::trading_control;
 use secrecy::SecretString;
 
@@ -25,6 +25,7 @@ pub trait Books: Send + Sync {
     async fn fee(&self, token_id: &str) -> Option<FeeSchedule>;
 }
 
+#[derive(Clone)]
 pub struct PipelineConfig {
     pub clob_host: String,
     pub confirm_live: bool,
@@ -158,6 +159,8 @@ pub async fn process_event(
     vault: &Vault,
     books: &dyn Books,
     cfg: &PipelineConfig,
+    data: &crate::polymarket::http::PublicClient,
+    app_cfg: &crate::config::Config,
     event_id: Uuid,
 ) -> anyhow::Result<Vec<Uuid>> {
     let mut tx = begin_as(pool, None, "worker").await?;
@@ -174,6 +177,7 @@ pub async fn process_event(
     .await?;
     let strategies = sqlx::query_as::<_, StrategyRow>(
         "SELECT s.id, s.user_id, s.trading_account_id, s.source_trader_id, s.enabled, s.sizing_mode,
+                s.allocation_mode, s.allocation_percent,
                 s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd, s.max_position_usd,
                 s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
                 s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets, s.created_at,
@@ -203,7 +207,18 @@ pub async fn process_event(
         if strategy.created_at.timestamp() > event.event_ts.timestamp() {
             continue;
         }
-        let id = decide_one(pool, vault, cfg, &event, &strategy, &book, fee.as_ref()).await?;
+        let id = decide_one(
+            pool,
+            vault,
+            cfg,
+            data,
+            app_cfg,
+            &event,
+            &strategy,
+            &book,
+            fee.as_ref(),
+        )
+        .await?;
         decisions.push(id);
     }
     let mut tx = begin_as(pool, None, "worker").await?;
@@ -228,10 +243,13 @@ pub async fn process_event(
     Ok(decisions)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn decide_one(
     pool: &PgPool,
     vault: &Vault,
     cfg: &PipelineConfig,
+    data: &crate::polymarket::http::PublicClient,
+    app_cfg: &crate::config::Config,
     event: &EventRow,
     strategy: &StrategyRow,
     book: &Result<OrderBook, String>,
@@ -274,7 +292,15 @@ async fn decide_one(
     .bind(&strategy.operating_mode)
     .fetch_one(&mut *tx)
     .await?;
-    let strategy_exposure = strategy_exposure_usd(&mut tx, strategy.id).await?;
+    let (strategy_exposure, effective_budget) = strategy_exposure_with_cap(
+        &mut tx,
+        strategy.id,
+        strategy.trading_account_id,
+        &strategy.allocation_mode,
+        strategy.strategy_budget_usd,
+        strategy.allocation_percent,
+    )
+    .await?;
     let open_positions: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM positions
          WHERE strategy_id = $1 AND open_shares > 0",
@@ -350,33 +376,45 @@ async fn decide_one(
             && Utc::now() - at < Duration::seconds(strategy.cooldown_seconds as i64)
     }) {
         reason = Some(RejectReason::Cooldown);
+    } else if strategy.operating_mode == "paper_trading"
+        && !crate::strategy_accounting::is_capital_bootstrapped(&mut tx, strategy.id).await?
+    {
+        reason = Some(RejectReason::StrategyCapitalNotInitialized);
     }
 
-    let cash: Decimal = if strategy.operating_mode == "paper_trading" {
-        sqlx::query_scalar(
-            "SELECT paper_cash_usd FROM account_risk_limits WHERE trading_account_id = $1",
+    let (_cash, _open_reserve, available) = if strategy.operating_mode == "paper_trading" {
+        crate::strategy_accounting::ensure_strategy_capital_row(
+            &mut tx,
+            strategy.user_id,
+            strategy.trading_account_id,
+            strategy.id,
         )
-        .bind(strategy.trading_account_id)
-        .fetch_one(&mut *tx)
-        .await?
+        .await?;
+        let (avail, res) =
+            crate::strategy_accounting::strategy_liquid_balances(&mut tx, strategy.id).await?;
+        (avail, res, avail)
     } else {
-        sqlx::query_scalar(
+        let cash: Decimal = sqlx::query_scalar(
             "SELECT COALESCE(last_exchange_balance_usd, 0) FROM trading_accounts WHERE id = $1",
         )
         .bind(strategy.trading_account_id)
         .fetch_one(&mut *tx)
-        .await?
+        .await?;
+        let open_reserve: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(position_reserved_usd + fee_reserved_usd), 0) FROM orders
+             WHERE trading_account_id = $1 AND operating_mode = $2
+               AND status IN ('pending', 'submitting', 'submitted', 'partially_filled', 'unknown')",
+        )
+        .bind(strategy.trading_account_id)
+        .bind(&strategy.operating_mode)
+        .fetch_one(&mut *tx)
+        .await?;
+        (
+            cash,
+            open_reserve,
+            available_after_reserve(cash, open_reserve),
+        )
     };
-    let open_reserve: Decimal = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(position_reserved_usd + fee_reserved_usd), 0) FROM orders
-         WHERE trading_account_id = $1 AND operating_mode = $2
-           AND status IN ('pending', 'submitting', 'submitted', 'partially_filled', 'unknown')",
-    )
-    .bind(strategy.trading_account_id)
-    .bind(&strategy.operating_mode)
-    .fetch_one(&mut *tx)
-    .await?;
-    let available = available_after_reserve(cash, open_reserve);
     let slip = strategy.max_slippage_bps.min(strategy.account_max_slippage);
     let tick = book.as_ref().map(|b| b.tick).unwrap_or(Decimal::new(1, 2));
     let limit = limit_price(side_buy, event.price, slip, tick);
@@ -410,17 +448,50 @@ async fn decide_one(
                 reason = Some(RejectReason::MaxPositions);
             }
         }
+        let mut portfolio_equity: Option<Decimal> = None;
+        let mut portfolio_equity_status = None;
+        if reason.is_none() && strategy.sizing_mode == "portfolio_ratio" {
+            let mut snap =
+                crate::source_equity::load_snapshot(pool, strategy.source_trader_id, app_cfg)
+                    .await?;
+            if snap
+                .as_ref()
+                .map(|s| !s.status.allows_portfolio_buy())
+                .unwrap_or(true)
+            {
+                let live = crate::source_equity::fetch_live_equity(
+                    data,
+                    app_cfg,
+                    &strategy.wallet_address,
+                )
+                .await;
+                crate::source_equity::upsert_snapshot(pool, strategy.source_trader_id, &live)
+                    .await?;
+                snap = Some(live);
+            }
+            match snap {
+                Some(s) if s.status.allows_portfolio_buy() => {
+                    portfolio_equity = s.total_equity_usd;
+                    portfolio_equity_status = Some(s.status);
+                }
+                _ => reason = Some(RejectReason::SourceEquityUnavailable),
+            }
+        }
         if reason.is_none() {
-            let sizing = SizingInput {
-                mode: parse_mode(&strategy.sizing_mode),
+            let mode_params = StrategyModeParams {
+                sizing_mode: strategy.sizing_mode.clone(),
                 fixed_amount_usd: strategy.fixed_amount_usd,
                 proportion: strategy.proportion,
                 multiplier: strategy.multiplier,
-                source_notional: event.notional_usd,
-                max_order_usd: strategy.max_order_usd.min(strategy.max_position_usd),
+                strategy_allocated_capital_usd: effective_budget,
+                source_trader_equity_usd: portfolio_equity,
+                source_equity_status: portfolio_equity_status,
+            };
+            let limits = BuyNotionalLimits {
+                max_order_usd: strategy.max_order_usd,
+                max_position_usd: strategy.max_position_usd,
                 min_order_usd: strategy.min_order_usd,
-                strategy_remaining_usd: (strategy.strategy_budget_usd - strategy_exposure)
-                    .max(Decimal::ZERO),
+                strategy_remaining_usd: (effective_budget - strategy_exposure).max(Decimal::ZERO),
                 account_exposure_remaining_usd: (strategy
                     .account_max_exposure
                     .min(strategy.max_exposure_usd)
@@ -428,7 +499,7 @@ async fn decide_one(
                     .max(Decimal::ZERO),
                 available_balance_usd: available,
             };
-            match target_notional(&sizing) {
+            match capped_copy_notional(&mode_params, event.notional_usd, &limits) {
                 Ok(notional) => {
                     target_notional_usd = notional;
                     let (min_order_size, liquidity) = match &book {
@@ -440,7 +511,7 @@ async fn decide_one(
                         ),
                         Err(_) => (Decimal::ZERO, Decimal::MAX),
                     };
-                    let spend_cap = (strategy.strategy_budget_usd - strategy_exposure)
+                    let spend_cap = (effective_budget - strategy_exposure)
                         .min(
                             strategy.account_max_exposure.min(strategy.max_exposure_usd) - exposure,
                         )
@@ -649,6 +720,19 @@ async fn decide_one(
     .bind(order_reserves(side_buy, limit, fill.shares, fee_price, fee).1)
     .fetch_one(&mut *tx)
     .await?;
+    if strategy.operating_mode == "paper_trading" && side_buy {
+        let (pos_r, fee_r) = order_reserves(side_buy, limit, fill.shares, fee_price, fee);
+        crate::strategy_accounting::reserve_order_cash(
+            &mut tx,
+            strategy.user_id,
+            strategy.trading_account_id,
+            strategy.id,
+            order_id,
+            pos_r + fee_r,
+            &format!("order-reserve:{}", order_id),
+        )
+        .await?;
+    }
     sqlx::query("UPDATE orders SET status = 'submitting', updated_at = now() WHERE id = $1")
         .bind(order_id)
         .execute(&mut *tx)
@@ -688,9 +772,9 @@ async fn settle_paper(
     let mut tx = begin_as(pool, None, "worker").await?;
     let fee = fill.fee_usd.unwrap_or(Decimal::ZERO);
     let fee_status = fill.fee_status;
-    sqlx::query(
+    let fill_id: Uuid = sqlx::query_scalar(
         "INSERT INTO fills (user_id, trading_account_id, order_id, price, shares, notional_usd, fee_usd, fee_status, slippage_vs_source_bps, slippage_vs_limit_bps)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
     )
     .bind(strategy.user_id)
     .bind(strategy.trading_account_id)
@@ -702,8 +786,29 @@ async fn settle_paper(
     .bind(fee_status)
     .bind(slippage_bps(event.price, fill.vwap))
     .bind(slippage_bps(event.price, fill.vwap))
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+    let sell_cost_released = if !side_buy {
+        let pos = sqlx::query_as::<_, PositionRow>(
+            "SELECT id, open_shares, avg_price, cost_basis_usd, realized_pnl_usd, source_observed_shares, pending_exit_shares
+             FROM positions WHERE strategy_id = $1 AND token_id = $2 AND operating_mode = 'paper_trading' FOR UPDATE",
+        )
+        .bind(strategy.id)
+        .bind(&event.token_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        pos.map(|p| {
+            let sold = fill.shares.min(p.open_shares);
+            if p.open_shares > Decimal::ZERO {
+                (p.cost_basis_usd * sold / p.open_shares).round_dp(8)
+            } else {
+                Decimal::ZERO
+            }
+        })
+        .unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
     apply_position(
         &mut tx,
         strategy,
@@ -716,16 +821,38 @@ async fn settle_paper(
         event.size_shares,
     )
     .await?;
-    let cash_delta = if side_buy {
-        -(fill.notional + fee)
-    } else {
-        fill.notional - fee
-    };
-    sqlx::query("UPDATE account_risk_limits SET paper_cash_usd = paper_cash_usd + $2, updated_at = now() WHERE trading_account_id = $1")
-        .bind(strategy.trading_account_id)
-        .bind(cash_delta)
-        .execute(&mut *tx)
+    if !crate::strategy_accounting::is_capital_bootstrapped(&mut tx, strategy.id).await? {
+        anyhow::bail!("strategy capital not bootstrapped");
+    }
+    if side_buy {
+        crate::strategy_accounting::apply_paper_buy_fill(
+            &mut tx,
+            strategy.user_id,
+            strategy.trading_account_id,
+            strategy.id,
+            order_id,
+            fill_id,
+            fill.notional,
+            fee,
+            &format!("fill-buy:{}", fill_id),
+        )
         .await?;
+    } else {
+        crate::strategy_accounting::apply_paper_sell_fill(
+            &mut tx,
+            strategy.user_id,
+            strategy.trading_account_id,
+            Some(strategy.id),
+            order_id,
+            fill_id,
+            fill.notional - fee,
+            sell_cost_released,
+            &format!("fill-sell:{}", fill_id),
+            "sell_fill",
+        )
+        .await?;
+        crate::strategy_accounting::sync_invested_from_positions(&mut tx, strategy.id).await?;
+    }
     let status = if fill.complete {
         "filled"
     } else {
@@ -755,6 +882,21 @@ async fn settle_paper(
         .bind(fee_left)
         .execute(&mut *tx)
         .await?;
+    if side_buy {
+        let unused_reserve = position_left + fee_left;
+        if unused_reserve > Decimal::ZERO {
+            crate::strategy_accounting::release_order_reserve(
+                &mut tx,
+                strategy.user_id,
+                strategy.trading_account_id,
+                strategy.id,
+                order_id,
+                unused_reserve,
+                &format!("fill-release-unused:{}", fill_id),
+            )
+            .await?;
+        }
+    }
     sqlx::query(
         "UPDATE source_traders SET copied_trade_count = copied_trade_count + 1 WHERE id = $1",
     )
@@ -949,6 +1091,24 @@ pub async fn cancel_open_buy_orders(
     account_id: Uuid,
     operating_mode: &str,
 ) -> anyhow::Result<u64> {
+    let order_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM orders
+         WHERE trading_account_id = $1 AND operating_mode = $2 AND side = 'buy'
+           AND status IN ('pending', 'submitting', 'submitted', 'partially_filled', 'unknown')
+         FOR UPDATE",
+    )
+    .bind(account_id)
+    .bind(operating_mode)
+    .fetch_all(&mut **tx)
+    .await?;
+    for oid in &order_ids {
+        crate::strategy_accounting::release_copy_order_reserves(
+            tx,
+            *oid,
+            &format!("bulk-cancel-buy:{}", oid),
+        )
+        .await?;
+    }
     let result = sqlx::query(
         "UPDATE orders SET status = 'cancelled', position_reserved_usd = 0, fee_reserved_usd = 0,
             updated_at = now(), error = COALESCE(error, 'cancelled_by_trading_control')
@@ -1062,9 +1222,15 @@ pub async fn paper_sell_position(
     book: &Result<OrderBook, String>,
     fee: Option<&FeeSchedule>,
 ) -> anyhow::Result<()> {
-    let mut tx = begin_as(pool, None, "worker").await?;
-    let pos: PositionRow = sqlx::query_as(
-        "SELECT id, open_shares, avg_price, cost_basis_usd, realized_pnl_usd, source_observed_shares, pending_exit_shares
+    let mut tx = begin_as(pool, Some(user_id), "worker").await?;
+    let idem_key = format!("hard-close-fill:{}", item_id);
+    if crate::strategy_accounting::ledger_idempotency_exists(&mut tx, &idem_key).await? {
+        tx.commit().await?;
+        return Ok(());
+    }
+    let pos: PaperSellPositionRow = sqlx::query_as(
+        "SELECT id, strategy_id, source_wallet, market_title, operating_mode,
+                open_shares, avg_price, cost_basis_usd, realized_pnl_usd, source_observed_shares, pending_exit_shares
          FROM positions WHERE id = $1 AND trading_account_id = $2 AND user_id = $3 FOR UPDATE",
     )
     .bind(position_id)
@@ -1094,6 +1260,13 @@ pub async fn paper_sell_position(
     }
     let sell_shares = want_shares.min(available);
     let book = book.as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
+    if book.min_order_size > Decimal::ZERO && sell_shares < book.min_order_size {
+        anyhow::bail!(
+            "below_minimum_order_size: sellable {} < market min {}",
+            sell_shares,
+            book.min_order_size
+        );
+    }
     let slip = 500;
     let tick = book.tick;
     let ref_price = book
@@ -1121,9 +1294,9 @@ pub async fn paper_sell_position(
     .fetch_one(&mut *tx)
     .await?;
     let fee_amount = fill.fee_usd.unwrap_or(Decimal::ZERO);
-    sqlx::query(
+    let fill_id: Uuid = sqlx::query_scalar(
         "INSERT INTO fills (user_id, trading_account_id, order_id, price, shares, notional_usd, fee_usd, fee_status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
     )
     .bind(user_id)
     .bind(account_id)
@@ -1133,7 +1306,7 @@ pub async fn paper_sell_position(
     .bind(fill.notional)
     .bind(fill.fee_usd)
     .bind(fill.fee_status)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
     let sold = fill.shares.min(pos.open_shares);
     let released = if pos.open_shares > Decimal::ZERO {
@@ -1152,13 +1325,52 @@ pub async fn paper_sell_position(
     .bind(pnl)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE account_risk_limits SET paper_cash_usd = paper_cash_usd + $2, updated_at = now() WHERE trading_account_id = $1",
-    )
-    .bind(account_id)
-    .bind(fill.notional - fee_amount)
-    .execute(&mut *tx)
-    .await?;
+    if remaining == Decimal::ZERO {
+        sqlx::query(
+            "INSERT INTO closed_positions (user_id, trading_account_id, strategy_id, source_wallet, token_id, market_title, operating_mode, closed_shares, realized_pnl_usd)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        )
+        .bind(user_id)
+        .bind(account_id)
+        .bind(pos.strategy_id)
+        .bind(&pos.source_wallet)
+        .bind(token_id)
+        .bind(&pos.market_title)
+        .bind(&pos.operating_mode)
+        .bind(sold)
+        .bind(pnl)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let use_ledger = match pos.strategy_id {
+        Some(sid) => crate::strategy_accounting::is_capital_bootstrapped(&mut tx, sid).await?,
+        None => false,
+    };
+    if use_ledger {
+        let sid = pos.strategy_id.expect("strategy_id");
+        crate::strategy_accounting::apply_paper_sell_fill(
+            &mut tx,
+            user_id,
+            account_id,
+            Some(sid),
+            order_id,
+            fill_id,
+            fill.notional - fee_amount,
+            released,
+            &idem_key,
+            "hard_close_sell",
+        )
+        .await?;
+        crate::strategy_accounting::sync_invested_from_positions(&mut tx, sid).await?;
+    } else {
+        sqlx::query(
+            "UPDATE account_risk_limits SET paper_cash_usd = paper_cash_usd + $2, updated_at = now() WHERE trading_account_id = $1",
+        )
+        .bind(account_id)
+        .bind(fill.notional - fee_amount)
+        .execute(&mut *tx)
+        .await?;
+    }
     let item_status =
         if remaining <= Decimal::ZERO || remaining <= Decimal::new(1, 4) || fill.complete {
             "closed"
@@ -1190,6 +1402,14 @@ async fn mark_order(
     exchange_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut tx = begin_as(pool, None, "worker").await?;
+    if matches!(status, "cancelled" | "rejected" | "failed") {
+        crate::strategy_accounting::release_copy_order_reserves(
+            &mut tx,
+            order_id,
+            &format!("mark-order-{status}:{order_id}"),
+        )
+        .await?;
+    }
     sqlx::query(
         "UPDATE orders SET status = $2, error = $3, exchange_order_id = COALESCE($4, exchange_order_id), updated_at = now(),
             position_reserved_usd = CASE WHEN $2 IN ('cancelled', 'rejected', 'failed') THEN 0 ELSE position_reserved_usd END,
@@ -1282,11 +1502,12 @@ async fn apply_position(
         .await?;
         if remaining == Decimal::ZERO {
             sqlx::query(
-                "INSERT INTO closed_positions (user_id, trading_account_id, source_wallet, token_id, market_title, operating_mode, closed_shares, realized_pnl_usd)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                "INSERT INTO closed_positions (user_id, trading_account_id, strategy_id, source_wallet, token_id, market_title, operating_mode, closed_shares, realized_pnl_usd)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             )
             .bind(strategy.user_id)
             .bind(strategy.trading_account_id)
+            .bind(strategy.id)
             .bind(&strategy.wallet_address)
             .bind(&event.token_id)
             .bind(&event.market_title)
@@ -1432,14 +1653,6 @@ pub async fn notify(pool: &PgPool, user_id: Uuid, kind: &str, id: Uuid) -> anyho
     Ok(())
 }
 
-fn parse_mode(value: &str) -> SizingMode {
-    match value {
-        "proportional" => SizingMode::Proportional,
-        "multiplier" => SizingMode::Multiplier,
-        _ => SizingMode::FixedAmount,
-    }
-}
-
 fn market_allowed(allowed: &Value, event: &EventRow) -> bool {
     let Some(items) = allowed.as_array() else {
         return true;
@@ -1481,6 +1694,8 @@ struct StrategyRow {
     source_trader_id: Uuid,
     enabled: bool,
     sizing_mode: String,
+    allocation_mode: String,
+    allocation_percent: Option<Decimal>,
     fixed_amount_usd: Option<Decimal>,
     proportion: Option<Decimal>,
     multiplier: Option<Decimal>,
@@ -1522,6 +1737,24 @@ struct PositionRow {
     avg_price: Decimal,
     cost_basis_usd: Decimal,
     realized_pnl_usd: Decimal,
+    source_observed_shares: Decimal,
+    pending_exit_shares: Decimal,
+}
+
+#[derive(sqlx::FromRow)]
+struct PaperSellPositionRow {
+    #[allow(dead_code)]
+    id: Uuid,
+    strategy_id: Option<Uuid>,
+    source_wallet: String,
+    market_title: Option<String>,
+    operating_mode: String,
+    open_shares: Decimal,
+    avg_price: Decimal,
+    cost_basis_usd: Decimal,
+    #[allow(dead_code)]
+    realized_pnl_usd: Decimal,
+    #[allow(dead_code)]
     source_observed_shares: Decimal,
     pending_exit_shares: Decimal,
 }

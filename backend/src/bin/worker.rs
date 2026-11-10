@@ -13,6 +13,7 @@ use pommarket::polymarket::rtds;
 use pommarket::polymarket::{decode_order_filled, decoded_to_trade, order_filled_topic};
 use pommarket::security::Vault;
 
+#[derive(Clone)]
 struct HttpBooks(PublicClient);
 
 #[async_trait::async_trait]
@@ -58,23 +59,32 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let rtds_pool = pool.clone();
     let rtds_books = HttpBooks(client.clone());
-    let rtds_cfg = PipelineConfig {
-        clob_host: pipeline.clob_host.clone(),
-        confirm_live: pipeline.confirm_live,
-        default_fee_rate: pipeline.default_fee_rate,
-        default_fee_exponent: pipeline.default_fee_exponent,
-    };
+    let rtds_pipeline = pipeline.clone();
     let rtds_vault = vault.clone();
     let rtds_url = cfg.rtds_url.clone();
+    let rtds_client = client.clone();
+    let rtds_app_cfg = cfg.clone();
     tokio::spawn(async move {
-        rtds::run_rtds(rtds_url, |trades| {
+        rtds::run_rtds(rtds_url, move |trades| {
             let pool = rtds_pool.clone();
-            let books = &rtds_books;
-            let cfg = &rtds_cfg;
+            let books = rtds_books.clone();
             let vault = rtds_vault.clone();
+            let rtds_client = rtds_client.clone();
+            let rtds_app_cfg = rtds_app_cfg.clone();
+            let pipe = rtds_pipeline.clone();
             async move {
                 for trade in trades {
-                    if let Err(err) = handle_trade(&pool, &vault, books, cfg, trade).await {
+                    if let Err(err) = handle_trade(
+                        &pool,
+                        &vault,
+                        &books,
+                        &pipe,
+                        &rtds_client,
+                        &rtds_app_cfg,
+                        trade,
+                    )
+                    .await
+                    {
                         tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "rtds trade failed");
                     }
                 }
@@ -87,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(0);
     loop {
         heartbeat(&pool).await;
-        if let Err(err) = poll_data_api(&pool, &client, &vault, &books, &pipeline).await {
+        if let Err(err) = poll_data_api(&pool, &client, &vault, &books, &pipeline, &cfg).await {
             tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "data api poll failed");
             set_collector(&pool, "data_api", "error").await;
         } else {
@@ -135,6 +145,12 @@ async fn main() -> anyhow::Result<()> {
         {
             tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "reconciliation failed");
         }
+        if let Err(err) =
+            pommarket::strategy_analytics::record_snapshots_for_enabled_strategies(&pool, &cfg)
+                .await
+        {
+            tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "strategy analytics snapshot failed");
+        }
         sleep(Duration::from_secs(cfg.worker_poll_seconds)).await;
     }
 }
@@ -143,7 +159,9 @@ async fn handle_trade(
     pool: &PgPool,
     vault: &Vault,
     books: &impl Books,
-    cfg: &PipelineConfig,
+    pipeline: &PipelineConfig,
+    data: &PublicClient,
+    app_cfg: &Config,
     trade: pommarket::polymarket::RawTrade,
 ) -> anyhow::Result<()> {
     let watched = wallet_watched(pool, &trade.source_wallet).await?;
@@ -152,7 +170,16 @@ async fn handle_trade(
     }
     let outcome = ingest(pool, &trade).await?;
     if outcome.created || !outcome.duplicate_fragment {
-        process_event(pool, vault, books, cfg, outcome.event_id).await?;
+        process_event(
+            pool,
+            vault,
+            books,
+            pipeline,
+            data,
+            app_cfg,
+            outcome.event_id,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -173,7 +200,8 @@ async fn poll_data_api(
     client: &PublicClient,
     vault: &Vault,
     books: &impl Books,
-    cfg: &PipelineConfig,
+    pipeline: &PipelineConfig,
+    app_cfg: &Config,
 ) -> anyhow::Result<()> {
     let mut tx = begin_as(pool, None, "worker").await?;
     let wallets: Vec<String> = sqlx::query_scalar(
@@ -191,7 +219,7 @@ async fn poll_data_api(
                 .await
                 .map_err(anyhow::Error::msg)?;
             for trade in trades {
-                handle_trade(pool, vault, books, cfg, trade).await?;
+                handle_trade(pool, vault, books, pipeline, client, app_cfg, trade).await?;
             }
             let Some(next) = next else { break };
             if !seen_cursors.insert(next.clone()) {
@@ -250,7 +278,7 @@ async fn poll_polygon(
                 .unwrap_or("");
             if let Some(decoded) = decode_order_filled(&topics, data, tx) {
                 let trade = decoded_to_trade(decoded, log);
-                handle_trade(pool, vault, books, pipeline, trade).await?;
+                handle_trade(pool, vault, books, pipeline, client, cfg, trade).await?;
             }
         }
     }

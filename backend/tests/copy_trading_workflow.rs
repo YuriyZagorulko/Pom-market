@@ -97,6 +97,7 @@ async fn proportional_budget_utilization_and_attribution() {
         default_fee_exponent: 1,
     };
     let book = FixedBook;
+    let (data, app_cfg) = test_support::pipeline_runtime();
 
     let user_id: Uuid = sqlx::query_scalar(
         "INSERT INTO users (email, display_name, password_hash, role, status, email_verified_at)
@@ -150,14 +151,24 @@ async fn proportional_budget_utilization_and_attribution() {
     .await
     .unwrap();
 
+    test_support::bootstrap_paper_capital_for_account(&worker, account_id).await;
+
     let wallet = "0x1111111111111111111111111111111111111111";
     let buy1 = trade("buy", "2000", wallet, "tok-a");
     let out1 = ingest(&worker, &buy1).await.unwrap();
-    process_event(&worker, &vault, &book, &pipeline, out1.event_id)
-        .await
-        .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &book,
+        &pipeline,
+        &data,
+        &app_cfg,
+        out1.event_id,
+    )
+    .await
+    .unwrap();
 
-    let util = utilization_for_user(&worker, user_id, strategy_id)
+    let util = utilization_for_user(&worker, user_id, strategy_id, &app_cfg)
         .await
         .unwrap();
     assert!(util.deployed_capital_usd > Decimal::ZERO);
@@ -176,11 +187,19 @@ async fn proportional_budget_utilization_and_attribution() {
 
     let sell = trade("sell", "1000", wallet, "tok-a");
     let sell_out = ingest(&worker, &sell).await.unwrap();
-    process_event(&worker, &vault, &book, &pipeline, sell_out.event_id)
-        .await
-        .unwrap();
+    process_event(
+        &worker,
+        &vault,
+        &book,
+        &pipeline,
+        &data,
+        &app_cfg,
+        sell_out.event_id,
+    )
+    .await
+    .unwrap();
 
-    let util2 = utilization_for_user(&worker, user_id, strategy_id)
+    let util2 = utilization_for_user(&worker, user_id, strategy_id, &app_cfg)
         .await
         .unwrap();
     assert!(

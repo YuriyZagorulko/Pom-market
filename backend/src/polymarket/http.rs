@@ -296,6 +296,55 @@ impl PublicClient {
             .cloned()
             .unwrap_or_default())
     }
+
+    /// `GET /v2/value` — open position mark value (excludes free collateral).
+    pub async fn portfolio_value_usd(&self, proxy_wallet: &str) -> Result<Decimal, String> {
+        let url = format!("{}/v2/value", self.data_api.trim_end_matches('/'));
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("user", proxy_wallet)])
+            .send()
+            .await
+            .map_err(|e| redact(&e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(format!("data api value HTTP {}", response.status()));
+        }
+        let body: Value = response.json().await.map_err(|e| redact(&e.to_string()))?;
+        let node = body.get("data").unwrap_or(&body);
+        node.get("value")
+            .and_then(json_decimal)
+            .ok_or_else(|| "value field missing".into())
+    }
+
+    /// Sum `current_value` on combo positions when present.
+    pub async fn combo_positions_value_usd(&self, proxy_wallet: &str) -> Result<Decimal, String> {
+        let url = format!(
+            "{}/v2/positions/combos",
+            self.data_api.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("user", proxy_wallet), ("limit", "100")])
+            .send()
+            .await
+            .map_err(|e| redact(&e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(format!("data api combos HTTP {}", response.status()));
+        }
+        let body: Value = response.json().await.map_err(|e| redact(&e.to_string()))?;
+        let rows = body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let sum = rows
+            .iter()
+            .filter_map(|row| row.get("current_value").and_then(json_decimal))
+            .fold(Decimal::ZERO, |a, b| a + b);
+        Ok(sum.round_dp(8))
+    }
 }
 
 pub fn parse_market_fee(market: &Value) -> Option<crate::engine::FeeSchedule> {

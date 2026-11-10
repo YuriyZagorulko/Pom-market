@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { injectPaperTrade } from "../helpers/inject";
 import { loginUser, typeInto } from "./helpers/forms";
 import { apiLogin, apiPostJson } from "../helpers/api";
+import { setGlobalKillSwitch } from "../helpers/admin";
 
 const adminEmail = process.env.E2E_ADMIN_EMAIL;
 const adminPassword = process.env.E2E_ADMIN_PASSWORD;
@@ -18,6 +19,24 @@ async function userToken(email: string, password: string) {
   return apiLogin(email, password, PAPER_API_XFF);
 }
 
+async function waitForOrders(token: string, accountId: string, min: number) {
+  await expect
+    .poll(
+      async () => {
+        const res = await fetch(
+          `${apiBase}/api/v1/orders?account_id=${accountId}&limit=50`,
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
+        if (!res.ok) return 0;
+        const body = (await res.json()) as { total?: number; items?: unknown[] };
+        if (typeof body.total === "number") return body.total;
+        return Array.isArray(body.items) ? body.items.length : 0;
+      },
+      { timeout: 90_000 },
+    )
+    .toBeGreaterThanOrEqual(min);
+}
+
 const stamp = Date.now();
 const userEmail = `pw-paper-${stamp}@example.com`;
 const wallet = "0x5555555555555555555555555555555555555555";
@@ -25,15 +44,16 @@ const signer = "0x9965507D1a55bcC2695C58ba16Fa3C528af0BbFc";
 
 test.describe.configure({ mode: "serial", timeout: 300_000 });
 
-test.beforeAll(() => {
+test.beforeAll(async () => {
   test.skip(
     !adminEmail || !adminPassword || !invitePassword,
     "Set E2E_ADMIN_* and E2E_INVITED_USER_PASSWORD in e2e/.env.local",
   );
+  await setGlobalKillSwitch(false);
 });
 
 function inject(side: string, suffix: string) {
-  injectPaperTrade(wallet, side, suffix);
+  injectPaperTrade(wallet, side, suffix, { sizeShares: "500" });
 }
 
 test("full paper path: admin invite → user setup → strategy → mock trades → UI", async ({
@@ -100,16 +120,28 @@ test("full paper path: admin invite → user setup → strategy → mock trades 
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      paper_cash_usd: "1000",
       max_order_usd: "100",
       max_exposure_usd: "1000",
     }),
   });
   expect(riskRes.ok).toBeTruthy();
+  const fundRes = await fetch(`${apiBase}/api/v1/accounts/${acct.id}/capital/paper-funding`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      delta_usd: "1000",
+      reason: "e2e_paper_flow",
+      idempotency_key: `e2e-paper-fund-${stamp}`,
+    }),
+  });
+  expect(fundRes.ok).toBeTruthy();
 
   await user.goto("/traders/new");
-  await typeInto(user.getByPlaceholder("Alias"), "PW Leader");
-  await typeInto(user.getByPlaceholder("Public 0x address"), wallet);
+  await typeInto(user.getByLabel("Display alias"), "PW Leader");
+  await typeInto(user.getByLabel(/Polymarket proxy wallet/), wallet);
   await user.getByRole("button", { name: "Check and add" }).click();
   await expect(user).toHaveURL(/\/traders\/[0-9a-f-]+/, { timeout: 30_000 });
   const traderId = user.url().split("/").pop()!;
@@ -119,6 +151,7 @@ test("full paper path: admin invite → user setup → strategy → mock trades 
   await expect(accountSelect.locator("option")).toHaveCount(2, { timeout: 30_000 });
   await accountSelect.selectOption({ index: 1 });
   await user.getByRole("button", { name: "$200" }).click();
+  await user.locator("select:has(option[value='proportional'])").selectOption("proportional");
   await user.getByRole("button", { name: "10%" }).click();
   user.once("dialog", (d) => d.accept());
   await user.getByRole("button", { name: "Create disabled strategy" }).click();
@@ -129,6 +162,16 @@ test("full paper path: admin invite → user setup → strategy → mock trades 
   const row = user.locator("table tbody tr").first();
   await expect(row).toContainText("no");
 
+  const bootRes = await fetch(`${apiBase}/api/v1/accounts/${acct.id}/capital/bootstrap`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ apply: true }),
+  });
+  expect(bootRes.ok).toBeTruthy();
+
   const enableRes = await fetch(`${apiBase}/api/v1/strategies/${strategyId}/enable`, {
     method: "POST",
     headers: {
@@ -138,6 +181,19 @@ test("full paper path: admin invite → user setup → strategy → mock trades 
     body: JSON.stringify({ enabled: true }),
   });
   expect(enableRes.ok).toBeTruthy();
+  await expect
+    .poll(
+      async () => {
+        const res = await fetch(`${apiBase}/api/v1/strategies/${strategyId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return false;
+        const body = (await res.json()) as { enabled?: boolean };
+        return body.enabled === true;
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(true);
 
   let ordersRequest = "";
   user.on("request", (req) => {
@@ -147,7 +203,8 @@ test("full paper path: admin invite → user setup → strategy → mock trades 
   });
 
   inject("buy", `${stamp}b1`);
-  await user.goto("/orders");
+  await waitForOrders(token, acct.id, 1);
+  await user.goto(`/orders?account_id=${acct.id}`);
   await expect(user.locator(".record-cards .record-card, .record-card")).toHaveCount(1, { timeout: 30_000 });
   const ordersUrl = new URL(ordersRequest || `${user.url()}`);
   expect(ordersUrl.searchParams.has("side")).toBe(false);

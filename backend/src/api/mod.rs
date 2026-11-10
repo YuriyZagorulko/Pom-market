@@ -15,6 +15,10 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::account_allocation::{
+    effective_allocation_cap, paper_account_equity_detail, parse_allocation_from_request,
+    validate_new_allocation_in_tx,
+};
 use crate::auth::{self, AuthUser};
 use crate::client_ip::{self, TrustedProxies};
 use crate::config::Config;
@@ -22,19 +26,27 @@ use crate::copy_preview::{
     market_allowed_list, percent_to_proportion, simulate_copy_preview, CopyPreviewParams,
     PreviewEvent,
 };
+use crate::copy_sizing::scaling_ratio;
 use crate::db::begin_as;
 use crate::email::{Email, MailError};
-use crate::engine::{is_eth_address, is_private_key, normalize_address};
+use crate::engine::{is_eth_address, normalize_address};
 use crate::polymarket::http::PublicClient;
 use crate::polymarket::live::probe_account;
 use crate::rate_limit::{self, RateLimitStore};
 use crate::security::{
     credential_aad, hash_password, random_token, sha256_hex, verify_password, SecretBlob, Vault,
 };
-use crate::strategy_budget::utilization_for_user;
+use crate::source_equity;
+use crate::strategy_accounting::{
+    allocate_to_strategy, apply_account_paper_funding, bootstrap_account_strategies,
+    reconcile_account, sync_strategy_capital_to_configured_cap, withdraw_from_strategy,
+};
+use crate::strategy_budget::utilization_report_for_user;
 
 mod account_control;
+mod json_num;
 mod page;
+mod strategy_analytics;
 use page::{ListQuery, Paged};
 type PageQuery = ListQuery;
 
@@ -155,6 +167,22 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/accounts/{id}/test", post(test_account))
         .route("/api/v1/accounts/{id}/balance", get(account_balance))
+        .route(
+            "/api/v1/accounts/{id}/allocation-summary",
+            get(account_allocation_summary),
+        )
+        .route(
+            "/api/v1/accounts/{id}/capital/reconciliation",
+            get(capital_reconciliation),
+        )
+        .route(
+            "/api/v1/accounts/{id}/capital/bootstrap",
+            post(capital_bootstrap),
+        )
+        .route(
+            "/api/v1/accounts/{id}/capital/paper-funding",
+            post(capital_paper_funding),
+        )
         .route("/api/v1/accounts/{id}/positions", get(account_positions))
         .route("/api/v1/accounts/{id}/mode", post(set_mode))
         .route("/api/v1/accounts/{id}/disconnect", post(disconnect_account))
@@ -212,6 +240,10 @@ pub fn router(state: AppState) -> Router {
             get(get_trader).patch(patch_trader).delete(delete_trader),
         )
         .route(
+            "/api/v1/source-traders/{id}/equity",
+            get(source_trader_equity),
+        )
+        .route(
             "/api/v1/strategies",
             get(list_strategies).post(create_strategy),
         )
@@ -225,6 +257,34 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/strategies/{id}/utilization",
             get(strategy_utilization),
+        )
+        .route(
+            "/api/v1/strategies/{id}/capital/allocate",
+            post(capital_allocate),
+        )
+        .route(
+            "/api/v1/strategies/{id}/capital/withdraw",
+            post(capital_withdraw),
+        )
+        .route(
+            "/api/v1/strategies/{id}/analytics/overview",
+            get(strategy_analytics::overview),
+        )
+        .route(
+            "/api/v1/strategies/{id}/analytics/equity",
+            get(strategy_analytics::equity),
+        )
+        .route(
+            "/api/v1/strategies/{id}/analytics/positions",
+            get(strategy_analytics::positions),
+        )
+        .route(
+            "/api/v1/strategies/{id}/analytics/activity",
+            get(strategy_analytics::activity),
+        )
+        .route(
+            "/api/v1/strategies/{id}/analytics/performance",
+            get(strategy_analytics::performance),
         )
         .route(
             "/api/v1/source-traders/{id}/copy-preview",
@@ -1163,6 +1223,14 @@ async fn create_account(
     if !is_eth_address(&body.signer_address) {
         return Err(bad("signer address is invalid"));
     }
+    if body.signature_type != "eoa" {
+        let funder_raw = body.funder_address.as_deref().map(str::trim).unwrap_or("");
+        if funder_raw.is_empty() {
+            return Err(bad(
+                "funder address is required for poly_proxy, poly_gnosis_safe, and poly_1271 accounts",
+            ));
+        }
+    }
     let funder = body
         .funder_address
         .clone()
@@ -1171,15 +1239,14 @@ async fn create_account(
         return Err(bad("funder address is invalid"));
     }
     if let Some(key) = &body.private_key {
-        if !is_private_key(key) {
-            return Err(bad(
-                "private key must be a 32-byte hex key, not a seed phrase",
-            ));
-        }
-        let derived = crate::polymarket::live::address_of(key).map_err(bad)?;
-        if derived != normalize_address(&body.signer_address) {
-            return Err(bad("private key does not match signer address"));
-        }
+        let derived = crate::polymarket::credentials::derived_signer_address(key).map_err(bad)?;
+        crate::polymarket::credentials::verify_key_signer_configuration(
+            &body.signature_type,
+            &derived,
+            &body.signer_address,
+            &funder,
+        )
+        .map_err(bad)?;
     }
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
@@ -1206,7 +1273,8 @@ async fn create_account(
     .await
     .map_err(internal)?;
     if let Some(key) = body.private_key.as_deref() {
-        store_key(&state.vault, &mut tx, user.id, id, key)
+        let key = crate::polymarket::credentials::validate_private_key_format(key).map_err(bad)?;
+        store_key(&state.vault, &mut tx, user.id, id, &key)
             .await
             .map_err(internal)?;
     }
@@ -1342,7 +1410,9 @@ async fn test_account(
         .await;
         report["balance_usd"] = serde_json::to_value(probed.balance_usd).unwrap_or(Value::Null);
         report["api_credentials_created"] = json!(probed.api_credentials_created);
-        report["signer_matches"] = json!(probed.signer_address == account.signer_address);
+        report["signer_matches"] = json!(
+            normalize_address(&probed.signer_address) == normalize_address(&account.signer_address)
+        );
         if let Some(error) = &probed.error {
             report["error"] = json!(error);
         }
@@ -1518,9 +1588,13 @@ struct RiskBody {
     max_order_usd: Option<Decimal>,
     max_daily_loss_usd: Option<Decimal>,
     max_exposure_usd: Option<Decimal>,
+    #[serde(default, deserialize_with = "json_num::opt_i32")]
     max_slippage_bps: Option<i32>,
+    #[serde(default, deserialize_with = "json_num::opt_i32")]
     max_orders_per_interval: Option<i32>,
+    #[serde(default, deserialize_with = "json_num::opt_i32")]
     interval_seconds: Option<i32>,
+    #[serde(default, deserialize_with = "json_num::opt_i32")]
     max_stale_data_seconds: Option<i32>,
     paper_cash_usd: Option<Decimal>,
     emergency_stop: Option<bool>,
@@ -1533,6 +1607,11 @@ async fn patch_risk(
     Json(body): Json<RiskBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
+    if body.paper_cash_usd.is_some() {
+        return Err(bad(
+            "paper_cash_usd cannot be changed here; use POST /api/v1/accounts/{id}/capital/paper-funding",
+        ));
+    }
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
@@ -1546,7 +1625,6 @@ async fn patch_risk(
             max_orders_per_interval = COALESCE($7, max_orders_per_interval),
             interval_seconds = COALESCE($8, interval_seconds),
             max_stale_data_seconds = COALESCE($9, max_stale_data_seconds),
-            paper_cash_usd = COALESCE($10, paper_cash_usd),
             updated_at = now()
          WHERE trading_account_id = $1 AND user_id = $2",
     )
@@ -1559,7 +1637,6 @@ async fn patch_risk(
     .bind(body.max_orders_per_interval)
     .bind(body.interval_seconds)
     .bind(body.max_stale_data_seconds)
-    .bind(body.paper_cash_usd)
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
@@ -1586,18 +1663,36 @@ async fn rotate_credentials(
     let Some(key) = body.private_key.as_deref() else {
         return Err(bad("private_key is required"));
     };
-    if !is_private_key(key) {
-        return Err(bad("private key must be a 32-byte hex key"));
-    }
-    let derived = crate::polymarket::live::address_of(key).map_err(bad)?;
+    let derived = crate::polymarket::credentials::derived_signer_address(key).map_err(bad)?;
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
     let account = load_account(&mut tx, user.id, id).await?;
-    if derived != account.signer_address && body.signer_address.is_empty() {
-        return Err(bad("private key does not match the stored signer"));
-    }
-    store_key(&state.vault, &mut tx, user.id, id, key)
+    let signature_type = if body.signature_type.is_empty() {
+        account.signature_type.as_str()
+    } else {
+        validate_signature(&body.signature_type)?;
+        body.signature_type.as_str()
+    };
+    let signer = if body.signer_address.is_empty() {
+        account.signer_address.clone()
+    } else {
+        normalize_address(&body.signer_address)
+    };
+    let funder = body
+        .funder_address
+        .as_ref()
+        .map(|v| normalize_address(v))
+        .unwrap_or_else(|| normalize_address(&account.funder_address));
+    crate::polymarket::credentials::verify_key_signer_configuration(
+        signature_type,
+        &derived,
+        &signer,
+        &funder,
+    )
+    .map_err(bad)?;
+    let key = crate::polymarket::credentials::validate_private_key_format(key).map_err(bad)?;
+    store_key(&state.vault, &mut tx, user.id, id, &key)
         .await
         .map_err(internal)?;
     if !body.signer_address.is_empty() {
@@ -1777,6 +1872,8 @@ struct StrategyBody {
     trading_account_id: Uuid,
     source_trader_id: Uuid,
     sizing_mode: Option<String>,
+    allocation_mode: Option<String>,
+    allocation_percent: Option<Decimal>,
     fixed_amount_usd: Option<Decimal>,
     /// UI percent 0–100; converted to `proportion` when sizing_mode is proportional.
     copy_percent: Option<Decimal>,
@@ -1785,14 +1882,19 @@ struct StrategyBody {
     strategy_budget_usd: Option<Decimal>,
     max_position_usd: Option<Decimal>,
     max_exposure_usd: Option<Decimal>,
+    #[serde(default, deserialize_with = "json_num::opt_i32")]
     max_open_positions: Option<i32>,
+    #[serde(default, deserialize_with = "json_num::opt_i32")]
     max_slippage_bps: Option<i32>,
     min_order_usd: Option<Decimal>,
     copy_buy: Option<bool>,
     copy_sell: Option<bool>,
+    #[serde(default, deserialize_with = "json_num::opt_i32")]
     cooldown_seconds: Option<i32>,
     allowed_markets: Option<Value>,
     enabled: Option<bool>,
+    /// Optional label; does not change source trader.
+    display_name: Option<String>,
 }
 
 async fn create_strategy(
@@ -1801,17 +1903,23 @@ async fn create_strategy(
     Json(body): Json<StrategyBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
-    let mode = body.sizing_mode.unwrap_or_else(|| "fixed_amount".into());
+    let mode = body.sizing_mode.unwrap_or_else(|| "portfolio_ratio".into());
     if !matches!(
         mode.as_str(),
-        "fixed_amount" | "proportional" | "multiplier"
+        "fixed_amount" | "proportional" | "multiplier" | "portfolio_ratio"
     ) {
         return Err(bad("unknown sizing mode"));
     }
-    let budget = body.strategy_budget_usd.unwrap_or(Decimal::from(100));
-    if budget <= Decimal::ZERO || budget > Decimal::from(10_000_000) {
-        return Err(bad("strategy budget must be between 0 and 10000000 USD"));
+    let budget = body.strategy_budget_usd.unwrap_or(Decimal::from(2000));
+    if budget > Decimal::from(10_000_000) {
+        return Err(bad("strategy budget must be at most 10000000 USD"));
     }
+    let alloc = parse_allocation_from_request(
+        body.allocation_mode.as_deref(),
+        budget,
+        body.allocation_percent,
+    )
+    .map_err(bad)?;
     let mut proportion = body.proportion;
     if mode == "proportional" {
         if let Some(pct) = body.copy_percent {
@@ -1855,18 +1963,24 @@ async fn create_strategy(
             "enable monitoring on the source account before creating a copy strategy",
         ));
     }
+    validate_new_allocation_in_tx(&mut tx, body.trading_account_id, &alloc, None)
+        .await
+        .map_err(bad)?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO copy_strategies (
-            user_id, trading_account_id, source_trader_id, enabled, sizing_mode, fixed_amount_usd, proportion, multiplier,
+            user_id, trading_account_id, source_trader_id, enabled, sizing_mode, allocation_mode, allocation_percent,
+            fixed_amount_usd, proportion, multiplier,
             strategy_budget_usd, max_position_usd, max_exposure_usd, max_open_positions, max_slippage_bps, min_order_usd,
             copy_buy, copy_sell, cooldown_seconds, allowed_markets
-         ) VALUES ($1,$2,$3,false,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+         ) VALUES ($1,$2,$3,false,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
          RETURNING id",
     )
     .bind(user.id)
     .bind(body.trading_account_id)
     .bind(body.source_trader_id)
     .bind(&mode)
+    .bind(alloc.allocation_mode.as_str())
+    .bind(alloc.allocation_percent)
     .bind(body.fixed_amount_usd.or(Some(Decimal::from(10))))
     .bind(proportion)
     .bind(body.multiplier)
@@ -1901,7 +2015,8 @@ async fn list_strategies(
         .map_err(internal)?;
     let rows = sqlx::query_as::<_, StrategyView>(
         "SELECT s.id, s.trading_account_id, s.source_trader_id, t.alias, t.wallet_address, a.name AS account_name,
-                s.enabled, s.sizing_mode, s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd,
+                COALESCE(s.display_name, t.alias) AS display_name, s.enabled, s.sizing_mode, s.allocation_mode, s.allocation_percent,
+                s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd,
                 s.max_position_usd, s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
                 s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets
          FROM copy_strategies s
@@ -1945,6 +2060,15 @@ async fn patch_strategy(
         .await
         .map_err(internal)?;
     let _ = one_strategy(&mut tx, user.id, id).await?;
+    let current: (Uuid, String, Decimal, Option<Decimal>) = sqlx::query_as(
+        "SELECT trading_account_id, allocation_mode, strategy_budget_usd, allocation_percent
+         FROM copy_strategies WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
     let mut proportion = body.proportion;
     if let Some(pct) = body.copy_percent {
         proportion = Some(
@@ -1952,34 +2076,57 @@ async fn patch_strategy(
                 .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 100"))?,
         );
     }
-    if let Some(b) = body.strategy_budget_usd {
-        if b <= Decimal::ZERO || b > Decimal::from(10_000_000) {
-            return Err(bad("strategy budget must be between 0 and 10000000 USD"));
+    let new_budget = body.strategy_budget_usd.unwrap_or(current.2);
+    if new_budget > Decimal::from(10_000_000) {
+        return Err(bad("strategy budget must be at most 10000000 USD"));
+    }
+    let new_alloc_mode = body
+        .allocation_mode
+        .as_deref()
+        .unwrap_or(current.1.as_str());
+    let new_alloc_pct = body.allocation_percent.or(current.3);
+    let alloc = parse_allocation_from_request(Some(new_alloc_mode), new_budget, new_alloc_pct)
+        .map_err(bad)?;
+    validate_new_allocation_in_tx(&mut tx, current.0, &alloc, Some(id))
+        .await
+        .map_err(bad)?;
+    if let Some(name) = body.display_name.as_deref() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(bad("display name cannot be empty"));
+        }
+        if trimmed.len() > 120 {
+            return Err(bad("display name must be at most 120 characters"));
         }
     }
     sqlx::query(
         "UPDATE copy_strategies SET
             sizing_mode = COALESCE($3, sizing_mode),
-            fixed_amount_usd = COALESCE($4, fixed_amount_usd),
-            proportion = COALESCE($5, proportion),
-            multiplier = COALESCE($6, multiplier),
-            strategy_budget_usd = COALESCE($7, strategy_budget_usd),
-            max_position_usd = COALESCE($8, max_position_usd),
-            max_exposure_usd = COALESCE($9, max_exposure_usd),
-            max_open_positions = COALESCE($10, max_open_positions),
-            max_slippage_bps = COALESCE($11, max_slippage_bps),
-            min_order_usd = COALESCE($12, min_order_usd),
-            copy_buy = COALESCE($13, copy_buy),
-            copy_sell = COALESCE($14, copy_sell),
-            cooldown_seconds = COALESCE($15, cooldown_seconds),
-            allowed_markets = COALESCE($16, allowed_markets),
-            enabled = COALESCE($17, enabled),
+            allocation_mode = COALESCE($4, allocation_mode),
+            allocation_percent = COALESCE($5, allocation_percent),
+            fixed_amount_usd = COALESCE($6, fixed_amount_usd),
+            proportion = COALESCE($7, proportion),
+            multiplier = COALESCE($8, multiplier),
+            strategy_budget_usd = COALESCE($9, strategy_budget_usd),
+            max_position_usd = COALESCE($10, max_position_usd),
+            max_exposure_usd = COALESCE($11, max_exposure_usd),
+            max_open_positions = COALESCE($12, max_open_positions),
+            max_slippage_bps = COALESCE($13, max_slippage_bps),
+            min_order_usd = COALESCE($14, min_order_usd),
+            copy_buy = COALESCE($15, copy_buy),
+            copy_sell = COALESCE($16, copy_sell),
+            cooldown_seconds = COALESCE($17, cooldown_seconds),
+            allowed_markets = COALESCE($18, allowed_markets),
+            enabled = COALESCE($19, enabled),
+            display_name = CASE WHEN $20::text IS NULL THEN display_name ELSE NULLIF(trim($20), '') END,
             updated_at = now()
          WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
     .bind(user.id)
     .bind(body.sizing_mode)
+    .bind(body.allocation_mode)
+    .bind(body.allocation_percent)
     .bind(body.fixed_amount_usd)
     .bind(proportion)
     .bind(body.multiplier)
@@ -1994,9 +2141,22 @@ async fn patch_strategy(
     .bind(body.cooldown_seconds)
     .bind(body.allowed_markets)
     .bind(body.enabled)
+    .bind(body.display_name.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
+    let enabled_after: bool =
+        sqlx::query_scalar("SELECT enabled FROM copy_strategies WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?;
+    if enabled_after {
+        sync_strategy_capital_to_configured_cap(&mut tx, user.id, id, &format!("patch:{id}"))
+            .await
+            .map_err(bad)?;
+    }
     tx.commit().await.map_err(internal)?;
     Ok(Json(json!({"ok": true})))
 }
@@ -2007,7 +2167,7 @@ async fn strategy_utilization(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
-    let util = utilization_for_user(&state.pool, user.id, id)
+    let report = utilization_report_for_user(&state.pool, user.id, id, &state.cfg)
         .await
         .map_err(|_| ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))?;
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
@@ -2038,12 +2198,29 @@ async fn strategy_utilization(
     .map_err(|_| ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))?;
     tx.commit().await.map_err(internal)?;
     Ok(Json(json!({
-        "allocated_budget_usd": util.allocated_budget_usd,
-        "deployed_capital_usd": util.deployed_capital_usd,
-        "reserved_capital_usd": util.reserved_capital_usd,
-        "available_budget_usd": util.available_budget_usd,
-        "open_positions_count": util.open_positions_count,
-        "updated_at": util.updated_at,
+        "allocated_budget_usd": report.effective_allocation_cap_usd,
+        "configured_allocation_mode": report.configured_allocation_mode,
+        "configured_allocation_percent": report.configured_allocation_percent,
+        "configured_fixed_usd": report.configured_fixed_usd,
+        "effective_allocation_cap_usd": report.effective_allocation_cap_usd,
+        "account_equity_usd": report.account_equity_usd,
+        "account_paper_cash_usd": report.account_paper_cash_usd,
+        "account_positions_market_value_usd": report.account_positions_market_value_usd,
+        "account_order_reserves_usd": report.account_order_reserves_usd,
+        "peer_allocations_usd": report.peer_allocations_usd,
+        "unallocated_account_usd": report.unallocated_account_usd,
+        "deployed_capital_usd": report.deployed_capital_usd,
+        "reserved_capital_usd": report.reserved_capital_usd,
+        "available_budget_usd": report.available_budget_usd,
+        "open_positions_count": report.open_positions_count,
+        "updated_at": report.updated_at,
+        "source_equity_usd": report.source_equity_usd,
+        "source_equity_status": report.source_equity_status,
+        "source_equity_quality_note": report.source_equity_quality_note,
+        "source_equity_observed_at": report.source_equity_observed_at,
+        "source_equity_age_seconds": report.source_equity_age_seconds,
+        "scaling_ratio_percent": report.scaling_ratio_percent,
+        "sizing_mode": report.sizing_mode,
         "enabled": summary.enabled,
         "operating_mode": summary.operating_mode,
         "monitoring_enabled": summary.monitoring_enabled,
@@ -2069,6 +2246,8 @@ struct StrategyActivitySummary {
 struct CopyPreviewBody {
     trading_account_id: Uuid,
     sizing_mode: String,
+    allocation_mode: Option<String>,
+    allocation_percent: Option<Decimal>,
     copy_percent: Option<Decimal>,
     proportion: Option<Decimal>,
     fixed_amount_usd: Option<Decimal>,
@@ -2081,6 +2260,7 @@ struct CopyPreviewBody {
     copy_sell: Option<bool>,
     allowed_markets: Option<Value>,
     limit: Option<i32>,
+    refresh_source_equity: Option<bool>,
 }
 
 async fn copy_preview(
@@ -2090,8 +2270,8 @@ async fn copy_preview(
     Json(body): Json<CopyPreviewBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
-    if body.strategy_budget_usd <= Decimal::ZERO {
-        return Err(bad("strategy budget must be positive"));
+    if body.strategy_budget_usd > Decimal::from(10_000_000) {
+        return Err(bad("strategy budget must be at most 10000000 USD"));
     }
     let limit = body.limit.unwrap_or(20).clamp(1, 50) as i64;
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
@@ -2107,8 +2287,21 @@ async fn copy_preview(
     .map_err(internal)?
     .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "trader not found".into()))?;
     let _ = load_account(&mut tx, user.id, body.trading_account_id).await?;
-    let risk = sqlx::query_as::<_, AccountRiskRow>(
-        "SELECT max_order_usd, max_exposure_usd, min_order_usd FROM account_risk_limits WHERE trading_account_id = $1",
+    let alloc = parse_allocation_from_request(
+        body.allocation_mode.as_deref(),
+        body.strategy_budget_usd,
+        body.allocation_percent,
+    )
+    .map_err(bad)?;
+    let equity_detail = paper_account_equity_detail(&mut tx, body.trading_account_id)
+        .await
+        .map_err(internal)?;
+    let effective_cap = effective_allocation_cap(&alloc, equity_detail.account_equity_usd);
+    if effective_cap <= Decimal::ZERO {
+        return Err(bad("effective allocation must be greater than zero"));
+    }
+    let risk = sqlx::query_as::<_, AccountRiskPreviewRow>(
+        "SELECT max_order_usd, max_exposure_usd FROM account_risk_limits WHERE trading_account_id = $1",
     )
     .bind(body.trading_account_id)
     .fetch_one(&mut *tx)
@@ -2143,23 +2336,51 @@ async fn copy_preview(
     .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
 
+    let mut equity_snap = source_equity::load_snapshot(&state.pool, id, &state.cfg)
+        .await
+        .map_err(internal)?;
+    let needs_equity = body.sizing_mode == "portfolio_ratio"
+        || body
+            .refresh_source_equity
+            .unwrap_or(body.sizing_mode == "portfolio_ratio");
+    if needs_equity
+        && equity_snap
+            .as_ref()
+            .map(|s| !s.status.allows_portfolio_buy())
+            .unwrap_or(true)
+    {
+        let live = source_equity::fetch_live_equity(&state.polymarket, &state.cfg, &wallet).await;
+        source_equity::upsert_snapshot(&state.pool, id, &live)
+            .await
+            .map_err(internal)?;
+        equity_snap = Some(live);
+    }
+    let (source_equity_usd, source_equity_status) = equity_snap
+        .as_ref()
+        .map(|s| (s.total_equity_usd, Some(s.status)))
+        .unwrap_or((None, None));
+    let scaling = source_equity_usd.and_then(|eq| scaling_ratio(effective_cap, eq));
+
     let allowed = body.allowed_markets.unwrap_or_else(|| json!([]));
     let params = CopyPreviewParams {
         sizing_mode: body.sizing_mode,
         fixed_amount_usd: body.fixed_amount_usd,
         proportion,
         multiplier: body.multiplier,
-        strategy_budget_usd: body.strategy_budget_usd,
+        effective_allocation_cap_usd: effective_cap,
         max_position_usd: body.max_position_usd.unwrap_or(Decimal::from(50)),
-        max_exposure_usd: body.max_exposure_usd.unwrap_or(body.strategy_budget_usd),
+        max_exposure_usd: body
+            .max_exposure_usd
+            .unwrap_or(effective_cap)
+            .max(effective_cap),
         account_max_exposure: risk.max_exposure_usd,
         max_order_usd: risk.max_order_usd,
-        min_order_usd: body
-            .min_order_usd
-            .unwrap_or(risk.min_order_usd)
-            .max(Decimal::ONE),
+        min_order_usd: body.min_order_usd.unwrap_or(Decimal::ONE).max(Decimal::ONE),
         copy_buy: body.copy_buy.unwrap_or(true),
         copy_sell: body.copy_sell.unwrap_or(true),
+        source_equity_usd,
+        source_equity_status,
+        scaling_ratio_percent: scaling,
     };
 
     let events: Vec<PreviewEvent> = rows
@@ -2190,7 +2411,278 @@ async fn copy_preview(
     let preview_rows = simulate_copy_preview(&events, &params);
     Ok(Json(json!({
         "disclaimer": "Estimates use recent source trades and current settings. Live execution may differ due to book, slippage, fees, and latency.",
+        "effective_allocation_cap_usd": effective_cap,
+        "account_equity_usd": equity_detail.account_equity_usd,
+        "source_equity_usd": source_equity_usd,
+        "source_equity_status": source_equity_status.map(|s| s.as_str()),
+        "source_equity_quality_note": equity_snap.as_ref().and_then(|s| s.quality_note.clone()),
+        "source_equity_observed_at": equity_snap.as_ref().map(|s| s.observed_at),
+        "scaling_ratio_percent": scaling,
         "rows": preview_rows,
+    })))
+}
+
+#[derive(Deserialize)]
+struct EquityQuery {
+    refresh: Option<bool>,
+}
+
+async fn source_trader_equity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(q): Query<EquityQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT wallet_address FROM source_traders WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal)?;
+    let Some((wallet,)) = row else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "trader not found".into()));
+    };
+    tx.commit().await.map_err(internal)?;
+
+    let snap = if q.refresh.unwrap_or(false) {
+        let live = source_equity::fetch_live_equity(&state.polymarket, &state.cfg, &wallet).await;
+        source_equity::upsert_snapshot(&state.pool, id, &live)
+            .await
+            .map_err(internal)?;
+        live
+    } else {
+        match source_equity::load_snapshot(&state.pool, id, &state.cfg)
+            .await
+            .map_err(internal)?
+        {
+            Some(s) => s,
+            None => {
+                let live =
+                    source_equity::fetch_live_equity(&state.polymarket, &state.cfg, &wallet).await;
+                source_equity::upsert_snapshot(&state.pool, id, &live)
+                    .await
+                    .map_err(internal)?;
+                live
+            }
+        }
+    };
+
+    Ok(Json(json!({
+        "source_wallet_address": wallet,
+        "equity_usd": snap.total_equity_usd,
+        "positions_value_usd": snap.positions_value_usd,
+        "combo_positions_value_usd": snap.combo_positions_value_usd,
+        "wallet_usdc_usd": snap.wallet_collateral_usd,
+        "status": snap.status.as_str(),
+        "quality_note": snap.quality_note,
+        "observed_at": snap.observed_at,
+        "age_seconds": snap.age_seconds,
+        "is_estimated": snap.status.is_estimated(),
+    })))
+}
+
+#[derive(Serialize)]
+struct StrategyAllocationRow {
+    strategy_id: Uuid,
+    alias: String,
+    allocation_mode: String,
+    allocation_percent: Option<Decimal>,
+    configured_budget_usd: Decimal,
+    effective_cap_usd: Decimal,
+    enabled: bool,
+}
+
+async fn capital_reconciliation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let _ = load_account(&mut tx, user.id, id).await?;
+    tx.commit().await.map_err(internal)?;
+    let report = reconcile_account(&state.pool, id).await.map_err(internal)?;
+    Ok(Json(serde_json::to_value(report).unwrap_or(json!({}))))
+}
+
+#[derive(Deserialize)]
+struct CapitalBootstrapBody {
+    #[serde(default)]
+    apply: bool,
+}
+
+#[derive(Deserialize)]
+struct PaperFundingBody {
+    delta_usd: Decimal,
+    idempotency_key: Option<String>,
+    reason: Option<String>,
+}
+
+async fn capital_paper_funding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PaperFundingBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let _ = load_account(&mut tx, user.id, id).await?;
+    let key = body
+        .idempotency_key
+        .unwrap_or_else(|| format!("paper-fund:{}:{}", id, Utc::now().timestamp_millis()));
+    let reason = body
+        .reason
+        .unwrap_or_else(|| "account_paper_funding".into());
+    apply_account_paper_funding(&mut tx, user.id, id, body.delta_usd, &key, &reason)
+        .await
+        .map_err(bad)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn capital_bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CapitalBootstrapBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let _ = load_account(&mut tx, user.id, id).await?;
+    tx.commit().await.map_err(internal)?;
+    let report = bootstrap_account_strategies(&state.pool, id, body.apply)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::to_value(report).unwrap_or(json!({}))))
+}
+
+#[derive(Deserialize)]
+struct CapitalTransferBody {
+    amount_usd: Decimal,
+    idempotency_key: Option<String>,
+}
+
+async fn capital_allocate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CapitalTransferBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let row: (Uuid,) = sqlx::query_as(
+        "SELECT trading_account_id FROM copy_strategies WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))?;
+    let key = body
+        .idempotency_key
+        .unwrap_or_else(|| format!("alloc:{}:{}", id, Utc::now().timestamp_millis()));
+    allocate_to_strategy(&mut tx, user.id, row.0, id, body.amount_usd, &key)
+        .await
+        .map_err(bad)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn capital_withdraw(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CapitalTransferBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let row: (Uuid,) = sqlx::query_as(
+        "SELECT trading_account_id FROM copy_strategies WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))?;
+    let key = body
+        .idempotency_key
+        .unwrap_or_else(|| format!("withdraw:{}:{}", id, Utc::now().timestamp_millis()));
+    withdraw_from_strategy(&mut tx, user.id, row.0, id, body.amount_usd, &key)
+        .await
+        .map_err(bad)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn account_allocation_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let _ = load_account(&mut tx, user.id, id).await?;
+    let detail = paper_account_equity_detail(&mut tx, id)
+        .await
+        .map_err(internal)?;
+    let rows: Vec<(Uuid, String, String, Decimal, Option<Decimal>, bool)> = sqlx::query_as(
+        "SELECT s.id, t.alias, s.allocation_mode, s.strategy_budget_usd, s.allocation_percent, s.enabled
+         FROM copy_strategies s
+         JOIN source_traders t ON t.id = s.source_trader_id
+         WHERE s.trading_account_id = $1
+         ORDER BY s.created_at",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+
+    let strategies: Vec<StrategyAllocationRow> = rows
+        .into_iter()
+        .map(|(sid, alias, mode, budget, pct, enabled)| {
+            let alloc = parse_allocation_from_request(Some(mode.as_str()), budget, pct)
+                .or_else(|_| parse_allocation_from_request(Some("fixed_usd"), budget, pct))
+                .expect("stored allocation row");
+            StrategyAllocationRow {
+                strategy_id: sid,
+                alias,
+                allocation_mode: mode,
+                allocation_percent: pct,
+                configured_budget_usd: budget,
+                effective_cap_usd: effective_allocation_cap(&alloc, detail.account_equity_usd),
+                enabled,
+            }
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "account_equity_usd": detail.account_equity_usd,
+        "paper_cash_usd": detail.paper_cash_usd,
+        "positions_market_value_usd": detail.positions_market_value_usd,
+        "open_order_reserves_usd": detail.open_order_reserves_usd,
+        "allocated_across_strategies_usd": detail.allocated_across_strategies_usd,
+        "unallocated_usd": detail.unallocated_usd,
+        "strategies": strategies,
     })))
 }
 
@@ -2211,10 +2703,9 @@ struct PreviewSourceRow {
 }
 
 #[derive(sqlx::FromRow)]
-struct AccountRiskRow {
+struct AccountRiskPreviewRow {
     max_order_usd: Decimal,
     max_exposure_usd: Decimal,
-    min_order_usd: Decimal,
 }
 
 #[derive(Deserialize)]
@@ -2304,6 +2795,9 @@ async fn enable_strategy(
         if row.operating_mode == "paper_trading" && row.paper_cash_usd < row.min_order_usd {
             return Err(bad("increase paper cash on the trading account"));
         }
+        sync_strategy_capital_to_configured_cap(&mut tx, user.id, id, &format!("enable:{id}"))
+            .await
+            .map_err(bad)?;
     }
     sqlx::query("UPDATE copy_strategies SET enabled = $3, updated_at = now() WHERE id = $1 AND user_id = $2")
         .bind(id)
@@ -3194,7 +3688,8 @@ async fn one_strategy(
 ) -> Result<StrategyView, ApiError> {
     sqlx::query_as::<_, StrategyView>(
         "SELECT s.id, s.trading_account_id, s.source_trader_id, t.alias, t.wallet_address, a.name AS account_name,
-                s.enabled, s.sizing_mode, s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd,
+                COALESCE(s.display_name, t.alias) AS display_name, s.enabled, s.sizing_mode, s.allocation_mode, s.allocation_percent,
+                s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd,
                 s.max_position_usd, s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
                 s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets
          FROM copy_strategies s
@@ -3316,8 +3811,11 @@ struct StrategyView {
     alias: String,
     wallet_address: String,
     account_name: String,
+    display_name: String,
     enabled: bool,
     sizing_mode: String,
+    allocation_mode: String,
+    allocation_percent: Option<Decimal>,
     fixed_amount_usd: Option<Decimal>,
     proportion: Option<Decimal>,
     multiplier: Option<Decimal>,

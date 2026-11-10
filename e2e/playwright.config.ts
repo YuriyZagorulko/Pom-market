@@ -40,6 +40,7 @@ export default defineConfig({
   },
   projects: [
     { name: "tenant", testMatch: /tenant-api\.spec\.ts/, use: { baseURL: apiBase } },
+    { name: "account-risk", testMatch: /account-risk\.spec\.ts/, use: { baseURL: apiBase } },
     { name: "user-login", testMatch: /user-login\.spec\.ts/, use: { baseURL: userBase } },
     {
       name: "admin",
@@ -47,6 +48,13 @@ export default defineConfig({
       use: { baseURL: adminBase },
     },
     { name: "paper", testMatch: /paper-flow\.spec\.ts/, use: { baseURL: userBase } },
+    { name: "copy-strategy", testMatch: /copy-strategy\.spec\.ts/, use: { baseURL: userBase } },
+    {
+      name: "strategy-analytics",
+      testMatch: /strategy-analytics\.spec\.ts/,
+      use: { baseURL: userBase },
+    },
+    { name: "danger-zone", testMatch: /danger-zone\.spec\.ts/, use: { baseURL: userBase } },
     { name: "trading-data", testMatch: /trading-data\.spec\.ts/, use: { baseURL: userBase } },
   ],
 });

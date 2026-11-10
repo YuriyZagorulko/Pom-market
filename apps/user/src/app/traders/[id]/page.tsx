@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { FormEvent } from "react";
 import { Desk, useResource } from "@/components/desk";
+import { SimpleFieldLabel } from "@/components/simple-field-label";
+import { useToast } from "@/components/toast";
 import { useSession } from "@/lib/session";
 
 export default function TraderPage() {
@@ -13,21 +15,35 @@ export default function TraderPage() {
 
 function Detail({ id }: { id: string }) {
   const { client } = useSession();
+  const toast = useToast();
   const trader = useResource<Record<string, unknown>>(`/api/v1/source-traders/${id}`, {
     refreshMs: 10000,
   });
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
-    await client.request(`/api/v1/source-traders/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ alias: data.get("alias"), monitoring_enabled: data.get("monitoring_enabled") === "on" }),
-    });
-    trader.reload();
+    try {
+      await client.request(`/api/v1/source-traders/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          alias: data.get("alias"),
+          monitoring_enabled: data.get("monitoring_enabled") === "on",
+        }),
+      });
+      toast.success("Source trader saved");
+      trader.reload();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Save failed");
+    }
   }
   async function remove() {
-    await client.request(`/api/v1/source-traders/${id}`, { method: "DELETE" });
-    location.href = "/traders";
+    try {
+      await client.request(`/api/v1/source-traders/${id}`, { method: "DELETE" });
+      toast.info("Source trader removed");
+      location.href = "/traders";
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Remove failed");
+    }
   }
   if (trader.loading) return <p>Loading…</p>;
   if (trader.error) return <p className="error">{trader.error}</p>;
@@ -106,10 +122,15 @@ function Detail({ id }: { id: string }) {
         </section>
         <button className="ghost" onClick={remove}>Remove wallet</button>
       </div>
-      <form className="panel" onSubmit={save}>
-        <input name="alias" defaultValue={String(trader.data.alias)} />
-        <label><input type="checkbox" name="monitoring_enabled" defaultChecked={monitoringEnabled} /> Monitoring enabled</label>
-        <button>Save</button>
+      <form className="panel form-stack" onSubmit={save}>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="trader-alias">Display alias</SimpleFieldLabel>
+          <input id="trader-alias" name="alias" defaultValue={String(trader.data.alias)} />
+        </div>
+        <label>
+          <input type="checkbox" name="monitoring_enabled" defaultChecked={monitoringEnabled} /> Monitoring enabled
+        </label>
+        <button type="submit">Save trader</button>
       </form>
       <div className="panel">
         <h2>Copy onto an account</h2>

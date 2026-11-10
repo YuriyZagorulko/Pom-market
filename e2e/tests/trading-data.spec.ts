@@ -59,14 +59,10 @@ test("wallet activity: filters, presets, URL reload", async ({ page }) => {
       .toBe(true);
   }
 
-  await page
-    .locator(".wallet-activity select")
-    .filter({ has: page.locator('option[value="buy"]') })
-    .first()
-    .selectOption("buy");
+  await page.getByLabel("Side").selectOption("buy");
   await page.waitForURL(/side=buy/);
 
-  const search = page.getByPlaceholder(/search market/i);
+  const search = page.getByLabel("Search");
   await typeInto(search, "poly");
   await search.press("Enter");
   await expect(page).toHaveURL(/q=poly/);
@@ -75,9 +71,9 @@ test("wallet activity: filters, presets, URL reload", async ({ page }) => {
   await expect(page).toHaveURL(/from=/);
   await expect(page).toHaveURL(/to=/);
 
-  const activityType = page.locator('select').filter({ has: page.locator('option[value="trade"]') });
+  const activityType = page.getByLabel("Activity type");
   if (await activityType.count()) {
-    await activityType.first().selectOption("trade");
+    await activityType.selectOption("trade");
     await expect(page).toHaveURL(/activity_type=trade/);
   }
 
@@ -136,8 +132,9 @@ test("activity: kind and date presets", async ({ page }) => {
   await login(page);
   await page.goto("/activity");
   await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
-  await typeInto(page.getByPlaceholder("Event type"), "order");
-  await page.getByPlaceholder("Event type").blur();
+  const kind = page.getByLabel("Event type");
+  await typeInto(kind, "order");
+  await kind.blur();
   await expect(page).toHaveURL(/kind=order/);
   await page.getByRole("button", { name: "All time" }).click();
   await expect(page).not.toHaveURL(/from=/);

@@ -38,7 +38,11 @@ cargo test --manifest-path backend/Cargo.toml \
   --test copy_trading_workflow \
   --test copy_trading_concurrency \
   --test copy_trading_attribution \
+  --test allocation_concurrency \
   --test account_trading_control \
   --test hard_close_safety \
+  --test strategy_analytics_financial \
+  --test strategy_capital_accounting \
+  --test strategy_capital_execution \
   -- --ignored --test-threads=1 --nocapture
 cargo test --manifest-path backend/Cargo.toml --test email_transport_safety -- --nocapture

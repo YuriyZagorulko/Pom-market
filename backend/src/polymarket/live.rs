@@ -63,8 +63,14 @@ pub async fn probe_account(
             };
         }
     };
-    let signer_address = format!("{:?}", signer.address()).to_lowercase();
-    let funder_address = funder.unwrap_or(&signer_address).to_string();
+    let signer_address = address_of(private_key).unwrap_or_else(|_| {
+        format!("{:#x}", signer.address())
+            .trim()
+            .to_ascii_lowercase()
+    });
+    let funder_address = funder
+        .map(|f| f.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| signer_address.clone());
     let client =
         match authenticated(clob_host, &signer, signature_type, Some(&funder_address)).await {
             Ok(client) => client,
@@ -248,12 +254,19 @@ pub async fn lookup_order(
 }
 
 pub fn address_of(private_key: &str) -> Result<String, String> {
-    let signer = signer_from_key(private_key)?;
-    Ok(format!("{:#x}", signer.address()))
+    let key = crate::polymarket::credentials::sanitize_private_key(private_key)?;
+    if !crate::engine::is_private_key(&key) {
+        return Err("private key must be a 32-byte hex key".into());
+    }
+    let signer = signer_from_key(&key)?;
+    Ok(crate::engine::normalize_address(&format!(
+        "{:#x}",
+        signer.address()
+    )))
 }
 
 fn signer_from_key(private_key: &str) -> Result<impl Signer + Clone, String> {
-    let signer = LocalSigner::from_str(private_key).map_err(|e| redact(&e.to_string()))?;
+    let signer = LocalSigner::from_str(private_key.trim()).map_err(|e| redact(&e.to_string()))?;
     Ok(signer.with_chain_id(Some(POLYGON)))
 }
 

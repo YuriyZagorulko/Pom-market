@@ -9,6 +9,7 @@ pub enum SizingMode {
     FixedAmount,
     Proportional,
     Multiplier,
+    PortfolioRatio,
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,10 @@ pub struct SizingInput {
     pub strategy_remaining_usd: Decimal,
     pub account_exposure_remaining_usd: Decimal,
     pub available_balance_usd: Decimal,
+    /// Strategy capital allocated to this copy strategy (not whole account balance).
+    pub strategy_allocated_capital_usd: Option<Decimal>,
+    /// Observed source trader total equity for portfolio-relative sizing.
+    pub source_trader_equity_usd: Option<Decimal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +60,8 @@ pub enum RejectReason {
     CredentialsMissing,
     ExchangeUnknown,
     FeeUnknown,
+    SourceEquityUnavailable,
+    StrategyCapitalNotInitialized,
 }
 
 impl RejectReason {
@@ -88,8 +95,54 @@ impl RejectReason {
             Self::CredentialsMissing => "credentials_missing",
             Self::ExchangeUnknown => "exchange_unknown",
             Self::FeeUnknown => "fee_unknown",
+            Self::SourceEquityUnavailable => "source_equity_unavailable",
+            Self::StrategyCapitalNotInitialized => "strategy_capital_not_initialized",
         }
     }
+}
+
+/// User-facing title and detail for API / activity views.
+pub fn decision_reason_explain(code: &str) -> Option<(&'static str, &'static str)> {
+    Some(match code {
+        "strategy_capital_not_initialized" => (
+            "Strategy capital not funded",
+            "No cash is reserved in this strategy's ledger yet. Enable the strategy or allocate paper capital from the trading account.",
+        ),
+        "strategy_disabled" => ("Strategy disabled", "Turn on the strategy to copy new trades."),
+        "source_equity_unavailable" => (
+            "Source portfolio equity unknown",
+            "Portfolio-relative sizing needs a fresh equity snapshot for the leader wallet.",
+        ),
+        "below_minimum" => (
+            "Below minimum order size",
+            "The computed copy size is below exchange or strategy minimums after caps.",
+        ),
+        "strategy_budget" => (
+            "Strategy budget exhausted",
+            "Remaining strategy allocation cannot cover this copy size.",
+        ),
+        "insufficient_balance" => (
+            "Insufficient balance",
+            "Available strategy cash or account balance is too low for this order.",
+        ),
+        "no_liquidity" => (
+            "No liquidity",
+            "The order book could not fill the target size within the limit price.",
+        ),
+        "slippage_exceeded" => (
+            "Slippage limit",
+            "Simulated fill slippage exceeds the strategy maximum.",
+        ),
+        "copy_side_disabled" => (
+            "Copy side disabled",
+            "This strategy is not configured to copy that side (buy or sell).",
+        ),
+        "no_position" => (
+            "No position to sell",
+            "The strategy has no open shares matching this exit.",
+        ),
+        _ => return None,
+    })
 }
 
 pub fn target_notional(input: &SizingInput) -> Result<Decimal, RejectReason> {
@@ -100,6 +153,20 @@ pub fn target_notional(input: &SizingInput) -> Result<Decimal, RejectReason> {
         }
         SizingMode::Multiplier => {
             input.source_notional * input.multiplier.ok_or(RejectReason::MissingSizing)?
+        }
+        SizingMode::PortfolioRatio => {
+            let equity = input
+                .source_trader_equity_usd
+                .filter(|v| *v > Decimal::ZERO)
+                .ok_or(RejectReason::SourceEquityUnavailable)?;
+            let alloc = input
+                .strategy_allocated_capital_usd
+                .filter(|v| *v > Decimal::ZERO)
+                .ok_or(RejectReason::MissingSizing)?;
+            if input.source_notional <= Decimal::ZERO {
+                return Err(RejectReason::BelowMinimum);
+            }
+            (input.source_notional * alloc / equity).round_dp(8)
         }
     };
     if raw <= Decimal::ZERO {
@@ -690,6 +757,18 @@ pub fn is_private_key(value: &str) -> bool {
 }
 
 #[cfg(test)]
+mod decision_reason_tests {
+    use super::decision_reason_explain;
+
+    #[test]
+    fn explains_capital_not_initialized() {
+        let (t, d) = decision_reason_explain("strategy_capital_not_initialized").unwrap();
+        assert!(t.contains("capital"));
+        assert!(!d.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -710,6 +789,8 @@ mod tests {
             strategy_remaining_usd: d("40"),
             account_exposure_remaining_usd: d("1000"),
             available_balance_usd: d("1000"),
+            strategy_allocated_capital_usd: None,
+            source_trader_equity_usd: None,
         };
         assert_eq!(target_notional(&input).unwrap(), d("40"));
         input.strategy_remaining_usd = d("100");
@@ -735,6 +816,8 @@ mod tests {
             strategy_remaining_usd: d("100"),
             account_exposure_remaining_usd: d("100"),
             available_balance_usd: d("100"),
+            strategy_allocated_capital_usd: None,
+            source_trader_equity_usd: None,
         };
         assert_eq!(target_notional(&proportional).unwrap(), d("20"));
         let mult = SizingInput {
@@ -745,6 +828,25 @@ mod tests {
             ..proportional
         };
         assert_eq!(target_notional(&mult).unwrap(), d("100"));
+    }
+
+    #[test]
+    fn portfolio_ratio_scales_by_allocation_over_equity() {
+        let input = SizingInput {
+            mode: SizingMode::PortfolioRatio,
+            fixed_amount_usd: None,
+            proportion: None,
+            multiplier: None,
+            source_notional: d("4000"),
+            max_order_usd: d("10000"),
+            min_order_usd: d("1"),
+            strategy_remaining_usd: d("2000"),
+            account_exposure_remaining_usd: d("10000"),
+            available_balance_usd: d("10000"),
+            strategy_allocated_capital_usd: Some(d("2000")),
+            source_trader_equity_usd: Some(d("20000")),
+        };
+        assert_eq!(target_notional(&input).unwrap(), d("400"));
     }
 
     #[test]

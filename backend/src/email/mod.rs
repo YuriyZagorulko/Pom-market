@@ -394,6 +394,8 @@ mod tests {
             app_base_url: "http://localhost:4323".into(),
             trusted_proxies: String::new(),
             trusted_proxies_parsed: crate::client_ip::TrustedProxies::default(),
+            source_equity_max_age_seconds: 120,
+            source_equity_min_usd: rust_decimal::Decimal::ONE,
         }
     }
 

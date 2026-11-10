@@ -46,6 +46,10 @@ pub struct Config {
     /// Comma-separated IPs/CIDRs of reverse proxies allowed to set X-Forwarded-For.
     pub trusted_proxies: String,
     pub trusted_proxies_parsed: TrustedProxies,
+    /// Max age for source trader equity snapshots used in portfolio-relative sizing.
+    pub source_equity_max_age_seconds: i64,
+    /// Minimum total equity before portfolio-relative BUY is allowed.
+    pub source_equity_min_usd: rust_decimal::Decimal,
 }
 
 impl Config {
@@ -113,6 +117,8 @@ impl Config {
                 .unwrap_or_else(|| var("USER_ORIGIN", "http://localhost:4323")),
             trusted_proxies,
             trusted_proxies_parsed,
+            source_equity_max_age_seconds: var("SOURCE_EQUITY_MAX_AGE_SECONDS", "120").parse()?,
+            source_equity_min_usd: var("SOURCE_EQUITY_MIN_USD", "1").parse()?,
         })
         .and_then(|cfg| cfg.validate().map(|()| cfg))
     }

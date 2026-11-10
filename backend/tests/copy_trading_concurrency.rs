@@ -98,6 +98,7 @@ async fn concurrent_buys_do_not_overspend_strategy_budget() {
         default_fee_exponent: 1,
     };
     let book = FixedBook;
+    let (data, app_cfg) = test_support::pipeline_runtime();
     let wallet = "0x1111111111111111111111111111111111111111";
 
     let user_id: Uuid = sqlx::query_scalar(
@@ -153,6 +154,8 @@ async fn concurrent_buys_do_not_overspend_strategy_budget() {
     .await
     .unwrap();
 
+    test_support::bootstrap_paper_capital_for_account(&worker, account_id).await;
+
     // Pre-fill deployed capital so only ~$0–50 remains for new BUY reserves (budget 150, deployed 130).
     sqlx::query(
         "INSERT INTO positions (user_id, trading_account_id, strategy_id, source_wallet, token_id, operating_mode,
@@ -173,12 +176,28 @@ async fn concurrent_buys_do_not_overspend_strategy_budget() {
     let o2 = ingest(&worker, &b2).await.unwrap();
 
     try_join!(
-        process_event(&worker, &vault, &book, &pipeline, o1.event_id),
-        process_event(&worker, &vault, &book, &pipeline, o2.event_id)
+        process_event(
+            &worker,
+            &vault,
+            &book,
+            &pipeline,
+            &data,
+            &app_cfg,
+            o1.event_id
+        ),
+        process_event(
+            &worker,
+            &vault,
+            &book,
+            &pipeline,
+            &data,
+            &app_cfg,
+            o2.event_id
+        )
     )
     .unwrap();
 
-    let util = utilization_for_user(&worker, user_id, strategy_id)
+    let util = utilization_for_user(&worker, user_id, strategy_id, &app_cfg)
         .await
         .unwrap();
     assert!(

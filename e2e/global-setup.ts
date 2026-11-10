@@ -30,6 +30,19 @@ export default async function globalSetup() {
 
   const adminToken = await apiLogin(adminEmail, adminPassword, SETUP_XFF);
 
+  const killOff = await fetch(`${apiBase}/api/v1/admin/kill-switch`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${adminToken}`,
+      "Content-Type": "application/json",
+      "X-Forwarded-For": SETUP_XFF,
+    },
+    body: JSON.stringify({ enabled: false }),
+  });
+  if (!killOff.ok) {
+    throw new Error(`failed to disable global kill switch for E2E: HTTP ${killOff.status}`);
+  }
+
   const created = await fetch(
     `${process.env.E2E_API_BASE_URL ?? "http://127.0.0.1:4321"}/api/v1/admin/users`,
     {

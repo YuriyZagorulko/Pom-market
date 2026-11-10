@@ -38,9 +38,10 @@ async fn pipeline_mock_scenarios() {
         "PATCH",
         &format!("/api/v1/accounts/{account_id}/risk"),
         &token,
-        json!({"paper_cash_usd": "1000", "max_order_usd": "100", "max_exposure_usd": "1000"}),
+        json!({"max_order_usd": "100", "max_exposure_usd": "1000"}),
     )
     .await;
+    api.fund_paper(&token, account_id, "1000").await;
     api.send(
         "POST",
         &format!("/api/v1/accounts/{account_id}/mode"),
@@ -105,6 +106,11 @@ async fn pipeline_mock_scenarios() {
     .unwrap();
     assert!(skipped >= 1, "disabled strategy should be skipped");
 
+    test_support::bootstrap_paper_capital_for_account(
+        &api.worker,
+        uuid::Uuid::parse_str(account_id).unwrap(),
+    )
+    .await;
     api.send(
         "POST",
         &format!("/api/v1/strategies/{strategy_id}/enable"),
@@ -123,17 +129,41 @@ async fn pipeline_mock_scenarios() {
     let (_, orders) = api.get_raw("/api/v1/orders", &token).await;
     assert_eq!(list_items(&orders).len(), 1, "no duplicate order");
 
-    api.send(
-        "PATCH",
-        &format!("/api/v1/accounts/{account_id}/risk"),
-        &token,
-        json!({"paper_cash_usd": "1", "max_order_usd": "100", "max_exposure_usd": "1000"}),
+    let sid = uuid::Uuid::parse_str(strategy_id).unwrap();
+    let mut drain = begin_as(&api.worker, None, "worker").await.unwrap();
+    sqlx::query(
+        "UPDATE strategy_capital_accounts SET available_cash_usd = 0, reserved_cash_usd = 0 WHERE strategy_id = $1",
     )
-    .await;
+    .bind(sid)
+    .execute(&mut *drain)
+    .await
+    .unwrap();
+    drain.commit().await.unwrap();
     let broke = TestApi::sample_trade(wallet, "buy", "10", "0xinsufficient");
     api.inject_and_process(&broke).await;
+    let mut chk = begin_as(&api.worker, None, "worker").await.unwrap();
+    let last: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, reason FROM copy_decisions WHERE strategy_id = $1 ORDER BY detected_at DESC LIMIT 1",
+    )
+    .bind(sid)
+    .fetch_optional(&mut *chk)
+    .await
+    .unwrap();
+    chk.commit().await.unwrap();
+    assert!(
+        matches!(last.as_ref(), Some((s, _)) if s == "rejected" || s == "skipped"),
+        "expected broke buy rejection, got {last:?}"
+    );
+    assert!(
+        matches!(&last, Some((_, Some(r))) if r == "insufficient_balance" || r == "strategy_budget"),
+        "expected cash rejection, got {last:?}"
+    );
     let (_, orders) = api.get_raw("/api/v1/orders", &token).await;
-    assert_eq!(list_items(&orders).len(), 1, "insufficient cash");
+    let filled = list_items(&orders)
+        .iter()
+        .filter(|o| o.get("status").and_then(|s| s.as_str()) == Some("filled"))
+        .count();
+    assert_eq!(filled, 1, "only the funded buy should fill");
 }
 
 #[tokio::test]
@@ -170,6 +200,14 @@ async fn tenant_isolation_api_extended() {
         )
         .await;
     let acct_b_id = acct_b["id"].as_str().unwrap();
+    api.send(
+        "PATCH",
+        &format!("/api/v1/accounts/{acct_b_id}/risk"),
+        &token_b,
+        json!({"max_order_usd": "100", "max_exposure_usd": "1000"}),
+    )
+    .await;
+    api.fund_paper(&token_b, acct_b_id, "1000").await;
 
     let trader_b = api
         .send(

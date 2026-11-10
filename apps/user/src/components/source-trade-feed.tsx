@@ -7,6 +7,8 @@ import { DateRangePresets } from "@/components/date-range-presets";
 import { FilterChips } from "@/components/filter-chips";
 import { Desk } from "@/components/desk";
 import { PaginationBar } from "@/components/pagination-bar";
+import { SimpleFieldLabel } from "@/components/simple-field-label";
+import { useToast } from "@/components/toast";
 import { WalletMultiselect } from "@/components/wallet-multiselect";
 import { useListQuery } from "@/lib/use-list-query";
 import { usePagedList } from "@/lib/use-paged-list";
@@ -24,6 +26,7 @@ import {
 } from "@/lib/source-trade-format";
 
 export function WalletActivityFeed() {
+  const toast = useToast();
   const list = useListQuery();
   const traders = usePagedList<{ id: string; alias: string; wallet_address: string }>("/api/v1/source-traders");
   const path = `/api/v1/source-trades?${list.apiParams.toString()}`;
@@ -51,7 +54,14 @@ export function WalletActivityFeed() {
             Trades from monitored Polymarket wallets
           </p>
         </div>
-        <button type="button" className="ghost" onClick={reload}>
+        <button
+          type="button"
+          className="ghost"
+          onClick={() => {
+            reload();
+            toast.info("Activity feed refreshed");
+          }}
+        >
           Refresh
         </button>
       </div>
@@ -72,76 +82,76 @@ export function WalletActivityFeed() {
             )
           }
         />
-        <input
-          defaultValue={list.read("q")}
-          placeholder="Search market, outcome, tx…"
-          onBlur={(e) => list.setParams({ q: e.target.value.trim() || null }, true)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") list.setParams({ q: (e.target as HTMLInputElement).value.trim() || null }, true);
-          }}
-        />
-        <select
-          value={list.read("side")}
-          onChange={(e) => list.setParams({ side: e.target.value || null }, true)}
-        >
-          <option value="">Buy and sell</option>
-          <option value="buy">Buy</option>
-          <option value="sell">Sell</option>
-        </select>
-        <select
-          value={list.read("outcome")}
-          onChange={(e) => list.setParams({ outcome: e.target.value || null }, true)}
-        >
-          <option value="">Any outcome</option>
-          <option value="Yes">Yes</option>
-          <option value="No">No</option>
-        </select>
-        <select
-          value={list.read("activity_type")}
-          onChange={(e) => list.setParams({ activity_type: e.target.value || null }, true)}
-        >
-          <option value="">Any type</option>
-          <option value="trade">Trade</option>
-        </select>
-        <select value={list.read("status")} onChange={(e) => list.setParams({ status: e.target.value || null }, true)}>
-          <option value="">Any status</option>
-          <option value="processed">Processed</option>
-          <option value="detected">Detected</option>
-          <option value="normalized">Normalized</option>
-          <option value="processing">Processing</option>
-          <option value="failed">Failed</option>
-          <option value="duplicate">Duplicate</option>
-        </select>
-        <input
-          type="date"
-          defaultValue={list.read("from")}
-          onBlur={(e) => list.setParams({ from: e.target.value || null }, true)}
-        />
-        <input
-          type="date"
-          defaultValue={list.read("to")}
-          onBlur={(e) => list.setParams({ to: e.target.value || null }, true)}
-        />
-        <input
-          placeholder="Min total USDC"
-          defaultValue={list.read("min_amount")}
-          onBlur={(e) => list.setParams({ min_amount: e.target.value.trim() || null }, true)}
-        />
-        <input
-          placeholder="Max total USDC"
-          defaultValue={list.read("max_amount")}
-          onBlur={(e) => list.setParams({ max_amount: e.target.value.trim() || null }, true)}
-        />
-        <input
-          placeholder="Min price"
-          defaultValue={list.read("min_price")}
-          onBlur={(e) => list.setParams({ min_price: e.target.value.trim() || null }, true)}
-        />
-        <input
-          placeholder="Max price"
-          defaultValue={list.read("max_price")}
-          onBlur={(e) => list.setParams({ max_price: e.target.value.trim() || null }, true)}
-        />
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-q">Search</SimpleFieldLabel>
+          <input
+            id="wa-q"
+            defaultValue={list.read("q")}
+            onBlur={(e) => list.setParams({ q: e.target.value.trim() || null }, true)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") list.setParams({ q: (e.target as HTMLInputElement).value.trim() || null }, true);
+            }}
+          />
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-side">Side</SimpleFieldLabel>
+          <select id="wa-side" value={list.read("side")} onChange={(e) => list.setParams({ side: e.target.value || null }, true)}>
+            <option value="">Buy and sell</option>
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-outcome">Outcome</SimpleFieldLabel>
+          <select id="wa-outcome" value={list.read("outcome")} onChange={(e) => list.setParams({ outcome: e.target.value || null }, true)}>
+            <option value="">Any outcome</option>
+            <option value="Yes">Yes</option>
+            <option value="No">No</option>
+          </select>
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-type">Activity type</SimpleFieldLabel>
+          <select id="wa-type" value={list.read("activity_type")} onChange={(e) => list.setParams({ activity_type: e.target.value || null }, true)}>
+            <option value="">Any type</option>
+            <option value="trade">Trade</option>
+          </select>
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-status">Ingestion status</SimpleFieldLabel>
+          <select id="wa-status" value={list.read("status")} onChange={(e) => list.setParams({ status: e.target.value || null }, true)}>
+            <option value="">Any status</option>
+            <option value="processed">Processed</option>
+            <option value="detected">Detected</option>
+            <option value="normalized">Normalized</option>
+            <option value="processing">Processing</option>
+            <option value="failed">Failed</option>
+            <option value="duplicate">Duplicate</option>
+          </select>
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-from">From date</SimpleFieldLabel>
+          <input id="wa-from" type="date" defaultValue={list.read("from")} onBlur={(e) => list.setParams({ from: e.target.value || null }, true)} />
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-to">To date</SimpleFieldLabel>
+          <input id="wa-to" type="date" defaultValue={list.read("to")} onBlur={(e) => list.setParams({ to: e.target.value || null }, true)} />
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-min-amt">Min total USDC</SimpleFieldLabel>
+          <input id="wa-min-amt" defaultValue={list.read("min_amount")} onBlur={(e) => list.setParams({ min_amount: e.target.value.trim() || null }, true)} />
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-max-amt">Max total USDC</SimpleFieldLabel>
+          <input id="wa-max-amt" defaultValue={list.read("max_amount")} onBlur={(e) => list.setParams({ max_amount: e.target.value.trim() || null }, true)} />
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-min-price">Min price</SimpleFieldLabel>
+          <input id="wa-min-price" defaultValue={list.read("min_price")} onBlur={(e) => list.setParams({ min_price: e.target.value.trim() || null }, true)} />
+        </div>
+        <div className="form-field">
+          <SimpleFieldLabel htmlFor="wa-max-price">Max price</SimpleFieldLabel>
+          <input id="wa-max-price" defaultValue={list.read("max_price")} onBlur={(e) => list.setParams({ max_price: e.target.value.trim() || null }, true)} />
+        </div>
       </div>
 
       <FilterChips

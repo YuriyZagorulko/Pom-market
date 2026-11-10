@@ -38,9 +38,10 @@ async fn orders_list_respects_empty_and_explicit_filters() {
         "PATCH",
         &format!("/api/v1/accounts/{account_id}/risk"),
         &token,
-        json!({"paper_cash_usd": "1000", "max_order_usd": "100", "max_exposure_usd": "1000"}),
+        json!({"max_order_usd": "100", "max_exposure_usd": "1000"}),
     )
     .await;
+    api.fund_paper(&token, account_id, "1000").await;
     api.send(
         "POST",
         &format!("/api/v1/accounts/{account_id}/mode"),
@@ -76,6 +77,7 @@ async fn orders_list_respects_empty_and_explicit_filters() {
         )
         .await;
     let strategy_id = strategy["id"].as_str().unwrap();
+    api.bootstrap_capital(&token, account_id).await;
     api.send(
         "POST",
         &format!("/api/v1/strategies/{strategy_id}/enable"),

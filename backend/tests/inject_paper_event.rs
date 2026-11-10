@@ -43,6 +43,7 @@ async fn inject_trade() {
     )
     .expect("vault");
     let books = common::FixedBook;
+    let (data, app_cfg) = test_support::pipeline_runtime();
     let pipeline = pommarket::pipeline::PipelineConfig {
         clob_host: env::var("POLYMARKET_CLOB_HOST")
             .unwrap_or_else(|_| "https://clob.polymarket.com".into()),
@@ -51,14 +52,23 @@ async fn inject_trade() {
         default_fee_exponent: 1,
     };
 
-    let trade = TestApi::sample_trade(&wallet, &side, "10", &tx);
+    let size = env::var("INJECT_SIZE").unwrap_or_else(|_| "10".into());
+    let trade = TestApi::sample_trade(&wallet, &side, &size, &tx);
     let outcome = pommarket::pipeline::ingest(&pool, &trade)
         .await
         .expect("ingest");
     if outcome.created || !outcome.duplicate_fragment {
-        pommarket::pipeline::process_event(&pool, &vault, &books, &pipeline, outcome.event_id)
-            .await
-            .expect("process");
+        pommarket::pipeline::process_event(
+            &pool,
+            &vault,
+            &books,
+            &pipeline,
+            &data,
+            &app_cfg,
+            outcome.event_id,
+        )
+        .await
+        .expect("process");
     }
     eprintln!(
         "ingest created={} event_id={}",
