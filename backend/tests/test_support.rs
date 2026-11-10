@@ -1,7 +1,19 @@
 //! Shared guards for PostgreSQL integration tests.
 #![allow(dead_code)]
 
+use serde_json::Value;
 use sqlx::PgPool;
+
+/// List endpoints return either a bare JSON array (legacy) or `{ items, total, ... }`.
+pub fn list_items(body: &Value) -> &[Value] {
+    if let Some(arr) = body.as_array() {
+        return arr;
+    }
+    body.get("items")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .expect("expected JSON array or paged object with items[]")
+}
 
 /// Refuses URLs that do not clearly target an isolated test database.
 fn database_segment(url: &str) -> &str {

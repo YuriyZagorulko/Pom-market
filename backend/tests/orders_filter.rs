@@ -3,6 +3,7 @@ mod test_support;
 
 use common::TestApi;
 use serde_json::json;
+use test_support::list_items;
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL pointed at a database whose name contains pommarket_test"]
@@ -89,7 +90,14 @@ async fn orders_list_respects_empty_and_explicit_filters() {
     api.inject_and_process(&buy).await;
     api.inject_and_process(&sell).await;
 
-    let count = |orders: &serde_json::Value| orders.as_array().map(|a| a.len()).unwrap_or(0);
+    let count = |orders: &serde_json::Value| {
+        orders
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .or_else(|| orders.as_array().map(|a| a.len()))
+            .unwrap_or(0)
+    };
 
     let (_, none) = api.get_raw("/api/v1/orders", &token).await;
     assert_eq!(count(&none), 2, "no query params");
@@ -101,7 +109,7 @@ async fn orders_list_respects_empty_and_explicit_filters() {
 
     let (_, buys) = api.get_raw("/api/v1/orders?side=buy", &token).await;
     assert_eq!(count(&buys), 1);
-    assert_eq!(buys[0]["side"], "buy");
+    assert_eq!(list_items(&buys)[0]["side"], "buy");
 
     let (_, sells) = api.get_raw("/api/v1/orders?side=sell", &token).await;
     assert_eq!(count(&sells), 1);

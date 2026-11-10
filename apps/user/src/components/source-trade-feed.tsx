@@ -1,9 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { CopyButton } from "@/components/copy-button";
-import { Desk, useResource } from "@/components/desk";
+import { DateRangePresets } from "@/components/date-range-presets";
+import { FilterChips } from "@/components/filter-chips";
+import { Desk } from "@/components/desk";
+import { PaginationBar } from "@/components/pagination-bar";
+import { WalletMultiselect } from "@/components/wallet-multiselect";
+import { useListQuery } from "@/lib/use-list-query";
+import { usePagedList } from "@/lib/use-paged-list";
 import {
   activityLabel,
   displayNotional,
@@ -17,35 +23,24 @@ import {
   type SourceTrade,
 } from "@/lib/source-trade-format";
 
-const PAGE = 50;
-
-export function WalletActivityPage() {
-  return (
-    <Desk>
-      <WalletActivityFeed />
-    </Desk>
-  );
-}
-
 export function WalletActivityFeed() {
-  const [query, setQuery] = useState("");
-  const [side, setSide] = useState("");
-  const [offset, setOffset] = useState(0);
+  const list = useListQuery();
+  const traders = usePagedList<{ id: string; alias: string; wallet_address: string }>("/api/v1/source-traders");
+  const path = `/api/v1/source-trades?${list.apiParams.toString()}`;
+  const { items: rows, total, limit, offset, loading, error, reload } = usePagedList<SourceTrade>(path);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const selectedWallets = list.read("wallets") ? list.read("wallets").split(",").filter(Boolean) : [];
 
-  const path = useMemo(() => {
-    const params = new URLSearchParams({ limit: String(PAGE), offset: String(offset) });
-    if (query.trim()) params.set("q", query.trim());
-    if (side) params.set("side", side);
-    return `/api/v1/source-trades?${params.toString()}`;
-  }, [query, side, offset]);
-
-  const { data, error, reload } = useResource<SourceTrade[]>(path);
-
-  const onFilterChange = useCallback(() => setOffset(0), []);
-
-  const rows = data ?? [];
-  const canLoadMore = rows.length === PAGE;
+  const grouped = useMemo(() => {
+    const map = new Map<string, SourceTrade[]>();
+    for (const row of rows) {
+      const day = row.event_ts.slice(0, 10);
+      const bucket = map.get(day) ?? [];
+      bucket.push(row);
+      map.set(day, bucket);
+    }
+    return Array.from(map.entries());
+  }, [rows]);
 
   return (
     <section className="wallet-activity">
@@ -61,30 +56,103 @@ export function WalletActivityFeed() {
         </button>
       </div>
 
-      <div className="filters">
+      <DateRangePresets
+        from={list.read("from")}
+        to={list.read("to")}
+        onChange={(patch) => list.setParams(patch, true)}
+      />
+      <div className="filters list-filters">
+        <WalletMultiselect
+          traders={traders.items}
+          selected={selectedWallets}
+          onChange={(ids) =>
+            list.setParams(
+              { wallets: ids.length === traders.items.length || ids.length === 0 ? null : ids.join(",") },
+              true,
+            )
+          }
+        />
         <input
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-            onFilterChange();
+          defaultValue={list.read("q")}
+          placeholder="Search market, outcome, tx…"
+          onBlur={(e) => list.setParams({ q: e.target.value.trim() || null }, true)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") list.setParams({ q: (e.target as HTMLInputElement).value.trim() || null }, true);
           }}
-          placeholder="Search wallet, market, token, tx"
         />
         <select
-          value={side}
-          onChange={(e) => {
-            setSide(e.target.value);
-            onFilterChange();
-          }}
+          value={list.read("side")}
+          onChange={(e) => list.setParams({ side: e.target.value || null }, true)}
         >
           <option value="">Buy and sell</option>
           <option value="buy">Buy</option>
           <option value="sell">Sell</option>
         </select>
+        <select
+          value={list.read("outcome")}
+          onChange={(e) => list.setParams({ outcome: e.target.value || null }, true)}
+        >
+          <option value="">Any outcome</option>
+          <option value="Yes">Yes</option>
+          <option value="No">No</option>
+        </select>
+        <select
+          value={list.read("activity_type")}
+          onChange={(e) => list.setParams({ activity_type: e.target.value || null }, true)}
+        >
+          <option value="">Any type</option>
+          <option value="trade">Trade</option>
+        </select>
+        <select value={list.read("status")} onChange={(e) => list.setParams({ status: e.target.value || null }, true)}>
+          <option value="">Any status</option>
+          <option value="processed">Processed</option>
+          <option value="detected">Detected</option>
+          <option value="normalized">Normalized</option>
+          <option value="processing">Processing</option>
+          <option value="failed">Failed</option>
+          <option value="duplicate">Duplicate</option>
+        </select>
+        <input
+          type="date"
+          defaultValue={list.read("from")}
+          onBlur={(e) => list.setParams({ from: e.target.value || null }, true)}
+        />
+        <input
+          type="date"
+          defaultValue={list.read("to")}
+          onBlur={(e) => list.setParams({ to: e.target.value || null }, true)}
+        />
+        <input
+          placeholder="Min total USDC"
+          defaultValue={list.read("min_amount")}
+          onBlur={(e) => list.setParams({ min_amount: e.target.value.trim() || null }, true)}
+        />
+        <input
+          placeholder="Max total USDC"
+          defaultValue={list.read("max_amount")}
+          onBlur={(e) => list.setParams({ max_amount: e.target.value.trim() || null }, true)}
+        />
+        <input
+          placeholder="Min price"
+          defaultValue={list.read("min_price")}
+          onBlur={(e) => list.setParams({ min_price: e.target.value.trim() || null }, true)}
+        />
+        <input
+          placeholder="Max price"
+          defaultValue={list.read("max_price")}
+          onBlur={(e) => list.setParams({ max_price: e.target.value.trim() || null }, true)}
+        />
       </div>
 
+      <FilterChips
+        chips={list.chips}
+        onRemove={(name) => list.setParams({ [name]: null }, true)}
+        onClear={() => list.clearAll()}
+      />
+
+      {loading && <p className="muted">Loading…</p>}
       {error && <p className="error">{error}</p>}
-      {!error && !rows.length && (
+      {!loading && !error && !rows.length && (
         <div className="activity-empty panel">
           <p style={{ margin: 0 }}>No wallet trades yet.</p>
           <p className="muted" style={{ margin: "8px 0 0" }}>
@@ -93,39 +161,32 @@ export function WalletActivityFeed() {
         </div>
       )}
 
-      <ul className="activity-feed">
-        {rows.map((trade) => (
-          <ActivityCard
-            key={trade.id}
-            trade={trade}
-            open={expanded === trade.id}
-            onToggle={() => setExpanded((cur) => (cur === trade.id ? null : trade.id))}
-          />
-        ))}
-      </ul>
+      {grouped.map(([day, bucket]) => (
+        <section key={day} className="activity-day-group">
+          <h2 className="activity-day-heading">{day}</h2>
+          <ul className="activity-feed">
+            {bucket.map((trade) => (
+              <ActivityCard
+                key={trade.id}
+                trade={trade}
+                open={expanded === trade.id}
+                onToggle={() => setExpanded((cur) => (cur === trade.id ? null : trade.id))}
+              />
+            ))}
+          </ul>
+        </section>
+      ))}
 
-      {!!rows.length && (
-        <div className="row activity-pager">
-          <button
-            type="button"
-            className="ghost"
-            disabled={offset === 0}
-            onClick={() => setOffset((o) => Math.max(0, o - PAGE))}
-          >
-            Newer
-          </button>
-          <span className="muted">
-            Showing {offset + 1}–{offset + rows.length}
-          </span>
-          <button
-            type="button"
-            className="ghost"
-            disabled={!canLoadMore}
-            onClick={() => setOffset((o) => o + PAGE)}
-          >
-            Older
-          </button>
-        </div>
+      {!loading && (
+        <PaginationBar
+          total={total}
+          limit={limit}
+          offset={offset}
+          page={list.page}
+          pageSizeOptions={list.pageSizeOptions}
+          onPage={(p) => list.setParams({ page: String(p) })}
+          onLimit={(n) => list.setParams({ limit: String(n), page: "1" })}
+        />
       )}
     </section>
   );

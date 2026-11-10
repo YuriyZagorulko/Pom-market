@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev -H 0.0.0.0 -p 4323",
     "build": "next build",
-    "start": "next start -H 0.0.0.0 -p 4323"
+    "start": "next start -H 0.0.0.0 -p 4323",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@pom/api-client": "workspace:*",
@@ -14,9 +16,14 @@
     "react-dom": "18.3.1"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.0.1",
     "@types/node": "20.16.10",
     "@types/react": "18.3.11",
     "@types/react-dom": "18.3.0",
-    "typescript": "5.6.2"
+    "@vitejs/plugin-react": "4.3.4",
+    "jsdom": "25.0.1",
+    "typescript": "5.6.2",
+    "vitest": "2.1.8"
   }
 }

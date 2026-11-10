@@ -38,6 +38,11 @@ export async function loginUser(page: Page, email: string, password: string) {
   );
   await page.getByRole("button", { name: "Enter" }).click();
   const resp = await loginResponse;
-  expect(resp.ok()).toBeTruthy();
+  const safeBody = await resp.text().catch(() => "");
+  const redacted = safeBody.replace(/"access_token"\s*:\s*"[^"]+"/g, '"access_token":"[redacted]"');
+  expect(
+    resp.ok(),
+    `user login failed: POST ${resp.url()} HTTP ${resp.status()} body=${redacted.slice(0, 240)}`,
+  ).toBeTruthy();
   await expect(page).not.toHaveURL(/\/login/);
 }

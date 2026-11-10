@@ -9,14 +9,12 @@ use chrono::{Duration as ChronoDuration, Utc};
 use pommarket::api::{new_app_state, router};
 use pommarket::config::Config;
 use pommarket::db::{connect, migrate};
-use pommarket::email::Email;
+use pommarket::email::{clear_mock_inbox, mock_inbox, Email, EmailMode};
 use pommarket::polymarket::http::PublicClient;
 use pommarket::security::{random_token, sha256_hex, Vault};
 use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL pointed at a database whose name contains pommarket_test"]
@@ -24,20 +22,15 @@ async fn invitation_recovery_verification_and_token_rules() {
     let migration_url = env::var("MIGRATION_DATABASE_URL").expect("MIGRATION_DATABASE_URL");
     assert_test_database_url(&migration_url);
 
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v3/smtp/email"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"messageId": "ok"})))
-        .mount(&mock)
-        .await;
-
-    env::set_var("BREVO_API_KEY", "test-brevo-key");
-    env::set_var("BREVO_API_BASE", mock.uri());
+    env::set_var("ENVIRONMENT", "test");
+    env::set_var("EMAIL_MODE", "mock");
+    env::set_var("BREVO_API_KEY", "must-not-be-used");
     env::set_var("BREVO_SENDER_EMAIL", "noreply@example.com");
     env::set_var("BREVO_SENDER_NAME", "POM Market");
     env::set_var("APP_BASE_URL", "http://localhost:4323");
     env::set_var("BOOTSTRAP_ADMIN_EMAIL", "admin@example.com");
     env::set_var("BOOTSTRAP_ADMIN_PASSWORD", "admin-password-1");
+    clear_mock_inbox();
 
     migrate(&migration_url).await.unwrap();
     let migration = connect(&migration_url).await.unwrap();
@@ -55,6 +48,7 @@ async fn invitation_recovery_verification_and_token_rules() {
     let pool = connect(&cfg.app_database_url).await.unwrap();
     let mail = Email::from_config(&cfg).unwrap();
     assert!(mail.enabled());
+    assert_eq!(mail.mode(), EmailMode::Mock);
     let (activity, _) = broadcast::channel(8);
     let state = new_app_state(
         pool.clone(),
@@ -111,12 +105,10 @@ async fn invitation_recovery_verification_and_token_rules() {
         .split("token=")
         .nth(1)
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!mock
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .is_empty());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let invite_mail = wait_for_mock_subject("invitation").await;
+    assert_eq!(invite_mail.to_email, "ada@example.com");
+    assert!(invite_mail.html.contains("/setup?token="));
 
     post(
         &http,
@@ -185,8 +177,9 @@ async fn invitation_recovery_verification_and_token_rules() {
         Value::Null,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let verify_token = latest_token_from_mock(&mock).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let verify_mail = wait_for_mock_subject("Verify").await;
+    let verify_token = token_from_html(&verify_mail.html);
     post(
         &http,
         &base,
@@ -202,11 +195,26 @@ async fn invitation_recovery_verification_and_token_rules() {
     assert!(verified.is_some());
 }
 
-async fn latest_token_from_mock(mock: &MockServer) -> String {
-    let requests = mock.received_requests().await.unwrap_or_default();
-    let raw = requests.last().expect("brevo request").body.clone();
-    let body: Value = serde_json::from_slice(&raw).unwrap();
-    let html = body["htmlContent"].as_str().expect("htmlContent");
+async fn wait_for_mock_subject(subject_needle: &str) -> pommarket::email::RecordedEmail {
+    for _ in 0..80 {
+        let inbox = mock_inbox();
+        let found = {
+            let guard = inbox.lock().expect("mock inbox");
+            guard
+                .iter()
+                .rev()
+                .find(|e| e.subject.contains(subject_needle))
+                .cloned()
+        };
+        if let Some(email) = found {
+            return email;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("mock inbox missing email with subject containing {subject_needle:?}");
+}
+
+fn token_from_html(html: &str) -> String {
     html.split("token=")
         .nth(1)
         .expect("verify link")

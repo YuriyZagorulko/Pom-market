@@ -70,4 +70,6 @@ export default async function globalSetup() {
     ].join("\n"),
     { mode: 0o600 },
   );
+  process.env.E2E_USER_EMAIL = userEmail;
+  process.env.E2E_USER_PASSWORD = userPassword;
 }

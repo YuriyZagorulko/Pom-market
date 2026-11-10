@@ -3,7 +3,7 @@ mod test_support;
 use std::env;
 use std::net::SocketAddr;
 
-use test_support::{assert_all_test_database_urls, truncate_integration_tables};
+use test_support::{assert_all_test_database_urls, list_items, truncate_integration_tables};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -328,8 +328,8 @@ async fn paper_workflow_and_tenant_isolation() {
         Value::Null,
     )
     .await;
-    assert_eq!(decisions.as_array().unwrap().len(), 1);
-    assert_eq!(decisions[0]["status"], "approved");
+    assert_eq!(list_items(&decisions).len(), 1);
+    assert_eq!(list_items(&decisions)[0]["status"], "approved");
     let orders = send(
         &http,
         &base,
@@ -339,8 +339,9 @@ async fn paper_workflow_and_tenant_isolation() {
         Value::Null,
     )
     .await;
-    assert_eq!(orders[0]["operating_mode"], "paper_trading");
-    assert_eq!(orders[0]["status"], "filled");
+    let order_rows = list_items(&orders);
+    assert_eq!(order_rows[0]["operating_mode"], "paper_trading");
+    assert_eq!(order_rows[0]["status"], "filled");
     let grace_orders = send(
         &http,
         &base,
@@ -350,7 +351,7 @@ async fn paper_workflow_and_tenant_isolation() {
         Value::Null,
     )
     .await;
-    assert!(grace_orders.as_array().unwrap().is_empty());
+    assert!(list_items(&grace_orders).is_empty());
     let detail = send(
         &http,
         &base,
@@ -385,11 +386,10 @@ async fn paper_workflow_and_tenant_isolation() {
         Value::Null,
     )
     .await;
+    let position_rows = list_items(&positions);
     assert!(
-        positions.as_array().unwrap().is_empty()
-            || positions
-                .as_array()
-                .unwrap()
+        position_rows.is_empty()
+            || position_rows
                 .iter()
                 .all(|row| row["open_shares"].as_str().unwrap().starts_with('0'))
     );

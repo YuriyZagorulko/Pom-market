@@ -18,6 +18,10 @@ use uuid::Uuid;
 use crate::auth::{self, AuthUser};
 use crate::client_ip::{self, TrustedProxies};
 use crate::config::Config;
+use crate::copy_preview::{
+    market_allowed_list, percent_to_proportion, simulate_copy_preview, CopyPreviewParams,
+    PreviewEvent,
+};
 use crate::db::begin_as;
 use crate::email::{Email, MailError};
 use crate::engine::{is_eth_address, is_private_key, normalize_address};
@@ -27,6 +31,12 @@ use crate::rate_limit::{self, RateLimitStore};
 use crate::security::{
     credential_aad, hash_password, random_token, sha256_hex, verify_password, SecretBlob, Vault,
 };
+use crate::strategy_budget::utilization_for_user;
+
+mod account_control;
+mod page;
+use page::{ListQuery, Paged};
+type PageQuery = ListQuery;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -150,6 +160,46 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/accounts/{id}/disconnect", post(disconnect_account))
         .route("/api/v1/accounts/{id}/risk", patch(patch_risk))
         .route(
+            "/api/v1/accounts/{id}/trading-control",
+            get(account_control::get_trading_control),
+        )
+        .route(
+            "/api/v1/accounts/{id}/trading-control/kill-switch/activate",
+            post(account_control::activate_kill_switch),
+        )
+        .route(
+            "/api/v1/accounts/{id}/trading-control/kill-switch/deactivate",
+            post(account_control::deactivate_kill_switch),
+        )
+        .route(
+            "/api/v1/accounts/{id}/trading-control/soft-close/activate",
+            post(account_control::activate_soft_close),
+        )
+        .route(
+            "/api/v1/accounts/{id}/trading-control/soft-close/deactivate",
+            post(account_control::deactivate_soft_close),
+        )
+        .route(
+            "/api/v1/accounts/{id}/trading-control/resume",
+            post(account_control::resume_trading),
+        )
+        .route(
+            "/api/v1/accounts/{id}/hard-close/preview",
+            get(account_control::hard_close_preview),
+        )
+        .route(
+            "/api/v1/accounts/{id}/hard-close",
+            post(account_control::start_hard_close_route),
+        )
+        .route(
+            "/api/v1/accounts/{id}/hard-close/{op_id}",
+            get(account_control::get_hard_close),
+        )
+        .route(
+            "/api/v1/accounts/{id}/hard-close/{op_id}/retry",
+            post(account_control::retry_hard_close),
+        )
+        .route(
             "/api/v1/accounts/{id}/credentials/rotate",
             post(rotate_credentials),
         )
@@ -172,6 +222,14 @@ pub fn router(state: AppState) -> Router {
                 .delete(delete_strategy),
         )
         .route("/api/v1/strategies/{id}/enable", post(enable_strategy))
+        .route(
+            "/api/v1/strategies/{id}/utilization",
+            get(strategy_utilization),
+        )
+        .route(
+            "/api/v1/source-traders/{id}/copy-preview",
+            post(copy_preview),
+        )
         .route("/api/v1/activity", get(list_activity))
         .route("/api/v1/source-trades", get(list_source_trades))
         .route("/api/v1/decisions", get(list_decisions))
@@ -1053,7 +1111,7 @@ async fn dashboard(
     .await
     .map_err(internal)?;
     let account_rows = sqlx::query_as::<_, AccountCard>(
-        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
+        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
          FROM trading_accounts WHERE user_id = $1 ORDER BY created_at",
     )
     .bind(user.id)
@@ -1166,7 +1224,7 @@ async fn list_accounts(
         .await
         .map_err(internal)?;
     let rows = sqlx::query_as::<_, AccountCard>(
-        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
+        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
          FROM trading_accounts WHERE user_id = $1 ORDER BY created_at",
     )
     .bind(user.id)
@@ -1439,7 +1497,7 @@ async fn disconnect_account(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
-    sqlx::query("UPDATE trading_accounts SET status = 'disconnected', operating_mode = 'monitoring', emergency_stop = true, updated_at = now() WHERE id = $1 AND user_id = $2")
+    sqlx::query("UPDATE trading_accounts SET status = 'disconnected', operating_mode = 'monitoring', emergency_stop = true, trading_control_state = 'kill_switch', updated_at = now() WHERE id = $1 AND user_id = $2")
         .bind(id)
         .bind(user.id)
         .execute(&mut *tx)
@@ -1720,6 +1778,8 @@ struct StrategyBody {
     source_trader_id: Uuid,
     sizing_mode: Option<String>,
     fixed_amount_usd: Option<Decimal>,
+    /// UI percent 0–100; converted to `proportion` when sizing_mode is proportional.
+    copy_percent: Option<Decimal>,
     proportion: Option<Decimal>,
     multiplier: Option<Decimal>,
     strategy_budget_usd: Option<Decimal>,
@@ -1748,6 +1808,24 @@ async fn create_strategy(
     ) {
         return Err(bad("unknown sizing mode"));
     }
+    let budget = body.strategy_budget_usd.unwrap_or(Decimal::from(100));
+    if budget <= Decimal::ZERO || budget > Decimal::from(10_000_000) {
+        return Err(bad("strategy budget must be between 0 and 10000000 USD"));
+    }
+    let mut proportion = body.proportion;
+    if mode == "proportional" {
+        if let Some(pct) = body.copy_percent {
+            proportion = Some(
+                percent_to_proportion(pct)
+                    .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 100"))?,
+            );
+        }
+        if proportion.is_none() {
+            return Err(bad(
+                "copy_percent or proportion is required for proportional sizing",
+            ));
+        }
+    }
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
@@ -1766,6 +1844,17 @@ async fn create_strategy(
             "source trader not found".into(),
         ));
     }
+    let monitoring: bool =
+        sqlx::query_scalar("SELECT monitoring_enabled FROM source_traders WHERE id = $1")
+            .bind(body.source_trader_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?;
+    if !monitoring {
+        return Err(bad(
+            "enable monitoring on the source account before creating a copy strategy",
+        ));
+    }
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO copy_strategies (
             user_id, trading_account_id, source_trader_id, enabled, sizing_mode, fixed_amount_usd, proportion, multiplier,
@@ -1779,9 +1868,9 @@ async fn create_strategy(
     .bind(body.source_trader_id)
     .bind(&mode)
     .bind(body.fixed_amount_usd.or(Some(Decimal::from(10))))
-    .bind(body.proportion)
+    .bind(proportion)
     .bind(body.multiplier)
-    .bind(body.strategy_budget_usd.unwrap_or(Decimal::from(100)))
+    .bind(budget)
     .bind(body.max_position_usd.unwrap_or(Decimal::from(50)))
     .bind(body.max_exposure_usd.unwrap_or(Decimal::from(100)))
     .bind(body.max_open_positions.unwrap_or(10))
@@ -1856,6 +1945,18 @@ async fn patch_strategy(
         .await
         .map_err(internal)?;
     let _ = one_strategy(&mut tx, user.id, id).await?;
+    let mut proportion = body.proportion;
+    if let Some(pct) = body.copy_percent {
+        proportion = Some(
+            percent_to_proportion(pct)
+                .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 100"))?,
+        );
+    }
+    if let Some(b) = body.strategy_budget_usd {
+        if b <= Decimal::ZERO || b > Decimal::from(10_000_000) {
+            return Err(bad("strategy budget must be between 0 and 10000000 USD"));
+        }
+    }
     sqlx::query(
         "UPDATE copy_strategies SET
             sizing_mode = COALESCE($3, sizing_mode),
@@ -1880,7 +1981,7 @@ async fn patch_strategy(
     .bind(user.id)
     .bind(body.sizing_mode)
     .bind(body.fixed_amount_usd)
-    .bind(body.proportion)
+    .bind(proportion)
     .bind(body.multiplier)
     .bind(body.strategy_budget_usd)
     .bind(body.max_position_usd)
@@ -1900,6 +2001,222 @@ async fn patch_strategy(
     Ok(Json(json!({"ok": true})))
 }
 
+async fn strategy_utilization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let util = utilization_for_user(&state.pool, user.id, id)
+        .await
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let summary: StrategyActivitySummary = sqlx::query_as(
+        "SELECT
+            s.enabled,
+            a.operating_mode,
+            st.monitoring_enabled,
+            (SELECT COUNT(*) FROM copy_decisions d WHERE d.strategy_id = s.id AND d.status = 'approved') AS copied_count,
+            (SELECT COUNT(*) FROM copy_decisions d WHERE d.strategy_id = s.id AND d.status = 'rejected') AS rejected_count,
+            (SELECT MAX(e.event_ts) FROM source_events e
+                JOIN source_traders t ON lower(t.wallet_address) = lower(e.source_wallet)
+                WHERE t.id = s.source_trader_id) AS last_source_event_at,
+            (SELECT MAX(o.updated_at) FROM orders o
+                JOIN copy_decisions d ON d.id = o.decision_id
+                WHERE d.strategy_id = s.id AND d.status = 'approved') AS last_copied_at
+         FROM copy_strategies s
+         JOIN trading_accounts a ON a.id = s.trading_account_id
+         JOIN source_traders st ON st.id = s.source_trader_id
+         WHERE s.id = $1 AND s.user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({
+        "allocated_budget_usd": util.allocated_budget_usd,
+        "deployed_capital_usd": util.deployed_capital_usd,
+        "reserved_capital_usd": util.reserved_capital_usd,
+        "available_budget_usd": util.available_budget_usd,
+        "open_positions_count": util.open_positions_count,
+        "updated_at": util.updated_at,
+        "enabled": summary.enabled,
+        "operating_mode": summary.operating_mode,
+        "monitoring_enabled": summary.monitoring_enabled,
+        "copied_trades_count": summary.copied_count,
+        "rejected_trades_count": summary.rejected_count,
+        "last_source_event_at": summary.last_source_event_at,
+        "last_copied_at": summary.last_copied_at,
+    })))
+}
+
+#[derive(sqlx::FromRow)]
+struct StrategyActivitySummary {
+    enabled: bool,
+    operating_mode: String,
+    monitoring_enabled: bool,
+    copied_count: i64,
+    rejected_count: i64,
+    last_source_event_at: Option<chrono::DateTime<Utc>>,
+    last_copied_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct CopyPreviewBody {
+    trading_account_id: Uuid,
+    sizing_mode: String,
+    copy_percent: Option<Decimal>,
+    proportion: Option<Decimal>,
+    fixed_amount_usd: Option<Decimal>,
+    multiplier: Option<Decimal>,
+    strategy_budget_usd: Decimal,
+    max_position_usd: Option<Decimal>,
+    max_exposure_usd: Option<Decimal>,
+    min_order_usd: Option<Decimal>,
+    copy_buy: Option<bool>,
+    copy_sell: Option<bool>,
+    allowed_markets: Option<Value>,
+    limit: Option<i32>,
+}
+
+async fn copy_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CopyPreviewBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    if body.strategy_budget_usd <= Decimal::ZERO {
+        return Err(bad("strategy budget must be positive"));
+    }
+    let limit = body.limit.unwrap_or(20).clamp(1, 50) as i64;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let wallet: String = sqlx::query_scalar(
+        "SELECT wallet_address FROM source_traders WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "trader not found".into()))?;
+    let _ = load_account(&mut tx, user.id, body.trading_account_id).await?;
+    let risk = sqlx::query_as::<_, AccountRiskRow>(
+        "SELECT max_order_usd, max_exposure_usd, min_order_usd FROM account_risk_limits WHERE trading_account_id = $1",
+    )
+    .bind(body.trading_account_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    let mut proportion = body.proportion;
+    if body.sizing_mode == "proportional" {
+        if let Some(pct) = body.copy_percent {
+            proportion = Some(
+                percent_to_proportion(pct)
+                    .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 100"))?,
+            );
+        }
+        if proportion.is_none() {
+            return Err(bad("copy_percent or proportion is required"));
+        }
+    }
+
+    let rows = sqlx::query_as::<_, PreviewSourceRow>(
+        "SELECT id, token_id, condition_id, outcome, market_title, market_icon, market_slug,
+                side, price, size_shares, notional_usd, event_ts
+         FROM source_events
+         WHERE lower(source_wallet) = lower($1)
+         ORDER BY event_ts DESC
+         LIMIT $2",
+    )
+    .bind(&wallet)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+
+    let allowed = body.allowed_markets.unwrap_or_else(|| json!([]));
+    let params = CopyPreviewParams {
+        sizing_mode: body.sizing_mode,
+        fixed_amount_usd: body.fixed_amount_usd,
+        proportion,
+        multiplier: body.multiplier,
+        strategy_budget_usd: body.strategy_budget_usd,
+        max_position_usd: body.max_position_usd.unwrap_or(Decimal::from(50)),
+        max_exposure_usd: body.max_exposure_usd.unwrap_or(body.strategy_budget_usd),
+        account_max_exposure: risk.max_exposure_usd,
+        max_order_usd: risk.max_order_usd,
+        min_order_usd: body
+            .min_order_usd
+            .unwrap_or(risk.min_order_usd)
+            .max(Decimal::ONE),
+        copy_buy: body.copy_buy.unwrap_or(true),
+        copy_sell: body.copy_sell.unwrap_or(true),
+    };
+
+    let events: Vec<PreviewEvent> = rows
+        .iter()
+        .map(|r| {
+            let pe = PreviewEvent {
+                id: r.id,
+                token_id: r.token_id.clone(),
+                side: r.side.clone(),
+                price: r.price,
+                size_shares: r.size_shares,
+                notional_usd: r.notional_usd,
+                event_ts: r.event_ts,
+                market_title: r.market_title.clone(),
+                market_icon: r.market_icon.clone(),
+                outcome: r.outcome.clone(),
+                condition_id: r.condition_id.clone(),
+                market_slug: r.market_slug.clone(),
+                allowed_check: true,
+            };
+            PreviewEvent {
+                allowed_check: market_allowed_list(&allowed, &pe),
+                ..pe
+            }
+        })
+        .collect();
+
+    let preview_rows = simulate_copy_preview(&events, &params);
+    Ok(Json(json!({
+        "disclaimer": "Estimates use recent source trades and current settings. Live execution may differ due to book, slippage, fees, and latency.",
+        "rows": preview_rows,
+    })))
+}
+
+#[derive(sqlx::FromRow)]
+struct PreviewSourceRow {
+    id: Uuid,
+    token_id: String,
+    condition_id: Option<String>,
+    outcome: Option<String>,
+    market_title: Option<String>,
+    market_icon: Option<String>,
+    market_slug: Option<String>,
+    side: String,
+    price: Decimal,
+    size_shares: Decimal,
+    notional_usd: Decimal,
+    event_ts: chrono::DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AccountRiskRow {
+    max_order_usd: Decimal,
+    max_exposure_usd: Decimal,
+    min_order_usd: Decimal,
+}
+
 #[derive(Deserialize)]
 struct EnableBody {
     enabled: bool,
@@ -1915,6 +2232,79 @@ async fn enable_strategy(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
+    if body.enabled {
+        #[derive(sqlx::FromRow)]
+        struct EnableCheck {
+            monitoring_enabled: bool,
+            operating_mode: String,
+            account_status: String,
+            emergency_stop: bool,
+            strategy_budget_usd: Decimal,
+            min_order_usd: Decimal,
+            sizing_mode: String,
+            proportion: Option<Decimal>,
+            fixed_amount_usd: Option<Decimal>,
+            multiplier: Option<Decimal>,
+            paper_cash_usd: Decimal,
+        }
+        let row = sqlx::query_as::<_, EnableCheck>(
+            "SELECT st.monitoring_enabled, a.operating_mode, a.status AS account_status, a.emergency_stop,
+                    s.strategy_budget_usd, s.min_order_usd, s.sizing_mode, s.proportion, s.fixed_amount_usd, s.multiplier,
+                    r.paper_cash_usd
+             FROM copy_strategies s
+             JOIN source_traders st ON st.id = s.source_trader_id
+             JOIN trading_accounts a ON a.id = s.trading_account_id
+             JOIN account_risk_limits r ON r.trading_account_id = a.id
+             WHERE s.id = $1 AND s.user_id = $2",
+        )
+        .bind(id)
+        .bind(user.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))?;
+        if !row.monitoring_enabled {
+            return Err(bad("enable monitoring on the source account first"));
+        }
+        if row.account_status == "disconnected" {
+            return Err(bad(
+                "connect the trading account before enabling copy trading",
+            ));
+        }
+        if row.emergency_stop {
+            return Err(bad("clear emergency stop on the trading account first"));
+        }
+        if row.operating_mode == "monitoring" {
+            return Err(bad(
+                "set the trading account to paper_trading or live_trading",
+            ));
+        }
+        if row.operating_mode == "live_trading" {
+            return Err(bad(
+                "live copy trading is not enabled in this release; use paper_trading",
+            ));
+        }
+        if row.strategy_budget_usd < row.min_order_usd {
+            return Err(bad(
+                "strategy budget is smaller than the minimum order size",
+            ));
+        }
+        match row.sizing_mode.as_str() {
+            "proportional" if row.proportion.is_none() => {
+                return Err(bad("set copy percentage before enabling the strategy"));
+            }
+            "fixed_amount" if row.fixed_amount_usd.is_none() => {
+                return Err(bad("set fixed amount before enabling the strategy"));
+            }
+            "multiplier" if row.multiplier.is_none() => {
+                return Err(bad("set multiplier before enabling the strategy"));
+            }
+            _ => {}
+        }
+        if row.operating_mode == "paper_trading" && row.paper_cash_usd < row.min_order_usd {
+            return Err(bad("increase paper cash on the trading account"));
+        }
+    }
     sqlx::query("UPDATE copy_strategies SET enabled = $3, updated_at = now() WHERE id = $1 AND user_id = $2")
         .bind(id)
         .bind(user.id)
@@ -1954,17 +2344,49 @@ async fn list_activity(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
-    let rows = sqlx::query_as::<_, ActivityRow>(
-        "SELECT id, kind, message, at, source_event_id, decision_id, order_id
-         FROM timeline_events WHERE user_id = $1 ORDER BY at DESC LIMIT $2 OFFSET $3",
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM timeline_events
+         WHERE user_id = $1
+           AND ($2::text IS NULL OR kind = $2)
+           AND ($3::text IS NULL OR message ILIKE '%' || $3 || '%')
+           AND ($4::timestamptz IS NULL OR at >= $4)
+           AND ($5::timestamptz IS NULL OR at < $5)",
     )
     .bind(user.id)
+    .bind(q.filter_kind())
+    .bind(q.filter_q())
+    .bind(q.parse_from())
+    .bind(q.parse_to_exclusive())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let rows = sqlx::query_as::<_, ActivityRow>(
+        "SELECT id, kind, message, at, source_event_id, decision_id, order_id
+         FROM timeline_events
+         WHERE user_id = $1
+           AND ($2::text IS NULL OR kind = $2)
+           AND ($3::text IS NULL OR message ILIKE '%' || $3 || '%')
+           AND ($4::timestamptz IS NULL OR at >= $4)
+           AND ($5::timestamptz IS NULL OR at < $5)
+         ORDER BY at DESC, id DESC
+         LIMIT $6 OFFSET $7",
+    )
+    .bind(user.id)
+    .bind(q.filter_kind())
+    .bind(q.filter_q())
+    .bind(q.parse_from())
+    .bind(q.parse_to_exclusive())
     .bind(q.limit())
-    .bind(q.offset.unwrap_or(0))
+    .bind(q.offset())
     .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
-    Ok(Json(rows))
+    Ok(Json(Paged {
+        items: rows,
+        total,
+        limit: q.limit(),
+        offset: q.offset(),
+    }))
 }
 
 async fn list_source_trades(
@@ -1973,9 +2395,56 @@ async fn list_source_trades(
     Query(q): Query<PageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
+    let wallet_ids = q.parse_wallets();
+    let wallet_ids = if wallet_ids.is_empty() {
+        None
+    } else {
+        Some(wallet_ids)
+    };
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM source_events e
+         WHERE EXISTS (
+            SELECT 1 FROM source_traders t
+            WHERE t.user_id = $1 AND lower(t.wallet_address) = lower(e.source_wallet)
+         )
+         AND ($2::text IS NULL OR e.side = $2)
+         AND ($3::text IS NULL OR e.source_wallet ILIKE '%' || $3 || '%' OR e.token_id ILIKE '%' || $3 || '%'
+              OR e.tx_hash ILIKE '%' || $3 || '%' OR e.market_title ILIKE '%' || $3 || '%'
+              OR e.market_slug ILIKE '%' || $3 || '%' OR e.outcome ILIKE '%' || $3 || '%'
+              OR EXISTS (SELECT 1 FROM source_traders st WHERE st.user_id = $1 AND lower(st.wallet_address) = lower(e.source_wallet) AND st.alias ILIKE '%' || $3 || '%'))
+         AND ($4::text IS NULL OR e.outcome ILIKE $4)
+         AND ($5::text IS NULL OR e.activity_type = $5)
+         AND ($6::text IS NULL OR e.status = $6)
+         AND ($7::timestamptz IS NULL OR e.event_ts >= $7)
+         AND ($8::timestamptz IS NULL OR e.event_ts < $8)
+         AND ($9::numeric IS NULL OR COALESCE(e.usdc_size, e.notional_usd) >= $9)
+         AND ($10::numeric IS NULL OR COALESCE(e.usdc_size, e.notional_usd) <= $10)
+         AND ($11::numeric IS NULL OR e.price >= $11)
+         AND ($12::numeric IS NULL OR e.price <= $12)
+         AND ($13::uuid[] IS NULL OR EXISTS (
+              SELECT 1 FROM source_traders st
+              WHERE st.user_id = $1 AND st.id = ANY($13) AND lower(st.wallet_address) = lower(e.source_wallet)
+         ))",
+    )
+    .bind(user.id)
+    .bind(q.filter_side())
+    .bind(q.filter_q())
+    .bind(q.filter_outcome())
+    .bind(q.filter_activity_type())
+    .bind(q.filter_status())
+    .bind(q.parse_from())
+    .bind(q.parse_to_exclusive())
+    .bind(q.min_amount())
+    .bind(q.max_amount())
+    .bind(q.min_price())
+    .bind(q.max_price())
+    .bind(wallet_ids.clone())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
     let rows = sqlx::query_as::<_, TradeRow>(
         "SELECT e.id, e.source_wallet, e.tx_hash, e.token_id, e.condition_id, e.outcome, e.market_title, e.market_slug,
                 e.event_title, e.event_slug, e.market_icon, e.activity_type, e.usdc_size,
@@ -1986,19 +2455,50 @@ async fn list_source_trades(
             WHERE t.user_id = $1 AND lower(t.wallet_address) = lower(e.source_wallet)
          )
          AND ($2::text IS NULL OR e.side = $2)
-         AND ($3::text IS NULL OR e.source_wallet = $3 OR e.token_id = $3 OR e.tx_hash = $3 OR e.market_title ILIKE '%' || $3 || '%')
-         ORDER BY e.event_ts DESC
-         LIMIT $4 OFFSET $5",
+         AND ($3::text IS NULL OR e.source_wallet ILIKE '%' || $3 || '%' OR e.token_id ILIKE '%' || $3 || '%'
+              OR e.tx_hash ILIKE '%' || $3 || '%' OR e.market_title ILIKE '%' || $3 || '%'
+              OR e.market_slug ILIKE '%' || $3 || '%' OR e.outcome ILIKE '%' || $3 || '%'
+              OR EXISTS (SELECT 1 FROM source_traders st WHERE st.user_id = $1 AND lower(st.wallet_address) = lower(e.source_wallet) AND st.alias ILIKE '%' || $3 || '%'))
+         AND ($4::text IS NULL OR e.outcome ILIKE $4)
+         AND ($5::text IS NULL OR e.activity_type = $5)
+         AND ($6::text IS NULL OR e.status = $6)
+         AND ($7::timestamptz IS NULL OR e.event_ts >= $7)
+         AND ($8::timestamptz IS NULL OR e.event_ts < $8)
+         AND ($9::numeric IS NULL OR COALESCE(e.usdc_size, e.notional_usd) >= $9)
+         AND ($10::numeric IS NULL OR COALESCE(e.usdc_size, e.notional_usd) <= $10)
+         AND ($11::numeric IS NULL OR e.price >= $11)
+         AND ($12::numeric IS NULL OR e.price <= $12)
+         AND ($13::uuid[] IS NULL OR EXISTS (
+              SELECT 1 FROM source_traders st
+              WHERE st.user_id = $1 AND st.id = ANY($13) AND lower(st.wallet_address) = lower(e.source_wallet)
+         ))
+         ORDER BY e.event_ts DESC, e.id DESC
+         LIMIT $14 OFFSET $15",
     )
     .bind(user.id)
     .bind(q.filter_side())
     .bind(q.filter_q())
+    .bind(q.filter_outcome())
+    .bind(q.filter_activity_type())
+    .bind(q.filter_status())
+    .bind(q.parse_from())
+    .bind(q.parse_to_exclusive())
+    .bind(q.min_amount())
+    .bind(q.max_amount())
+    .bind(q.min_price())
+    .bind(q.max_price())
+    .bind(wallet_ids)
     .bind(q.limit())
-    .bind(q.offset.unwrap_or(0))
+    .bind(q.offset())
     .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
-    Ok(Json(rows))
+    Ok(Json(Paged {
+        items: rows,
+        total,
+        limit: q.limit(),
+        offset: q.offset(),
+    }))
 }
 
 async fn list_decisions(
@@ -2019,19 +2519,39 @@ async fn list_decisions(
            AND ($3::text IS NULL OR status = $3)
            AND ($4::text IS NULL OR side = $4)
            AND ($5::text IS NULL OR operating_mode = $5)
-         ORDER BY decided_at DESC LIMIT $6 OFFSET $7",
+         ORDER BY decided_at DESC, id DESC LIMIT $6 OFFSET $7",
     )
     .bind(user.id)
     .bind(q.account_id)
     .bind(q.filter_status())
     .bind(q.filter_side())
-    .bind(PageQuery::filter_text(&q.mode))
+    .bind(ListQuery::filter_text(&q.mode))
     .bind(q.limit())
-    .bind(q.offset.unwrap_or(0))
+    .bind(q.offset())
     .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
-    Ok(Json(rows))
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM copy_decisions WHERE user_id = $1
+           AND ($2::uuid IS NULL OR trading_account_id = $2)
+           AND ($3::text IS NULL OR status = $3)
+           AND ($4::text IS NULL OR side = $4)
+           AND ($5::text IS NULL OR operating_mode = $5)",
+    )
+    .bind(user.id)
+    .bind(q.account_id)
+    .bind(q.filter_status())
+    .bind(q.filter_side())
+    .bind(ListQuery::filter_text(&q.mode))
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    Ok(Json(Paged {
+        items: rows,
+        total,
+        limit: q.limit(),
+        offset: q.offset(),
+    }))
 }
 
 async fn list_orders(
@@ -2043,27 +2563,75 @@ async fn list_orders(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
-    let rows = sqlx::query_as::<_, OrderRow>(
-        "SELECT id, trading_account_id, decision_id, source_event_id, exchange_order_id, operating_mode, order_type, side,
-                token_id, limit_price, size_shares, status, error, created_at, submitted_at, updated_at
-         FROM orders WHERE user_id = $1
-           AND ($2::uuid IS NULL OR trading_account_id = $2)
-           AND ($3::text IS NULL OR status = $3)
-           AND ($4::text IS NULL OR side = $4)
-           AND ($5::text IS NULL OR operating_mode = $5)
-         ORDER BY created_at DESC LIMIT $6 OFFSET $7",
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM orders o
+         LEFT JOIN source_events se ON se.id = o.source_event_id
+         WHERE o.user_id = $1
+           AND ($2::uuid IS NULL OR o.trading_account_id = $2)
+           AND ($3::text IS NULL OR o.status = $3)
+           AND ($4::text IS NULL OR o.side = $4)
+           AND ($5::text IS NULL OR o.operating_mode = $5)
+           AND ($6::text IS NULL OR o.token_id ILIKE '%' || $6 || '%' OR o.exchange_order_id ILIKE '%' || $6 || '%'
+                OR se.market_title ILIKE '%' || $6 || '%')
+           AND ($7::timestamptz IS NULL OR o.created_at >= $7)
+           AND ($8::timestamptz IS NULL OR o.created_at < $8)
+           AND ($9::numeric IS NULL OR o.limit_price >= $9)
+           AND ($10::numeric IS NULL OR o.limit_price <= $10)",
     )
     .bind(user.id)
     .bind(q.account_id)
     .bind(q.filter_status())
     .bind(q.filter_side())
-    .bind(PageQuery::filter_text(&q.mode))
+    .bind(ListQuery::filter_text(&q.mode))
+    .bind(q.filter_q())
+    .bind(q.parse_from())
+    .bind(q.parse_to_exclusive())
+    .bind(q.min_price())
+    .bind(q.max_price())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let rows = sqlx::query_as::<_, OrderListRow>(
+        "SELECT o.id, o.trading_account_id, o.decision_id, o.source_event_id, o.exchange_order_id, o.operating_mode, o.order_type, o.side,
+                o.token_id, o.limit_price, o.size_shares, o.status, o.error, o.created_at, o.submitted_at, o.updated_at,
+                se.market_title, se.outcome, se.market_icon, se.market_slug
+         FROM orders o
+         LEFT JOIN source_events se ON se.id = o.source_event_id
+         WHERE o.user_id = $1
+           AND ($2::uuid IS NULL OR o.trading_account_id = $2)
+           AND ($3::text IS NULL OR o.status = $3)
+           AND ($4::text IS NULL OR o.side = $4)
+           AND ($5::text IS NULL OR o.operating_mode = $5)
+           AND ($6::text IS NULL OR o.token_id ILIKE '%' || $6 || '%' OR o.exchange_order_id ILIKE '%' || $6 || '%'
+                OR se.market_title ILIKE '%' || $6 || '%')
+           AND ($7::timestamptz IS NULL OR o.created_at >= $7)
+           AND ($8::timestamptz IS NULL OR o.created_at < $8)
+           AND ($9::numeric IS NULL OR o.limit_price >= $9)
+           AND ($10::numeric IS NULL OR o.limit_price <= $10)
+         ORDER BY o.created_at DESC, o.id DESC
+         LIMIT $11 OFFSET $12",
+    )
+    .bind(user.id)
+    .bind(q.account_id)
+    .bind(q.filter_status())
+    .bind(q.filter_side())
+    .bind(ListQuery::filter_text(&q.mode))
+    .bind(q.filter_q())
+    .bind(q.parse_from())
+    .bind(q.parse_to_exclusive())
+    .bind(q.min_price())
+    .bind(q.max_price())
     .bind(q.limit())
-    .bind(q.offset.unwrap_or(0))
+    .bind(q.offset())
     .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
-    Ok(Json(rows))
+    Ok(Json(Paged {
+        items: rows,
+        total,
+        limit: q.limit(),
+        offset: q.offset(),
+    }))
 }
 
 async fn list_fills(
@@ -2075,20 +2643,73 @@ async fn list_fills(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
-    let rows = sqlx::query_as::<_, FillRow>(
-        "SELECT id, order_id, trading_account_id, price, shares, notional_usd, fee_usd, fee_status, tx_hash,
-                slippage_vs_source_bps, slippage_vs_limit_bps, filled_at
-         FROM fills WHERE user_id = $1 AND ($2::uuid IS NULL OR trading_account_id = $2)
-         ORDER BY filled_at DESC LIMIT $3 OFFSET $4",
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fills f
+         LEFT JOIN orders o ON o.id = f.order_id
+         LEFT JOIN source_events se ON se.id = o.source_event_id
+         WHERE f.user_id = $1
+           AND ($2::uuid IS NULL OR f.trading_account_id = $2)
+           AND ($3::text IS NULL OR o.side = $3)
+           AND ($4::text IS NULL OR se.outcome ILIKE $4 OR se.market_title ILIKE '%' || $4 || '%')
+           AND ($5::text IS NULL OR f.tx_hash ILIKE '%' || $5 || '%' OR f.order_id::text ILIKE '%' || $5 || '%'
+                OR se.market_title ILIKE '%' || $5 || '%')
+           AND ($6::timestamptz IS NULL OR f.filled_at >= $6)
+           AND ($7::timestamptz IS NULL OR f.filled_at < $7)
+           AND ($8::numeric IS NULL OR f.price >= $8)
+           AND ($9::numeric IS NULL OR f.price <= $9)",
     )
     .bind(user.id)
     .bind(q.account_id)
+    .bind(q.filter_side())
+    .bind(q.filter_outcome())
+    .bind(q.filter_q())
+    .bind(q.parse_from())
+    .bind(q.parse_to_exclusive())
+    .bind(q.min_price())
+    .bind(q.max_price())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let rows = sqlx::query_as::<_, FillListRow>(
+        "SELECT f.id, f.order_id, f.trading_account_id, f.price, f.shares, f.notional_usd, f.fee_usd, f.fee_status, f.tx_hash,
+                f.slippage_vs_source_bps, f.slippage_vs_limit_bps, f.filled_at,
+                se.market_title, se.outcome, se.market_icon, o.side AS order_side
+         FROM fills f
+         LEFT JOIN orders o ON o.id = f.order_id
+         LEFT JOIN source_events se ON se.id = o.source_event_id
+         WHERE f.user_id = $1
+           AND ($2::uuid IS NULL OR f.trading_account_id = $2)
+           AND ($3::text IS NULL OR o.side = $3)
+           AND ($4::text IS NULL OR se.outcome ILIKE $4 OR se.market_title ILIKE '%' || $4 || '%')
+           AND ($5::text IS NULL OR f.tx_hash ILIKE '%' || $5 || '%' OR f.order_id::text ILIKE '%' || $5 || '%'
+                OR se.market_title ILIKE '%' || $5 || '%')
+           AND ($6::timestamptz IS NULL OR f.filled_at >= $6)
+           AND ($7::timestamptz IS NULL OR f.filled_at < $7)
+           AND ($8::numeric IS NULL OR f.price >= $8)
+           AND ($9::numeric IS NULL OR f.price <= $9)
+         ORDER BY f.filled_at DESC, f.id DESC
+         LIMIT $10 OFFSET $11",
+    )
+    .bind(user.id)
+    .bind(q.account_id)
+    .bind(q.filter_side())
+    .bind(q.filter_outcome())
+    .bind(q.filter_q())
+    .bind(q.parse_from())
+    .bind(q.parse_to_exclusive())
+    .bind(q.min_price())
+    .bind(q.max_price())
     .bind(q.limit())
-    .bind(q.offset.unwrap_or(0))
+    .bind(q.offset())
     .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
-    Ok(Json(rows))
+    Ok(Json(Paged {
+        items: rows,
+        total,
+        limit: q.limit(),
+        offset: q.offset(),
+    }))
 }
 
 async fn list_positions(
@@ -2100,19 +2721,40 @@ async fn list_positions(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
-    let rows = sqlx::query_as::<_, PositionView>(
-        "SELECT id, source_wallet, token_id, market_title, outcome, operating_mode, open_shares, avg_price, cost_basis_usd, realized_pnl_usd, updated_at
-         FROM positions WHERE user_id = $1 AND open_shares > 0 AND ($2::uuid IS NULL OR trading_account_id = $2)
-         ORDER BY updated_at DESC LIMIT $3 OFFSET $4",
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM positions
+         WHERE user_id = $1 AND open_shares > 0
+           AND ($2::uuid IS NULL OR trading_account_id = $2)
+           AND ($3::text IS NULL OR market_title ILIKE '%' || $3 || '%' OR outcome ILIKE '%' || $3 || '%' OR token_id ILIKE '%' || $3 || '%')",
     )
     .bind(user.id)
     .bind(q.account_id)
+    .bind(q.filter_q())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let rows = sqlx::query_as::<_, PositionView>(
+        "SELECT id, source_wallet, token_id, market_title, outcome, operating_mode, open_shares, avg_price, cost_basis_usd, realized_pnl_usd, updated_at
+         FROM positions WHERE user_id = $1 AND open_shares > 0
+           AND ($2::uuid IS NULL OR trading_account_id = $2)
+           AND ($3::text IS NULL OR market_title ILIKE '%' || $3 || '%' OR outcome ILIKE '%' || $3 || '%' OR token_id ILIKE '%' || $3 || '%')
+         ORDER BY updated_at DESC, id DESC
+         LIMIT $4 OFFSET $5",
+    )
+    .bind(user.id)
+    .bind(q.account_id)
+    .bind(q.filter_q())
     .bind(q.limit())
-    .bind(q.offset.unwrap_or(0))
+    .bind(q.offset())
     .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
-    Ok(Json(rows))
+    Ok(Json(Paged {
+        items: rows,
+        total,
+        limit: q.limit(),
+        offset: q.offset(),
+    }))
 }
 
 async fn list_closed(
@@ -2124,17 +2766,27 @@ async fn list_closed(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM closed_positions WHERE user_id = $1")
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
     let rows = sqlx::query_as::<_, ClosedRow>(
         "SELECT id, trading_account_id, source_wallet, token_id, market_title, operating_mode, closed_shares, realized_pnl_usd, closed_at
-         FROM closed_positions WHERE user_id = $1 ORDER BY closed_at DESC LIMIT $2 OFFSET $3",
+         FROM closed_positions WHERE user_id = $1 ORDER BY closed_at DESC, id DESC LIMIT $2 OFFSET $3",
     )
     .bind(user.id)
     .bind(q.limit())
-    .bind(q.offset.unwrap_or(0))
+    .bind(q.offset())
     .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
-    Ok(Json(rows))
+    Ok(Json(Paged {
+        items: rows,
+        total,
+        limit: q.limit(),
+        offset: q.offset(),
+    }))
 }
 
 async fn trade_detail(
@@ -2524,7 +3176,7 @@ async fn load_account(
     id: Uuid,
 ) -> Result<AccountCard, ApiError> {
     sqlx::query_as::<_, AccountCard>(
-        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
+        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
          FROM trading_accounts WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
@@ -2570,75 +3222,6 @@ async fn audit(tx: &mut crate::db::Tx<'_>, actor: Option<Uuid>, action: &str, ta
 fn internal(err: impl std::fmt::Display) -> ApiError {
     tracing::error!(error = %crate::security::redact(&err.to_string()), "request failed");
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, "request failed".into())
-}
-
-#[derive(Deserialize)]
-struct PageQuery {
-    limit: Option<i64>,
-    offset: Option<i64>,
-    q: Option<String>,
-    side: Option<String>,
-    status: Option<String>,
-    mode: Option<String>,
-    account_id: Option<Uuid>,
-}
-
-impl PageQuery {
-    fn limit(&self) -> i64 {
-        self.limit.unwrap_or(50).clamp(1, 200)
-    }
-
-    fn filter_text(value: &Option<String>) -> Option<String> {
-        value
-            .as_ref()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    fn filter_side(&self) -> Option<String> {
-        Self::filter_text(&self.side).map(|s| s.to_ascii_lowercase())
-    }
-
-    fn filter_status(&self) -> Option<String> {
-        Self::filter_text(&self.status)
-    }
-
-    fn filter_q(&self) -> Option<String> {
-        Self::filter_text(&self.q).map(|s| s.to_ascii_lowercase())
-    }
-}
-
-#[cfg(test)]
-mod page_query_tests {
-    use super::PageQuery;
-
-    fn empty_query() -> PageQuery {
-        PageQuery {
-            limit: None,
-            offset: None,
-            q: None,
-            side: None,
-            status: None,
-            mode: None,
-            account_id: None,
-        }
-    }
-
-    #[test]
-    fn blank_filters_are_treated_as_absent() {
-        let mut q = empty_query();
-        q.side = Some(String::new());
-        q.status = Some("   ".into());
-        assert_eq!(q.filter_side(), None);
-        assert_eq!(q.filter_status(), None);
-    }
-
-    #[test]
-    fn side_filter_normalizes_case() {
-        let mut q = empty_query();
-        q.side = Some("BUY".into());
-        assert_eq!(q.filter_side().as_deref(), Some("buy"));
-    }
 }
 
 #[derive(Deserialize)]
@@ -2691,6 +3274,7 @@ struct AccountCard {
     operating_mode: String,
     status: String,
     emergency_stop: bool,
+    trading_control_state: String,
     last_exchange_balance_usd: Option<Decimal>,
     last_balance_checked_at: Option<chrono::DateTime<Utc>>,
     last_connection_error: Option<String>,
@@ -2803,6 +3387,30 @@ struct DecisionRow {
 }
 
 #[derive(sqlx::FromRow, Serialize)]
+struct OrderListRow {
+    id: Uuid,
+    trading_account_id: Uuid,
+    decision_id: Uuid,
+    source_event_id: Uuid,
+    exchange_order_id: Option<String>,
+    operating_mode: String,
+    order_type: String,
+    side: String,
+    token_id: String,
+    limit_price: Decimal,
+    size_shares: Decimal,
+    status: String,
+    error: Option<String>,
+    created_at: chrono::DateTime<Utc>,
+    submitted_at: Option<chrono::DateTime<Utc>>,
+    updated_at: chrono::DateTime<Utc>,
+    market_title: Option<String>,
+    outcome: Option<String>,
+    market_icon: Option<String>,
+    market_slug: Option<String>,
+}
+
+#[derive(sqlx::FromRow, Serialize)]
 struct OrderRow {
     id: Uuid,
     trading_account_id: Uuid,
@@ -2820,6 +3428,26 @@ struct OrderRow {
     created_at: chrono::DateTime<Utc>,
     submitted_at: Option<chrono::DateTime<Utc>>,
     updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow, Serialize)]
+struct FillListRow {
+    id: Uuid,
+    order_id: Uuid,
+    trading_account_id: Uuid,
+    price: Decimal,
+    shares: Decimal,
+    notional_usd: Decimal,
+    fee_usd: Option<Decimal>,
+    fee_status: String,
+    tx_hash: Option<String>,
+    slippage_vs_source_bps: Option<i32>,
+    slippage_vs_limit_bps: Option<i32>,
+    filled_at: chrono::DateTime<Utc>,
+    market_title: Option<String>,
+    outcome: Option<String>,
+    market_icon: Option<String>,
+    order_side: Option<String>,
 }
 
 #[derive(sqlx::FromRow, Serialize)]

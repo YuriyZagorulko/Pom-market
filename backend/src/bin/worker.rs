@@ -115,6 +115,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        if let Err(err) = pommarket::hard_close::process_pending_operations(
+            &pool,
+            &books,
+            pipeline.default_fee_rate,
+            pipeline.default_fee_exponent,
+        )
+        .await
+        {
+            tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "hard close tick failed");
+        }
         if let Err(err) = pommarket::pipeline::reconcile_live_orders(
             &pool,
             &vault,

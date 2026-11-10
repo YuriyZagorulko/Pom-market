@@ -1,4 +1,7 @@
 pub mod brevo;
+pub mod console;
+pub mod mock;
+mod mode;
 
 use std::sync::Arc;
 
@@ -8,6 +11,9 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::security::redact;
+
+pub use mock::{clear_mock_inbox, mock_inbox, take_mock_emails, RecordedEmail};
+pub use mode::{automated_test_context, email_mode_from_env, resolve_email_mode, EmailMode};
 
 #[derive(Debug, Error)]
 pub enum MailError {
@@ -82,28 +88,62 @@ pub struct Email {
     sender_name: String,
     app_base_url: String,
     enabled: bool,
+    mode: EmailMode,
 }
 
 impl Email {
     pub fn from_config(cfg: &Config) -> anyhow::Result<Self> {
-        let (mailer, enabled) = match cfg.brevo_api_key.clone() {
-            Some(key) => (
-                brevo::BrevoMailer::arc(key, cfg.brevo_api_base.clone())?,
-                true,
-            ),
-            None => (Arc::new(NoopMailer) as Arc<dyn Mailer>, false),
+        let explicit = email_mode_from_env();
+        let resolved = match resolve_email_mode(cfg, explicit) {
+            Ok(mode) => mode,
+            Err(mode::ResolveEmailModeError::BrevoForbiddenInTests) => {
+                return Err(anyhow::anyhow!(
+                    "EMAIL_MODE=brevo is forbidden in automated test environments"
+                ));
+            }
+            Err(mode::ResolveEmailModeError::Unconfigured) => {
+                return Ok(Self {
+                    mailer: Arc::new(NoopMailer),
+                    sender_email: cfg.brevo_sender_email.clone(),
+                    sender_name: cfg.brevo_sender_name.clone(),
+                    app_base_url: cfg.app_base_url.clone(),
+                    enabled: false,
+                    mode: EmailMode::Console,
+                });
+            }
         };
+
+        let (mailer, enabled) = match resolved {
+            EmailMode::Mock => (mock::MockMailer::arc(), true),
+            EmailMode::Console => (Arc::new(console::ConsoleMailer) as Arc<dyn Mailer>, true),
+            EmailMode::Brevo => {
+                let key = cfg
+                    .brevo_api_key
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("EMAIL_MODE=brevo requires BREVO_API_KEY"))?;
+                (
+                    brevo::BrevoMailer::arc(key, cfg.brevo_api_base.clone())?,
+                    true,
+                )
+            }
+        };
+
         Ok(Self {
             mailer,
             sender_email: cfg.brevo_sender_email.clone(),
             sender_name: cfg.brevo_sender_name.clone(),
             app_base_url: cfg.app_base_url.clone(),
             enabled,
+            mode: resolved,
         })
     }
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn mode(&self) -> EmailMode {
+        self.mode
     }
 
     pub fn setup_url(&self, token: &str) -> String {
@@ -264,6 +304,9 @@ fn password_reset_email_html(display_name: &str, reset_url: &str) -> String {
 }
 
 pub fn brevo_api_key_from_env() -> Option<SecretString> {
+    if automated_test_context_from_urls_only() {
+        return None;
+    }
     for name in ["BREVO_API_KEY", "BREEVO_API_KEY"] {
         if let Ok(value) = std::env::var(name) {
             let trimmed = value.trim();
@@ -275,15 +318,100 @@ pub fn brevo_api_key_from_env() -> Option<SecretString> {
     None
 }
 
+fn automated_test_context_from_urls_only() -> bool {
+    if std::env::var("ENVIRONMENT").as_deref() == Ok("test") {
+        return true;
+    }
+    if std::env::var("E2E_MODE").as_deref() == Ok("1") {
+        return true;
+    }
+    for name in [
+        "MIGRATION_DATABASE_URL",
+        "APP_DATABASE_URL",
+        "WORKER_DATABASE_URL",
+    ] {
+        if let Ok(url) = std::env::var(name) {
+            if url.contains("pommarket_test") || url.contains("pommarket_e2e") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn test_cfg(url_suffix: &str) -> Config {
+        let base = format!("postgres://u:p@localhost:5432/{url_suffix}");
+        Config {
+            env: "test".into(),
+            api_bind: "0.0.0.0:4321".into(),
+            migration_database_url: base.clone(),
+            app_database_url: base.clone(),
+            worker_database_url: base,
+            admin_origin: "http://localhost:4322".into(),
+            user_origin: "http://localhost:4323".into(),
+            jwt_secret: "x".repeat(32),
+            encryption_master_key: "x".repeat(32),
+            encryption_key_id: "k1".into(),
+            previous_encryption_key: None,
+            previous_encryption_key_id: None,
+            access_ttl_seconds: 900,
+            refresh_ttl_seconds: 1209600,
+            invite_ttl_hours: 72,
+            password_reset_ttl_minutes: 30,
+            bootstrap_admin_email: None,
+            bootstrap_admin_password: None,
+            bootstrap_admin_name: "Admin".into(),
+            clob_host: "https://clob.polymarket.com".into(),
+            data_api_host: "https://data-api.polymarket.com".into(),
+            gamma_host: "https://gamma-api.polymarket.com".into(),
+            rtds_url: "wss://ws-live-data.polymarket.com".into(),
+            polygon_rpc_url: None,
+            polygon_logs_enabled: false,
+            chain_id: 137,
+            ctf_exchange: "0x".into(),
+            neg_risk_exchange: "0x".into(),
+            worker_poll_seconds: 8,
+            reconciliation_seconds: 30,
+            confirm_live_trading: false,
+            fee_rate: rust_decimal::Decimal::ZERO,
+            fee_exponent: 1,
+            log_format: "text".into(),
+            brevo_api_key: Some(SecretString::from("secret-should-not-be-used".to_string())),
+            brevo_api_base: None,
+            brevo_sender_email: "noreply@example.com".into(),
+            brevo_sender_name: "POM Market".into(),
+            app_base_url: "http://localhost:4323".into(),
+            trusted_proxies: String::new(),
+            trusted_proxies_parsed: crate::client_ip::TrustedProxies::default(),
+        }
+    }
 
     #[test]
     fn reads_brevo_and_legacy_env_names() {
-        std::env::set_var("BREEVO_API_KEY", "");
-        std::env::remove_var("BREVO_API_KEY");
+        let _guard = env_test_lock().lock().unwrap();
+        for name in [
+            "BREVO_API_KEY",
+            "BREEVO_API_KEY",
+            "ENVIRONMENT",
+            "E2E_MODE",
+            "MIGRATION_DATABASE_URL",
+            "APP_DATABASE_URL",
+            "WORKER_DATABASE_URL",
+        ] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("ENVIRONMENT", "development");
         assert!(brevo_api_key_from_env().is_none());
         std::env::set_var("BREVO_API_KEY", "key-primary");
         assert_eq!(
@@ -297,5 +425,25 @@ mod tests {
             "key-legacy"
         );
         std::env::remove_var("BREEVO_API_KEY");
+        std::env::remove_var("ENVIRONMENT");
+    }
+
+    #[test]
+    fn test_database_forces_mock_mode() {
+        let _guard = env_test_lock().lock().unwrap();
+        let cfg = test_cfg("pommarket_test");
+        std::env::remove_var("EMAIL_MODE");
+        let mail = Email::from_config(&cfg).unwrap();
+        assert!(mail.enabled());
+        assert_eq!(mail.mode(), EmailMode::Mock);
+    }
+
+    #[test]
+    fn brevo_mode_rejected_in_test_context() {
+        let _guard = env_test_lock().lock().unwrap();
+        let cfg = test_cfg("pommarket_test");
+        std::env::set_var("EMAIL_MODE", "brevo");
+        assert!(Email::from_config(&cfg).is_err());
+        std::env::remove_var("EMAIL_MODE");
     }
 }

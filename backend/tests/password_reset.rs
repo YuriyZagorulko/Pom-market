@@ -2,6 +2,7 @@ mod test_support;
 
 use std::env;
 use std::net::SocketAddr;
+use std::time::Duration;
 use test_support::{assert_test_database_url, truncate_users};
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -9,14 +10,12 @@ use pommarket::api::{new_app_state, router, FORGOT_PASSWORD_MESSAGE};
 use pommarket::auth;
 use pommarket::config::Config;
 use pommarket::db::{connect, migrate};
-use pommarket::email::Email;
+use pommarket::email::{clear_mock_inbox, mock_inbox, Email, EmailMode};
 use pommarket::polymarket::http::PublicClient;
 use pommarket::security::{hash_password, random_token, sha256_hex, verify_password, Vault};
 use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL pointed at a database whose name contains pommarket_test"]
@@ -24,21 +23,16 @@ async fn password_reset_flow_security_matrix() {
     let migration_url = env::var("MIGRATION_DATABASE_URL").expect("MIGRATION_DATABASE_URL");
     assert_test_database_url(&migration_url);
 
-    let mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v3/smtp/email"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"messageId": "ok"})))
-        .mount(&mock)
-        .await;
-
-    env::set_var("BREVO_API_KEY", "test-brevo-key");
-    env::set_var("BREVO_API_BASE", mock.uri());
+    env::set_var("ENVIRONMENT", "test");
+    env::set_var("EMAIL_MODE", "mock");
+    env::set_var("BREVO_API_KEY", "must-not-be-used");
     env::set_var("BREVO_SENDER_EMAIL", "noreply@example.com");
     env::set_var("BREVO_SENDER_NAME", "POM Market");
     env::set_var("APP_BASE_URL", "http://localhost:4323");
     env::set_var("BOOTSTRAP_ADMIN_EMAIL", "admin@example.com");
     env::set_var("BOOTSTRAP_ADMIN_PASSWORD", "admin-password-1");
     env::set_var("PASSWORD_RESET_TTL_MINUTES", "30");
+    clear_mock_inbox();
 
     migrate(&migration_url).await.unwrap();
     let migration = connect(&migration_url).await.unwrap();
@@ -64,6 +58,7 @@ async fn password_reset_flow_security_matrix() {
     .unwrap();
 
     let mail = Email::from_config(&cfg).unwrap();
+    assert_eq!(mail.mode(), EmailMode::Mock);
     let (activity, _) = broadcast::channel(8);
     let state = new_app_state(
         pool.clone(),
@@ -122,7 +117,9 @@ async fn password_reset_flow_security_matrix() {
         .unwrap();
     assert_eq!(invalid.status(), 400);
 
-    let token = latest_reset_token(&mock).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let reset_mail = wait_for_mock_subject("Reset your POM Market password").await;
+    let token = token_from_reset_html(&reset_mail.html);
 
     let login = post_json(
         &http,
@@ -218,19 +215,13 @@ async fn password_reset_flow_security_matrix() {
     .count();
     assert_eq!(ok_count, 1);
 
-    let fail_mock = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v3/smtp/email"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&fail_mock)
-        .await;
-    env::set_var("BREVO_API_BASE", fail_mock.uri());
-    let fail_cfg = Config::from_env().unwrap();
-    let fail_mail = Email::from_config(&fail_cfg).unwrap();
-    assert!(fail_mail
-        .send_password_recovery("ada@example.com", "Ada", "token-value")
-        .await
-        .is_err());
+    env::set_var("EMAIL_MODE", "brevo");
+    assert!(
+        Email::from_config(&cfg).is_err(),
+        "real email mode must be rejected in integration test environment"
+    );
+    env::remove_var("EMAIL_MODE");
+
     let still_ok = post_json(
         &http,
         &base,
@@ -243,11 +234,26 @@ async fn password_reset_flow_security_matrix() {
     let _ = auth::consume_password_reset(&pool, &random_token(), "another-password-1").await;
 }
 
-async fn latest_reset_token(mock: &MockServer) -> String {
-    let requests = mock.received_requests().await.unwrap_or_default();
-    let raw = requests.last().expect("brevo call").body.clone();
-    let body: Value = serde_json::from_slice(&raw).unwrap();
-    let html = body["htmlContent"].as_str().expect("html");
+async fn wait_for_mock_subject(subject_needle: &str) -> pommarket::email::RecordedEmail {
+    for _ in 0..80 {
+        let inbox = mock_inbox();
+        let found = {
+            let guard = inbox.lock().expect("mock inbox");
+            guard
+                .iter()
+                .rev()
+                .find(|e| e.subject.contains(subject_needle))
+                .cloned()
+        };
+        if let Some(email) = found {
+            return email;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("mock inbox missing email with subject containing {subject_needle:?}");
+}
+
+fn token_from_reset_html(html: &str) -> String {
     assert!(html.contains("/reset-password?token="));
     html.split("token=")
         .nth(1)

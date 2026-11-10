@@ -3,9 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+// Do not load .env.user.local here — global-setup provisions a fresh user after config loads.
+// Tests must call loadE2eUserCreds() so credentials match the current run.
 const envLocal = path.join(__dirname, ".env.local");
-if (fs.existsSync(envLocal)) {
-  for (const line of fs.readFileSync(envLocal, "utf8").split("\n")) {
+for (const file of [envLocal].filter((p) => fs.existsSync(p))) {
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const eq = trimmed.indexOf("=");
@@ -45,5 +47,6 @@ export default defineConfig({
       use: { baseURL: adminBase },
     },
     { name: "paper", testMatch: /paper-flow\.spec\.ts/, use: { baseURL: userBase } },
+    { name: "trading-data", testMatch: /trading-data\.spec\.ts/, use: { baseURL: userBase } },
   ],
 });

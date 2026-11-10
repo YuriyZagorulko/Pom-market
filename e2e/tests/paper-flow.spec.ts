@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
-import { execSync } from "node:child_process";
 import * as path from "node:path";
+import { injectPaperTrade } from "../helpers/inject";
 import { loginUser, typeInto } from "./helpers/forms";
 import { apiLogin, apiPostJson } from "../helpers/api";
 
@@ -33,14 +33,7 @@ test.beforeAll(() => {
 });
 
 function inject(side: string, suffix: string) {
-  execSync(
-    `INJECT_WALLET=${wallet} INJECT_SIDE=${side} INJECT_TX_SUFFIX=${suffix} bash scripts/inject-paper-event.sh`,
-    {
-      cwd: repoRoot,
-      stdio: "pipe",
-      env: { ...process.env, E2E_MODE: process.env.E2E_MODE ?? "1" },
-    },
-  );
+  injectPaperTrade(wallet, side, suffix);
 }
 
 test("full paper path: admin invite → user setup → strategy → mock trades → UI", async ({
@@ -119,10 +112,15 @@ test("full paper path: admin invite → user setup → strategy → mock trades 
   await typeInto(user.getByPlaceholder("Public 0x address"), wallet);
   await user.getByRole("button", { name: "Check and add" }).click();
   await expect(user).toHaveURL(/\/traders\/[0-9a-f-]+/, { timeout: 30_000 });
-  await expect(user.locator('select[name="trading_account_id"] option')).toHaveCount(1, {
-    timeout: 30_000,
-  });
-  await user.locator('select[name="trading_account_id"]').selectOption({ label: "Paper UI Account" });
+  const traderId = user.url().split("/").pop()!;
+  await user.goto(`/traders/${traderId}/strategy/new`);
+  await expect(user.getByRole("heading", { name: "Create copy strategy" })).toBeVisible();
+  const accountSelect = user.locator("select").first();
+  await expect(accountSelect.locator("option")).toHaveCount(2, { timeout: 30_000 });
+  await accountSelect.selectOption({ index: 1 });
+  await user.getByRole("button", { name: "$200" }).click();
+  await user.getByRole("button", { name: "10%" }).click();
+  user.once("dialog", (d) => d.accept());
   await user.getByRole("button", { name: "Create disabled strategy" }).click();
   await expect(user).toHaveURL(/\/strategies\/[0-9a-f-]+/, { timeout: 15_000 });
   const strategyId = user.url().split("/").pop()!;
@@ -150,19 +148,19 @@ test("full paper path: admin invite → user setup → strategy → mock trades 
 
   inject("buy", `${stamp}b1`);
   await user.goto("/orders");
-  await expect(user.locator("table tbody tr")).toHaveCount(1, { timeout: 30_000 });
+  await expect(user.locator(".record-cards .record-card, .record-card")).toHaveCount(1, { timeout: 30_000 });
   const ordersUrl = new URL(ordersRequest || `${user.url()}`);
   expect(ordersUrl.searchParams.has("side")).toBe(false);
   expect(ordersUrl.searchParams.has("status")).toBe(false);
 
   inject("sell", `${stamp}s1`);
   await user.getByRole("button", { name: "Refresh" }).click();
-  await expect(user.locator("table tbody tr")).toHaveCount(2, { timeout: 30_000 });
+  await expect(user.locator(".record-cards .record-card, .record-card")).toHaveCount(2, { timeout: 30_000 });
 
-  const before = await user.locator("table tbody tr").count();
+  const before = await user.locator(".record-cards .record-card, .record-card").count();
   inject("buy", `${stamp}b1`);
   await user.getByRole("button", { name: "Refresh" }).click();
-  await expect(user.locator("table tbody tr")).toHaveCount(before, { timeout: 15_000 });
+  await expect(user.locator(".record-cards .record-card, .record-card")).toHaveCount(before, { timeout: 15_000 });
 
   await user.close();
 });

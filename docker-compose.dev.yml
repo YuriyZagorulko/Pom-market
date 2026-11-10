@@ -60,6 +60,8 @@ services:
       API_INTERNAL_URL: http://api:4321
       NODE_ENV: development
       WATCHPACK_POLLING: "true"
+      NEXT_DEV_NEXT_DIR: /app/apps/admin/.next
+      NEXT_DEV_ALWAYS_CLEAN: "1"
     volumes:
       - ./apps/admin:/app/apps/admin
       - ./packages:/app/packages
@@ -69,6 +71,7 @@ services:
       - /app/node_modules
       - /app/apps/admin/node_modules
       - /app/packages/api-client/node_modules
+      - /app/apps/admin/.next
 
   user:
     build:
@@ -80,6 +83,8 @@ services:
       API_INTERNAL_URL: http://api:4321
       NODE_ENV: development
       WATCHPACK_POLLING: "true"
+      NEXT_DEV_NEXT_DIR: /app/apps/user/.next
+      NEXT_DEV_ALWAYS_CLEAN: "1"
     volumes:
       - ./apps/user:/app/apps/user
       - ./packages:/app/packages
@@ -89,6 +94,7 @@ services:
       - /app/node_modules
       - /app/apps/user/node_modules
       - /app/packages/api-client/node_modules
+      - /app/apps/user/.next
 
 volumes:
   cargo-target-api:

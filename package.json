@@ -7,6 +7,7 @@
     "dev:user": "pnpm --filter @pom/user dev",
     "build:admin": "pnpm --filter @pom/admin build",
     "build:user": "pnpm --filter @pom/user build",
+    "test:user": "pnpm --filter @pom/user test",
     "test:e2e": "pnpm --filter @pom/e2e test"
   }
 }

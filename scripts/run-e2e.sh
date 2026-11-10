@@ -8,6 +8,11 @@ set -a
 source .env
 set +a
 
+export ENVIRONMENT=test
+export EMAIL_MODE=mock
+export E2E_MODE=1
+unset BREVO_API_KEY BREEVO_API_KEY BREVO_API_BASE 2>/dev/null || true
+
 export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-pommarket_dev_password}"
 export POSTGRES_PORT="${POSTGRES_PORT:-5440}"
 export E2E_API_PORT="${E2E_API_PORT:-4324}"
@@ -57,16 +62,13 @@ fi
 $PNPM install
 export E2E_MODE=1
 export WORKER_DATABASE_URL="postgres://pommarket_worker:${WORKER_DB_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/pommarket_e2e"
-if [ "${E2E_IN_DOCKER:-}" = "1" ]; then
+# Paper inject tests invoke `cargo test --test inject_paper_event`; Playwright runs on the host (needs `cargo` on PATH).
+$PNPM --filter @pom/e2e exec playwright install chromium
+if command -v cargo >/dev/null 2>&1; then
   $PNPM --filter @pom/e2e test
 else
-  docker run --rm --network host \
-    -v "$root:/app" -w /app \
-    -e E2E_IN_DOCKER=1 \
-    -e E2E_MODE=1 \
-    -e WORKER_DATABASE_URL \
-    mcr.microsoft.com/playwright:v1.49.1-jammy \
-    bash -lc 'corepack enable && npx -y pnpm@9.15.9 install --force && npx -y pnpm@9.15.9 --filter @pom/e2e exec playwright test'
+  echo "warning: cargo not on PATH — skipping paper-flow and trading-data inject scenarios" >&2
+  $PNPM --filter @pom/e2e exec playwright test --grep-invert "paper-flow|wallet activity"
 fi
 
 after_users=$(count_primary_users)

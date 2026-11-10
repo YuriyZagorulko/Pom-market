@@ -2,13 +2,17 @@ pub mod api;
 pub mod auth;
 pub mod client_ip;
 pub mod config;
+pub mod copy_preview;
 pub mod db;
 pub mod email;
 pub mod engine;
+pub mod hard_close;
 pub mod pipeline;
 pub mod polymarket;
 pub mod rate_limit;
 pub mod security;
+pub mod strategy_budget;
+pub mod trading_control;
 
 use chrono::Utc;
 use sqlx::PgPool;

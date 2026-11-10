@@ -71,6 +71,24 @@ button.ghost { background: transparent; color: var(--ink); border: 1px solid var
 .activity-detail-row code { word-break: break-all; background: #f5f0e8; padding: 2px 6px; border-radius: 6px; }
 .activity-empty { margin-top: 16px; text-align: center; padding: 28px; }
 .activity-pager { margin-top: 16px; }
+.list-filters { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.date-presets { flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.date-preset.active { font-weight: 600; text-decoration: underline; }
+.account-select { display: flex; flex-direction: column; gap: 4px; }
+.account-select select { min-width: 10rem; }
+.filter-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; align-items: center; }
+.chip { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+.chip-clear { font-size: 12px; padding: 4px 10px; }
+.list-pagination { margin: 16px 0; flex-wrap: wrap; gap: 12px; }
+.wallet-multiselect { position: relative; }
+.wallet-multiselect-panel { position: absolute; z-index: 5; width: min(360px, 92vw); margin-top: 6px; display: grid; gap: 8px; max-height: 320px; overflow: auto; }
+.wallet-multiselect-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.wallet-multiselect-list label { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.activity-day-heading { font-size: 14px; color: var(--muted); margin: 18px 0 8px; text-transform: uppercase; letter-spacing: 0.06em; }
+.record-cards { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.record-card { display: grid; gap: 4px; }
+.timeline-row { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.trade-detail { display: grid; gap: 14px; max-width: 920px; }
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
   nav { border-right: 0; border-bottom: 1px solid var(--line); }

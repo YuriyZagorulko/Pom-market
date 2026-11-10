@@ -4,6 +4,7 @@ mod test_support;
 use common::TestApi;
 use pommarket::db::begin_as;
 use serde_json::json;
+use test_support::list_items;
 #[tokio::test]
 #[ignore = "requires PostgreSQL pointed at a database whose name contains pommarket_test"]
 async fn pipeline_mock_scenarios() {
@@ -57,7 +58,7 @@ async fn pipeline_mock_scenarios() {
     let unknown_out = api.inject_and_process(&unknown).await;
     assert!(unknown_out.created, "event row may still be created");
     let (_, orders) = api.get_raw("/api/v1/orders", &token).await;
-    assert!(orders.as_array().unwrap().is_empty(), "unwatched wallet");
+    assert!(list_items(&orders).is_empty(), "unwatched wallet");
 
     let trader = api
         .send(
@@ -92,7 +93,7 @@ async fn pipeline_mock_scenarios() {
     let disabled_trade = TestApi::sample_trade(wallet, "buy", "10", "0xdisabledstrat");
     api.inject_and_process(&disabled_trade).await;
     let (_, orders) = api.get_raw("/api/v1/orders", &token).await;
-    assert!(orders.as_array().unwrap().is_empty(), "strategy disabled");
+    assert!(list_items(&orders).is_empty(), "strategy disabled");
 
     let mut tx = begin_as(&api.worker, None, "worker").await.unwrap();
     let skipped: i64 = sqlx::query_scalar(
@@ -115,12 +116,12 @@ async fn pipeline_mock_scenarios() {
     let good = TestApi::sample_trade(wallet, "buy", "10", "0xgoodbuy");
     api.inject_and_process(&good).await;
     let (_, orders) = api.get_raw("/api/v1/orders", &token).await;
-    assert_eq!(orders.as_array().unwrap().len(), 1);
+    assert_eq!(list_items(&orders).len(), 1);
 
     let dup = api.inject_and_process(&good).await;
     assert!(!dup.created, "dedup");
     let (_, orders) = api.get_raw("/api/v1/orders", &token).await;
-    assert_eq!(orders.as_array().unwrap().len(), 1, "no duplicate order");
+    assert_eq!(list_items(&orders).len(), 1, "no duplicate order");
 
     api.send(
         "PATCH",
@@ -132,7 +133,7 @@ async fn pipeline_mock_scenarios() {
     let broke = TestApi::sample_trade(wallet, "buy", "10", "0xinsufficient");
     api.inject_and_process(&broke).await;
     let (_, orders) = api.get_raw("/api/v1/orders", &token).await;
-    assert_eq!(orders.as_array().unwrap().len(), 1, "insufficient cash");
+    assert_eq!(list_items(&orders).len(), 1, "insufficient cash");
 }
 
 #[tokio::test]

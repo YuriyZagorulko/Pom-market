@@ -12,6 +12,11 @@ services:
         required: false
     environment:
       API_BIND: 0.0.0.0:4321
+      ENVIRONMENT: test
+      EMAIL_MODE: mock
+      E2E_MODE: "1"
+      BREVO_API_KEY: ""
+      BREVO_API_BASE: ""
       MIGRATION_DATABASE_URL: postgres://pommarket:${POSTGRES_PASSWORD:-pommarket_dev_password}@postgres:5432/pommarket_e2e
       APP_DATABASE_URL: postgres://pommarket_app:${APP_DB_PASSWORD}@postgres:5432/pommarket_e2e
       WORKER_DATABASE_URL: postgres://pommarket_worker:${WORKER_DB_PASSWORD}@postgres:5432/pommarket_e2e
@@ -34,6 +39,11 @@ services:
       - path: .env
         required: false
     environment:
+      ENVIRONMENT: test
+      EMAIL_MODE: mock
+      E2E_MODE: "1"
+      BREVO_API_KEY: ""
+      BREVO_API_BASE: ""
       MIGRATION_DATABASE_URL: postgres://pommarket:${POSTGRES_PASSWORD:-pommarket_dev_password}@postgres:5432/pommarket_e2e
       APP_DATABASE_URL: postgres://pommarket_app:${APP_DB_PASSWORD}@postgres:5432/pommarket_e2e
       WORKER_DATABASE_URL: postgres://pommarket_worker:${WORKER_DB_PASSWORD}@postgres:5432/pommarket_e2e

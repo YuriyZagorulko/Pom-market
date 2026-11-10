@@ -15,6 +15,8 @@ use crate::engine::{
 use crate::polymarket::live::{place_fak, LiveOrderRequest};
 use crate::polymarket::RawTrade;
 use crate::security::{credential_aad, redact, Vault};
+use crate::strategy_budget::strategy_exposure_usd;
+use crate::trading_control;
 use secrecy::SecretString;
 
 #[async_trait]
@@ -175,7 +177,7 @@ pub async fn process_event(
                 s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd, s.max_position_usd,
                 s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
                 s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets, s.created_at,
-                a.operating_mode, a.emergency_stop, a.live_confirmed_at, a.signature_type, a.funder_address,
+                a.operating_mode, a.emergency_stop, a.trading_control_state, a.live_confirmed_at, a.signature_type, a.funder_address,
                 a.last_exchange_balance_usd, a.status AS account_status,
                 r.max_order_usd, r.max_daily_loss_usd, r.max_exposure_usd AS account_max_exposure,
                 r.max_slippage_bps AS account_max_slippage, r.max_orders_per_interval, r.interval_seconds,
@@ -240,6 +242,10 @@ async fn decide_one(
         .bind(strategy.trading_account_id.to_string())
         .execute(&mut *tx)
         .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("strategy-budget:{}", strategy.id))
+        .execute(&mut *tx)
+        .await?;
     let already: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM copy_decisions WHERE strategy_id = $1 AND source_event_id = $2",
     )
@@ -268,26 +274,12 @@ async fn decide_one(
     .bind(&strategy.operating_mode)
     .fetch_one(&mut *tx)
     .await?;
-    let strategy_exposure: Decimal = sqlx::query_scalar(
-        "SELECT COALESCE((SELECT SUM(cost_basis_usd) FROM positions
-            WHERE trading_account_id = $1 AND lower(source_wallet) = $2 AND operating_mode = $3 AND open_shares > 0), 0)
-         + COALESCE((SELECT SUM(o.position_reserved_usd + o.fee_reserved_usd) FROM orders o
-            JOIN source_events e ON e.id = o.source_event_id
-            WHERE o.trading_account_id = $1 AND lower(e.source_wallet) = $2 AND o.operating_mode = $3
-              AND o.status IN ('pending', 'submitting', 'submitted', 'partially_filled', 'unknown')), 0)",
-    )
-    .bind(strategy.trading_account_id)
-    .bind(&strategy.wallet_address)
-    .bind(&strategy.operating_mode)
-    .fetch_one(&mut *tx)
-    .await?;
+    let strategy_exposure = strategy_exposure_usd(&mut tx, strategy.id).await?;
     let open_positions: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM positions
-         WHERE trading_account_id = $1 AND lower(source_wallet) = $2 AND operating_mode = $3 AND open_shares > 0",
+         WHERE strategy_id = $1 AND open_shares > 0",
     )
-    .bind(strategy.trading_account_id)
-    .bind(&strategy.wallet_address)
-    .bind(&strategy.operating_mode)
+    .bind(strategy.id)
     .fetch_one(&mut *tx)
     .await?;
     let recent_orders: i64 = sqlx::query_scalar(
@@ -317,18 +309,30 @@ async fn decide_one(
     let mut reason: Option<RejectReason> = None;
     if !strategy.enabled {
         reason = Some(RejectReason::StrategyDisabled);
+    } else if kill && strategy.operating_mode != "monitoring" {
+        reason = Some(RejectReason::KillSwitch);
+    } else if let Some(code) = trading_control::pipeline_blocked(
+        &strategy.trading_control_state,
+        side_buy,
+        kill,
+        &strategy.operating_mode,
+    ) {
+        reason = Some(match code {
+            "kill_switch" => RejectReason::KillSwitch,
+            "emergency_stop" => RejectReason::EmergencyStop,
+            "soft_close_no_buy" => RejectReason::SoftCloseBuyBlocked,
+            "hard_close_in_progress" => RejectReason::HardCloseInProgress,
+            "account_no_buy" => RejectReason::AccountNoBuy,
+            _ => RejectReason::EmergencyStop,
+        });
     } else if strategy.emergency_stop {
         reason = Some(RejectReason::EmergencyStop);
     } else if strategy.operating_mode == "monitoring" {
         reason = Some(RejectReason::MonitoringMode);
     } else if strategy.operating_mode == "live_trading"
-        && (kill || !cfg.confirm_live || strategy.live_confirmed_at.is_none())
+        && (!cfg.confirm_live || strategy.live_confirmed_at.is_none())
     {
-        reason = Some(if kill {
-            RejectReason::KillSwitch
-        } else {
-            RejectReason::LiveNotConfirmed
-        });
+        reason = Some(RejectReason::LiveNotConfirmed);
     } else if side_buy && !strategy.copy_buy || !side_buy && !strategy.copy_sell {
         reason = Some(RejectReason::CopySideDisabled);
     } else if Utc::now().signed_duration_since(event.event_ts)
@@ -395,10 +399,9 @@ async fn decide_one(
         if open_positions >= strategy.max_open_positions as i64 {
             let existing_token: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM positions
-                 WHERE trading_account_id = $1 AND lower(source_wallet) = $2 AND token_id = $3 AND operating_mode = $4 AND open_shares > 0",
+                 WHERE strategy_id = $1 AND token_id = $2 AND operating_mode = $3 AND open_shares > 0",
             )
-            .bind(strategy.trading_account_id)
-            .bind(&strategy.wallet_address)
+            .bind(strategy.id)
             .bind(&event.token_id)
             .bind(&strategy.operating_mode)
             .fetch_one(&mut *tx)
@@ -477,10 +480,9 @@ async fn decide_one(
     let position = sqlx::query_as::<_, PositionRow>(
         "SELECT id, open_shares, avg_price, cost_basis_usd, realized_pnl_usd, source_observed_shares, pending_exit_shares
          FROM positions
-         WHERE trading_account_id = $1 AND lower(source_wallet) = $2 AND token_id = $3 AND operating_mode = $4",
+         WHERE strategy_id = $1 AND token_id = $2 AND operating_mode = $3",
     )
-    .bind(strategy.trading_account_id)
-    .bind(&strategy.wallet_address)
+    .bind(strategy.id)
     .bind(&event.token_id)
     .bind(&strategy.operating_mode)
     .fetch_optional(&mut *tx)
@@ -942,6 +944,244 @@ async fn submit_live(
     Ok(())
 }
 
+pub async fn cancel_open_buy_orders(
+    tx: &mut crate::db::Tx<'_>,
+    account_id: Uuid,
+    operating_mode: &str,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "UPDATE orders SET status = 'cancelled', position_reserved_usd = 0, fee_reserved_usd = 0,
+            updated_at = now(), error = COALESCE(error, 'cancelled_by_trading_control')
+         WHERE trading_account_id = $1 AND operating_mode = $2 AND side = 'buy'
+           AND status IN ('pending', 'submitting', 'submitted', 'partially_filled', 'unknown')",
+    )
+    .bind(account_id)
+    .bind(operating_mode)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn cancel_open_sell_orders(
+    tx: &mut crate::db::Tx<'_>,
+    account_id: Uuid,
+    operating_mode: &str,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "UPDATE orders SET status = 'cancelled', position_reserved_usd = 0, fee_reserved_usd = 0,
+            updated_at = now(), error = COALESCE(error, 'cancelled_for_hard_close')
+         WHERE trading_account_id = $1 AND operating_mode = $2 AND side = 'sell'
+           AND origin = 'copy'
+           AND status IN ('pending', 'submitting', 'submitted', 'partially_filled', 'unknown')",
+    )
+    .bind(account_id)
+    .bind(operating_mode)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn reset_pending_exit_shares(
+    tx: &mut crate::db::Tx<'_>,
+    account_id: Uuid,
+    operating_mode: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE positions SET pending_exit_shares = 0, updated_at = now()
+         WHERE trading_account_id = $1 AND operating_mode = $2",
+    )
+    .bind(account_id)
+    .bind(operating_mode)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Shares reserved by active copy sell orders for a token on this account (paper).
+pub async fn reserved_sell_shares(
+    tx: &mut crate::db::Tx<'_>,
+    account_id: Uuid,
+    token_id: &str,
+    operating_mode: &str,
+) -> anyhow::Result<Decimal> {
+    let reserved: Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(GREATEST(
+            o.size_shares - COALESCE((SELECT SUM(f.shares) FROM fills f WHERE f.order_id = o.id), 0),
+            0
+        )), 0)
+         FROM orders o
+         WHERE o.trading_account_id = $1 AND o.operating_mode = $2 AND o.side = 'sell'
+           AND o.origin = 'copy'
+           AND o.token_id = $3
+           AND o.status IN ('pending', 'submitting', 'submitted', 'partially_filled', 'unknown')",
+    )
+    .bind(account_id)
+    .bind(operating_mode)
+    .bind(token_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(reserved)
+}
+
+pub fn sellable_shares(
+    open_shares: Decimal,
+    pending_exit: Decimal,
+    reserved_sells: Decimal,
+) -> Decimal {
+    (open_shares - pending_exit - reserved_sells).max(Decimal::ZERO)
+}
+
+#[cfg(test)]
+mod sellable_tests {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn sellable_respects_reservations() {
+        assert_eq!(
+            sellable_shares(Decimal::from(100), Decimal::from(10), Decimal::from(25)),
+            Decimal::from(65)
+        );
+        assert_eq!(
+            sellable_shares(Decimal::from(10), Decimal::from(20), Decimal::ZERO),
+            Decimal::ZERO
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn paper_sell_position(
+    pool: &PgPool,
+    user_id: Uuid,
+    account_id: Uuid,
+    operation_id: Uuid,
+    item_id: Uuid,
+    position_id: Uuid,
+    token_id: &str,
+    want_shares: Decimal,
+    book: &Result<OrderBook, String>,
+    fee: Option<&FeeSchedule>,
+) -> anyhow::Result<()> {
+    let mut tx = begin_as(pool, None, "worker").await?;
+    let pos: PositionRow = sqlx::query_as(
+        "SELECT id, open_shares, avg_price, cost_basis_usd, realized_pnl_usd, source_observed_shares, pending_exit_shares
+         FROM positions WHERE id = $1 AND trading_account_id = $2 AND user_id = $3 FOR UPDATE",
+    )
+    .bind(position_id)
+    .bind(account_id)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if pos.open_shares <= Decimal::ZERO {
+        sqlx::query(
+            "UPDATE hard_close_items SET status = 'closed', closed_shares = requested_shares, remaining_shares = 0, updated_at = now() WHERE id = $1",
+        )
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    let reserved = reserved_sell_shares(&mut tx, account_id, token_id, "paper_trading").await?;
+    let available = sellable_shares(pos.open_shares, pos.pending_exit_shares, reserved);
+    if available <= Decimal::ZERO {
+        anyhow::bail!(
+            "no sellable shares (open={}, pending_exit={}, reserved_sells={})",
+            pos.open_shares,
+            pos.pending_exit_shares,
+            reserved
+        );
+    }
+    let sell_shares = want_shares.min(available);
+    let book = book.as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let slip = 500;
+    let tick = book.tick;
+    let ref_price = book
+        .bids
+        .first()
+        .map(|l| l.price)
+        .unwrap_or(pos.avg_price)
+        .max(tick);
+    let limit = limit_price(false, ref_price, slip, tick);
+    let fill =
+        walk_book(book, false, limit, sell_shares, fee).map_err(|r| anyhow::anyhow!(r.as_str()))?;
+    let order_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO orders (
+            user_id, trading_account_id, client_order_id, operating_mode, order_type, side,
+            token_id, limit_price, size_shares, status, origin, position_id, position_reserved_usd, fee_reserved_usd
+         ) VALUES ($1,$2,gen_random_uuid(),'paper_trading','FAK','sell',$3,$4,$5,'filled','hard_close',$6,0,0)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(account_id)
+    .bind(token_id)
+    .bind(limit)
+    .bind(fill.shares)
+    .bind(position_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let fee_amount = fill.fee_usd.unwrap_or(Decimal::ZERO);
+    sqlx::query(
+        "INSERT INTO fills (user_id, trading_account_id, order_id, price, shares, notional_usd, fee_usd, fee_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(user_id)
+    .bind(account_id)
+    .bind(order_id)
+    .bind(fill.vwap)
+    .bind(fill.shares)
+    .bind(fill.notional)
+    .bind(fill.fee_usd)
+    .bind(fill.fee_status)
+    .execute(&mut *tx)
+    .await?;
+    let sold = fill.shares.min(pos.open_shares);
+    let released = if pos.open_shares > Decimal::ZERO {
+        (pos.cost_basis_usd * sold / pos.open_shares).round_dp(8)
+    } else {
+        Decimal::ZERO
+    };
+    let pnl = fill.notional - released - fee_amount;
+    let remaining = pos.open_shares - sold;
+    sqlx::query(
+        "UPDATE positions SET open_shares = $2, cost_basis_usd = $3, realized_pnl_usd = realized_pnl_usd + $4, updated_at = now() WHERE id = $1",
+    )
+    .bind(position_id)
+    .bind(remaining)
+    .bind((pos.cost_basis_usd - released).max(Decimal::ZERO))
+    .bind(pnl)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE account_risk_limits SET paper_cash_usd = paper_cash_usd + $2, updated_at = now() WHERE trading_account_id = $1",
+    )
+    .bind(account_id)
+    .bind(fill.notional - fee_amount)
+    .execute(&mut *tx)
+    .await?;
+    let item_status =
+        if remaining <= Decimal::ZERO || remaining <= Decimal::new(1, 4) || fill.complete {
+            "closed"
+        } else {
+            "partial"
+        };
+    let item_remaining = remaining.max(Decimal::ZERO);
+    sqlx::query(
+        "UPDATE hard_close_items SET status = $2, closed_shares = closed_shares + $3, remaining_shares = $4,
+            order_id = $5, updated_at = now() WHERE id = $1",
+    )
+    .bind(item_id)
+    .bind(item_status)
+    .bind(sold)
+    .bind(item_remaining)
+    .bind(order_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let _ = operation_id;
+    Ok(())
+}
+
 async fn mark_order(
     pool: &PgPool,
     order_id: Uuid,
@@ -981,10 +1221,10 @@ async fn apply_position(
     if side_buy {
         sqlx::query(
             "INSERT INTO positions (
-                user_id, trading_account_id, source_wallet, token_id, condition_id, outcome, market_title,
+                user_id, trading_account_id, strategy_id, source_wallet, token_id, condition_id, outcome, market_title,
                 operating_mode, open_shares, avg_price, cost_basis_usd, source_observed_shares
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-             ON CONFLICT (trading_account_id, source_wallet, token_id, operating_mode)
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             ON CONFLICT (strategy_id, token_id, operating_mode) WHERE (strategy_id IS NOT NULL)
              DO UPDATE SET
                 open_shares = positions.open_shares + EXCLUDED.open_shares,
                 cost_basis_usd = positions.cost_basis_usd + EXCLUDED.cost_basis_usd,
@@ -996,6 +1236,7 @@ async fn apply_position(
         )
         .bind(strategy.user_id)
         .bind(strategy.trading_account_id)
+        .bind(strategy.id)
         .bind(&strategy.wallet_address)
         .bind(&event.token_id)
         .bind(&event.condition_id)
@@ -1012,11 +1253,10 @@ async fn apply_position(
         let pos = sqlx::query_as::<_, PositionRow>(
             "SELECT id, open_shares, avg_price, cost_basis_usd, realized_pnl_usd, source_observed_shares, pending_exit_shares
              FROM positions
-             WHERE trading_account_id = $1 AND lower(source_wallet) = $2 AND token_id = $3 AND operating_mode = $4
+             WHERE strategy_id = $1 AND token_id = $2 AND operating_mode = $3
              FOR UPDATE",
         )
-        .bind(strategy.trading_account_id)
-        .bind(&strategy.wallet_address)
+        .bind(strategy.id)
         .bind(&event.token_id)
         .bind(&strategy.operating_mode)
         .fetch_one(&mut **tx)
@@ -1257,6 +1497,7 @@ struct StrategyRow {
     created_at: DateTime<Utc>,
     operating_mode: String,
     emergency_stop: bool,
+    trading_control_state: String,
     live_confirmed_at: Option<DateTime<Utc>>,
     signature_type: String,
     funder_address: String,

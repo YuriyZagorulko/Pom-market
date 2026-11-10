@@ -4,7 +4,11 @@ RUN corepack enable
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY packages ./packages
 COPY apps/user ./apps/user
+COPY docker/next-dev-entrypoint.sh /usr/local/bin/next-dev-entrypoint.sh
+RUN chmod +x /usr/local/bin/next-dev-entrypoint.sh
 RUN pnpm install --frozen-lockfile --filter @pom/user...
 ENV NODE_ENV=development
+ENV NEXT_DEV_NEXT_DIR=/app/apps/user/.next
 EXPOSE 4323
+ENTRYPOINT ["next-dev-entrypoint.sh"]
 CMD ["pnpm", "--filter", "@pom/user", "dev"]

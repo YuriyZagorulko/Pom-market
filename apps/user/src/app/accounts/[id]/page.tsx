@@ -2,6 +2,7 @@
 
 import { useParams } from "next/navigation";
 import { FormEvent, useState } from "react";
+import { DangerZone } from "@/components/danger-zone";
 import { Desk, useResource } from "@/components/desk";
 import { useSession } from "@/lib/session";
 
@@ -30,7 +31,8 @@ function Detail({ id }: { id: string }) {
   async function risk(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = Object.fromEntries(new FormData(event.currentTarget).entries());
-    const body: Record<string, unknown> = { ...form, emergency_stop: form.emergency_stop === "on" };
+    const { emergency_stop: _stop, ...formRest } = form;
+    const body: Record<string, unknown> = { ...formRest };
     await client.request(`/api/v1/accounts/${id}/risk`, { method: "PATCH", body: JSON.stringify(body) });
     setMessage("Risk limits saved");
     reload();
@@ -88,9 +90,9 @@ function Detail({ id }: { id: string }) {
         <input name="max_exposure_usd" defaultValue={String(data.risk.max_exposure_usd)} placeholder="Max exposure" />
         <input name="max_slippage_bps" defaultValue={String(data.risk.max_slippage_bps)} placeholder="Max slippage bps" />
         <input name="paper_cash_usd" defaultValue={String(data.risk.paper_cash_usd)} placeholder="Paper cash" />
-        <label><input name="emergency_stop" type="checkbox" defaultChecked={Boolean(account.emergency_stop)} /> Emergency stop</label>
         <button>Save risk</button>
       </form>
+      <DangerZone accountId={id} client={client} onChange={reload} />
       {message && <div className="ok">{message}</div>}
     </section>
   );

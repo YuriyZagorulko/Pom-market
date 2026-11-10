@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useParams } from "next/navigation";
 import { FormEvent } from "react";
 import { Desk, useResource } from "@/components/desk";
@@ -15,7 +16,6 @@ function Detail({ id }: { id: string }) {
   const trader = useResource<Record<string, unknown>>(`/api/v1/source-traders/${id}`, {
     refreshMs: 10000,
   });
-  const accounts = useResource<Array<Record<string, string>>>("/api/v1/accounts");
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
@@ -24,13 +24,6 @@ function Detail({ id }: { id: string }) {
       body: JSON.stringify({ alias: data.get("alias"), monitoring_enabled: data.get("monitoring_enabled") === "on" }),
     });
     trader.reload();
-  }
-  async function bind(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const body = Object.fromEntries(new FormData(event.currentTarget).entries());
-    body.source_trader_id = id;
-    const created = await client.request<{ id: string }>("/api/v1/strategies", { method: "POST", body: JSON.stringify(body) });
-    location.href = `/strategies/${created.id}`;
   }
   async function remove() {
     await client.request(`/api/v1/source-traders/${id}`, { method: "DELETE" });
@@ -118,20 +111,11 @@ function Detail({ id }: { id: string }) {
         <label><input type="checkbox" name="monitoring_enabled" defaultChecked={monitoringEnabled} /> Monitoring enabled</label>
         <button>Save</button>
       </form>
-      <form className="panel" onSubmit={bind} style={{ display: "grid", gap: 8 }}>
+      <div className="panel">
         <h2>Copy onto an account</h2>
-        <select name="trading_account_id" required>
-          {accounts.data?.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
-        </select>
-        <select name="sizing_mode" defaultValue="fixed_amount">
-          <option value="fixed_amount">Fixed amount</option>
-          <option value="proportional">Proportional</option>
-          <option value="multiplier">Multiplier</option>
-        </select>
-        <input name="fixed_amount_usd" defaultValue="25" />
-        <input name="strategy_budget_usd" defaultValue="100" />
-        <button>Create disabled strategy</button>
-      </form>
+        <p className="muted">Set budget, copy %, risk limits, and preview recent source trades.</p>
+        <Link className="button" href={`/traders/${id}/strategy/new`}>Create copy strategy</Link>
+      </div>
     </section>
   );
 }
