@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::db::begin_as;
+use crate::engine::RejectReason;
 use crate::polymarket::http::PublicClient;
 
 const POLYGON_USDC_E: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
@@ -305,6 +306,32 @@ async fn wallet_usdc_balance(rpc: &str, wallet: &str) -> Result<Decimal, String>
     Ok(total.round_dp(8))
 }
 
+/// Open-position **market value** from Polymarket Data API `GET /v2/value` (`positions_value_usd`).
+/// Not cost basis, not wallet USDC, not total equity.
+pub fn position_value_for_sizing(snap: &EquitySnapshot) -> Result<Decimal, RejectReason> {
+    if snap.status == EquityStatus::Stale {
+        return Err(RejectReason::SourcePositionValueStale);
+    }
+    if snap.expires_at < Utc::now() {
+        return Err(RejectReason::SourcePositionValueStale);
+    }
+    match snap.positions_value_usd {
+        None => Err(RejectReason::SourcePositionValueUnavailable),
+        Some(v) if v <= Decimal::ZERO => Err(RejectReason::SourcePositionValueZero),
+        Some(v) => Ok(v),
+    }
+}
+
+/// Refresh when open-position MTM is missing, expired, or marked stale.
+pub fn snapshot_needs_position_value_refresh(snap: &EquitySnapshot) -> bool {
+    snap.status == EquityStatus::Stale
+        || snap.expires_at < Utc::now()
+        || snap
+            .positions_value_usd
+            .filter(|v| *v > Decimal::ZERO)
+            .is_none()
+}
+
 fn hex_u256_decimal(hex: &str) -> Result<Decimal, String> {
     let clean = hex.trim_start_matches("0x");
     if clean.is_empty() || clean == "0" {
@@ -327,5 +354,52 @@ mod tests {
         assert!(!EquityStatus::Stale.allows_portfolio_buy());
         assert!(EquityStatus::Partial.is_estimated());
         assert!(!EquityStatus::Complete.is_estimated());
+    }
+
+    fn snap(positions: Option<Decimal>, status: EquityStatus, expired: bool) -> EquitySnapshot {
+        EquitySnapshot {
+            wallet_queried: "0xabc".into(),
+            positions_value_usd: positions,
+            combo_positions_value_usd: None,
+            wallet_collateral_usd: None,
+            total_equity_usd: None,
+            status,
+            quality_note: None,
+            observed_at: Utc::now(),
+            expires_at: if expired {
+                Utc::now() - Duration::seconds(1)
+            } else {
+                Utc::now() + Duration::hours(1)
+            },
+            age_seconds: 0,
+        }
+    }
+
+    #[test]
+    fn position_value_accepts_unavailable_with_mtm() {
+        let s = snap(Some(Decimal::from(4000)), EquityStatus::Unavailable, false);
+        assert_eq!(
+            position_value_for_sizing(&s).unwrap(),
+            Decimal::from(4000)
+        );
+    }
+
+    #[test]
+    fn position_value_rejects_stale_and_zero() {
+        let stale = snap(Some(Decimal::from(4000)), EquityStatus::Stale, false);
+        assert_eq!(
+            position_value_for_sizing(&stale),
+            Err(RejectReason::SourcePositionValueStale)
+        );
+        let expired = snap(Some(Decimal::from(4000)), EquityStatus::Partial, true);
+        assert_eq!(
+            position_value_for_sizing(&expired),
+            Err(RejectReason::SourcePositionValueStale)
+        );
+        let zero = snap(Some(Decimal::ZERO), EquityStatus::Partial, false);
+        assert_eq!(
+            position_value_for_sizing(&zero),
+            Err(RejectReason::SourcePositionValueZero)
+        );
     }
 }

@@ -396,6 +396,7 @@ mod tests {
             trusted_proxies_parsed: crate::client_ip::TrustedProxies::default(),
             source_equity_max_age_seconds: 120,
             source_equity_min_usd: rust_decimal::Decimal::ONE,
+            paper_allow_synthetic_fills: false,
         }
     }
 

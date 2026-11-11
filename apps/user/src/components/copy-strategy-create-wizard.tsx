@@ -10,6 +10,7 @@ import {
   type AllocationMode,
   type SizingMode,
 } from "@/lib/copy-strategy-create";
+import { SIZING_MODE_OPTIONS } from "@/lib/sizing-mode";
 import { SimpleFieldLabel } from "@/components/simple-field-label";
 import { useToast } from "@/components/toast";
 import { BUDGET_PRESETS, COPY_PERCENT_PRESETS } from "@/lib/copy-sizing";
@@ -48,20 +49,20 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
   const [accountId, setAccountId] = useState("");
   const [allocationMode, setAllocationMode] = useState<AllocationMode>("fixed_usd");
   const [allocationPercent, setAllocationPercent] = useState("25");
-  const [sizingMode, setSizingMode] = useState<SizingMode>("portfolio_ratio");
+  const [sizingMode, setSizingMode] = useState<SizingMode>("position_value_ratio");
   const [budget, setBudget] = useState("2000");
   const [customBudget, setCustomBudget] = useState(false);
   const [copyPercent, setCopyPercent] = useState("10");
   const [fixedAmountUsd, setFixedAmountUsd] = useState("25");
-  const [multiplier, setMultiplier] = useState("1");
+  const [pvrTradeMultiplier, setPvrTradeMultiplier] = useState("1");
   const [maxTrade, setMaxTrade] = useState("200");
-  const [maxExposure, setMaxExposure] = useState("");
   const [maxOpenPositions, setMaxOpenPositions] = useState("10");
   const [maxSlippageBps, setMaxSlippageBps] = useState("150");
   const [minOrder, setMinOrder] = useState("1");
   const [cooldownSeconds, setCooldownSeconds] = useState("0");
   const [copyBuy, setCopyBuy] = useState(true);
   const [copySell, setCopySell] = useState(true);
+  const [allowSubminimumPaperTrades, setAllowSubminimumPaperTrades] = useState(false);
   const [preview, setPreview] = useState<{ rows: PreviewRow[]; disclaimer?: string } | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -101,16 +102,16 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
     sizingMode,
     strategyBudgetUsd: budget,
     maxPositionUsd: maxTrade,
-    maxExposureUsd: maxExposure,
     maxOpenPositions,
     maxSlippageBps,
     minOrderUsd: minOrder,
     cooldownSeconds,
     copyBuy,
     copySell,
+    allowSubminimumPaperTrades,
     copyPercent,
     fixedAmountUsd,
-    multiplier,
+    pvrTradeMultiplier,
     monitoringEnabled: monitoring,
     accountOperatingMode: selectedAccount?.operating_mode,
   };
@@ -340,23 +341,50 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
 
         <h2 style={{ margin: "12px 0 0" }}>Copy sizing</h2>
         <select value={sizingMode} onChange={(e) => setSizingMode(e.target.value as SizingMode)}>
-          <option value="portfolio_ratio">Portfolio-relative (recommended)</option>
-          <option value="proportional">Proportional — % of each source trade</option>
-          <option value="fixed_amount">Fixed amount — same USD per copied trade</option>
-          <option value="multiplier">Multiplier — scale source notional</option>
+          {SIZING_MODE_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
         </select>
-        {sizingMode === "portfolio_ratio" && (
-          <p className="muted" style={{ margin: 0 }}>
-            Target order ≈ source notional × (your allocation ÷ source equity). Requires fresh partial+ source equity;
-            SELL exits are unchanged.
-          </p>
+        <p className="muted" style={{ margin: 0 }}>
+          {SIZING_MODE_OPTIONS.find((o) => o.value === sizingMode)?.hint}
+        </p>
+        {sizingMode === "position_value_ratio" && (
+          <>
+            <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+              Example: open-position value $4,000 · source $200 · allocation $2,000 → base ~$100; × multiplier 2 → ~$200.
+            </p>
+            <div className="form-field">
+              <SimpleFieldLabel htmlFor="wiz-pvr-mult">Множитель сделки (PVR)</SimpleFieldLabel>
+              <div className="filters" style={{ flexWrap: "wrap" }}>
+                {["0.5", "1", "2", "5", "10"].map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    className={pvrTradeMultiplier === p ? "" : "ghost"}
+                    onClick={() => setPvrTradeMultiplier(p)}
+                  >
+                    ×{p}
+                  </button>
+                ))}
+              </div>
+              <input
+                id="wiz-pvr-mult"
+                value={pvrTradeMultiplier}
+                onChange={(e) => setPvrTradeMultiplier(e.target.value)}
+                placeholder="1"
+              />
+              <p className="muted" style={{ margin: "4px 0 0", fontSize: 12 }}>
+                Умножает расчёт PVR после формулы (0.5 — меньше, 10 — больше). Не заменяет min/max order и лимиты
+                exposure.
+              </p>
+            </div>
+          </>
         )}
 
         {sizingMode === "proportional" && (
           <>
-            <p className="muted" style={{ margin: 0 }}>
-              Percent of each <strong>source trade notional</strong>, not % of wallet capital.
-            </p>
             <div className="filters" style={{ flexWrap: "wrap" }}>
               {COPY_PERCENT_PRESETS.map((p) => (
                 <button
@@ -379,20 +407,10 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
             placeholder="Fixed amount USD per trade"
           />
         )}
-        {sizingMode === "multiplier" && (
-          <input value={multiplier} onChange={(e) => setMultiplier(e.target.value)} placeholder="Multiplier (e.g. 1.5)" />
-        )}
-
         <h2 style={{ margin: "12px 0 0" }}>Risk limits</h2>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="wiz-max-position">Max position / per trade (USD)</SimpleFieldLabel>
           <input id="wiz-max-position" value={maxTrade} onChange={(e) => setMaxTrade(e.target.value)} />
-        </div>
-        <div className="form-field">
-          <SimpleFieldLabel htmlFor="wiz-max-exposure" optional>
-            Max exposure (USD)
-          </SimpleFieldLabel>
-          <input id="wiz-max-exposure" value={maxExposure} onChange={(e) => setMaxExposure(e.target.value)} />
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="wiz-max-positions">Max open positions</SimpleFieldLabel>
@@ -406,6 +424,19 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
           <SimpleFieldLabel htmlFor="wiz-min-order">Min order (USD)</SimpleFieldLabel>
           <input id="wiz-min-order" value={minOrder} onChange={(e) => setMinOrder(e.target.value)} />
         </div>
+        <label style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+          <input
+            type="checkbox"
+            checked={allowSubminimumPaperTrades}
+            onChange={(e) => setAllowSubminimumPaperTrades(e.target.checked)}
+          />
+          <span>
+            Копировать сделки меньше биржевого минимума
+            <span className="muted" style={{ display: "block", fontSize: 12, marginTop: 4 }}>
+              <strong>PAPER-only.</strong> Позволяет моделировать сделки ниже минимального размера Polymarket.
+            </span>
+          </span>
+        </label>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="wiz-cooldown">Cooldown (seconds)</SimpleFieldLabel>
           <input id="wiz-cooldown" value={cooldownSeconds} onChange={(e) => setCooldownSeconds(e.target.value)} />

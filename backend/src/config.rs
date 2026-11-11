@@ -50,6 +50,8 @@ pub struct Config {
     pub source_equity_max_age_seconds: i64,
     /// Minimum total equity before portfolio-relative BUY is allowed.
     pub source_equity_min_usd: rust_decimal::Decimal,
+    /// When false (default), PAPER rejects when the CLOB cannot fill within the copy limit.
+    pub paper_allow_synthetic_fills: bool,
 }
 
 impl Config {
@@ -119,6 +121,7 @@ impl Config {
             trusted_proxies_parsed,
             source_equity_max_age_seconds: var("SOURCE_EQUITY_MAX_AGE_SECONDS", "120").parse()?,
             source_equity_min_usd: var("SOURCE_EQUITY_MIN_USD", "1").parse()?,
+            paper_allow_synthetic_fills: var("PAPER_ALLOW_SYNTHETIC_FILLS", "false") == "true",
         })
         .and_then(|cfg| cfg.validate().map(|()| cfg))
     }

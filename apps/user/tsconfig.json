@@ -25,6 +25,9 @@
     "paths": {
       "@/*": [
         "./src/*"
+      ],
+      "@pom/format": [
+        "../../packages/format/src/numeric-input.ts"
       ]
     }
   },

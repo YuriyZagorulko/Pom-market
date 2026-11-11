@@ -50,6 +50,7 @@ async fn inject_trade() {
         confirm_live: false,
         default_fee_rate: rust_decimal::Decimal::ZERO,
         default_fee_exponent: 1,
+        paper_allow_synthetic_fills: false,
     };
 
     let size = env::var("INJECT_SIZE").unwrap_or_else(|_| "10".into());

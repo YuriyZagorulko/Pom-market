@@ -13,8 +13,10 @@ import {
   buildAccountRenameBody,
   buildAccountRiskPatchBody,
   buildCredentialsRotateBody,
+  buildPaperFundingRequest,
 } from "@/lib/account-forms";
 import type { SignatureTypeValue } from "@/lib/polymarket-account-hints";
+import { NumericInput } from "@/components/numeric-input";
 import { useSession } from "@/lib/session";
 
 export default function AccountPage() {
@@ -76,6 +78,21 @@ function Detail({ id }: { id: string }) {
     }
     try {
       await client.request(`/api/v1/accounts/${id}/risk`, { method: "PATCH", body: JSON.stringify(built.body) });
+      const funding = buildPaperFundingRequest(
+        data?.risk.paper_cash_usd ?? "0",
+        form,
+        `paper-fund-ui:${id}:${Date.now()}`,
+      );
+      if (!funding.ok) {
+        toast.error(funding.error);
+        return;
+      }
+      if (funding.body) {
+        await client.request(`/api/v1/accounts/${id}/capital/paper-funding`, {
+          method: "POST",
+          body: JSON.stringify(funding.body),
+        });
+      }
       toast.success("Account risk limits saved");
       reload();
     } catch (err) {
@@ -234,32 +251,23 @@ function Detail({ id }: { id: string }) {
       <form className="panel form-stack" onSubmit={risk}>
         <h2 style={{ margin: 0 }}>Account risk</h2>
         <p className="muted" style={{ margin: 0 }}>
-          Limits and paper cash for this trading account.
+          Limits patch here; paper cash changes apply as a funding delta (ledger), not a direct balance override.
         </p>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="max_order_usd">Max order (USD)</SimpleFieldLabel>
-          <input id="max_order_usd" name="max_order_usd" defaultValue={riskDefaults.max_order_usd} />
+          <NumericInput id="max_order_usd" name="max_order_usd" defaultValue={riskDefaults.max_order_usd} />
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="max_daily_loss_usd">Max daily loss (USD)</SimpleFieldLabel>
-          <input id="max_daily_loss_usd" name="max_daily_loss_usd" defaultValue={riskDefaults.max_daily_loss_usd} />
-        </div>
-        <div className="form-field">
-          <SimpleFieldLabel htmlFor="max_exposure_usd">Max exposure (USD)</SimpleFieldLabel>
-          <input id="max_exposure_usd" name="max_exposure_usd" defaultValue={riskDefaults.max_exposure_usd} />
+          <NumericInput id="max_daily_loss_usd" name="max_daily_loss_usd" defaultValue={riskDefaults.max_daily_loss_usd} />
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="max_slippage_bps">Max slippage (basis points)</SimpleFieldLabel>
-          <input
-            id="max_slippage_bps"
-            name="max_slippage_bps"
-            defaultValue={riskDefaults.max_slippage_bps}
-            inputMode="numeric"
-          />
+          <NumericInput id="max_slippage_bps" name="max_slippage_bps" defaultValue={riskDefaults.max_slippage_bps} inputMode="numeric" />
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="paper_cash_usd">Paper cash balance (USD)</SimpleFieldLabel>
-          <input id="paper_cash_usd" name="paper_cash_usd" defaultValue={riskDefaults.paper_cash_usd} />
+          <NumericInput id="paper_cash_usd" name="paper_cash_usd" defaultValue={riskDefaults.paper_cash_usd} />
         </div>
         <button type="submit">Save risk</button>
       </form>

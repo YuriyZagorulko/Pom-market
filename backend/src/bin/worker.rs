@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         confirm_live: cfg.confirm_live_trading,
         default_fee_rate: cfg.fee_rate,
         default_fee_exponent: cfg.fee_exponent,
+        paper_allow_synthetic_fills: cfg.paper_allow_synthetic_fills,
     };
     let vault = Vault::new(
         &cfg.encryption_master_key,

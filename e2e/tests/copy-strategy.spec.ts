@@ -133,7 +133,12 @@ test("copy strategy wizard, preview, paper copies, utilization, live rejected", 
   await user.waitForURL(/\/strategies\/[a-f0-9-]+/, { timeout: 15_000 });
   const strategyId = user.url().split("/").pop()!;
   await expect(user.getByRole("button", { name: "Overview" })).toBeVisible({ timeout: 15_000 });
-  await expect(user.getByText(/Partial equity/i).first()).toBeVisible({ timeout: 15_000 });
+  await expect(user.locator(".metric-grid").getByText("Strategy equity", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(
+    user.getByText(/Configured allocation \(not yet funded\)|Partial equity|Strategy equity \(available/i).first(),
+  ).toBeVisible({ timeout: 15_000 });
 
   user.once("dialog", (d) => d.accept());
   await user.getByRole("button", { name: /Enable strategy/ }).click();

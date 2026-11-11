@@ -10,6 +10,8 @@ pub enum SizingMode {
     Proportional,
     Multiplier,
     PortfolioRatio,
+    /// Leader open-position market value (Data API `/v2/value`), not wallet equity.
+    PositionValueRatio,
 }
 
 #[derive(Clone, Debug)]
@@ -22,12 +24,15 @@ pub struct SizingInput {
     pub max_order_usd: Decimal,
     pub min_order_usd: Decimal,
     pub strategy_remaining_usd: Decimal,
-    pub account_exposure_remaining_usd: Decimal,
     pub available_balance_usd: Decimal,
     /// Strategy capital allocated to this copy strategy (not whole account balance).
     pub strategy_allocated_capital_usd: Option<Decimal>,
     /// Observed source trader total equity for portfolio-relative sizing.
     pub source_trader_equity_usd: Option<Decimal>,
+    /// Leader aggregate open-position MTM for position_value_ratio (not wallet equity).
+    pub source_open_positions_value_usd: Option<Decimal>,
+    /// PAPER strategy opt-in: skip Polymarket exchange $1 floor in sizing caps (LIVE always strict).
+    pub allow_subminimum_paper_trades: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,11 +66,14 @@ pub enum RejectReason {
     ExchangeUnknown,
     FeeUnknown,
     SourceEquityUnavailable,
+    SourcePositionValueUnavailable,
+    SourcePositionValueStale,
+    SourcePositionValueZero,
     StrategyCapitalNotInitialized,
 }
 
 impl RejectReason {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::MissingSizing => "missing_sizing",
             Self::BelowMinimum => "below_minimum",
@@ -96,6 +104,9 @@ impl RejectReason {
             Self::ExchangeUnknown => "exchange_unknown",
             Self::FeeUnknown => "fee_unknown",
             Self::SourceEquityUnavailable => "source_equity_unavailable",
+            Self::SourcePositionValueUnavailable => "source_position_value_unavailable",
+            Self::SourcePositionValueStale => "source_position_value_stale",
+            Self::SourcePositionValueZero => "source_position_value_zero",
             Self::StrategyCapitalNotInitialized => "strategy_capital_not_initialized",
         }
     }
@@ -113,6 +124,18 @@ pub fn decision_reason_explain(code: &str) -> Option<(&'static str, &'static str
             "Source portfolio equity unknown",
             "Portfolio-relative sizing needs a fresh equity snapshot for the leader wallet.",
         ),
+        "source_position_value_unavailable" => (
+            "Leader open-position value unknown",
+            "Position Value Ratio needs a fresh open-position market value snapshot (Polymarket Data API /v2/value).",
+        ),
+        "source_position_value_stale" => (
+            "Leader open-position value stale",
+            "The open-position value snapshot is too old; wait for the worker to refresh it.",
+        ),
+        "source_position_value_zero" => (
+            "Leader has no open positions",
+            "Position Value Ratio needs a positive open-position market value; the leader portfolio reads as empty.",
+        ),
         "below_minimum" => (
             "Below minimum order size",
             "The computed copy size is below exchange or strategy minimums after caps.",
@@ -126,8 +149,8 @@ pub fn decision_reason_explain(code: &str) -> Option<(&'static str, &'static str
             "Available strategy cash or account balance is too low for this order.",
         ),
         "no_liquidity" => (
-            "No liquidity",
-            "The order book could not fill the target size within the limit price.",
+            "No liquidity within allowed price",
+            "The Polymarket CLOB has no depth at or inside your copy limit. Paper mode does not fill at the leader price unless PAPER_ALLOW_SYNTHETIC_FILLS is explicitly enabled.",
         ),
         "slippage_exceeded" => (
             "Slippage limit",
@@ -168,35 +191,58 @@ pub fn target_notional(input: &SizingInput) -> Result<Decimal, RejectReason> {
             }
             (input.source_notional * alloc / equity).round_dp(8)
         }
+        SizingMode::PositionValueRatio => {
+            let positions = input
+                .source_open_positions_value_usd
+                .filter(|v| *v > Decimal::ZERO)
+                .ok_or(RejectReason::SourcePositionValueUnavailable)?;
+            let alloc = input
+                .strategy_allocated_capital_usd
+                .filter(|v| *v > Decimal::ZERO)
+                .ok_or(RejectReason::MissingSizing)?;
+            if input.source_notional <= Decimal::ZERO {
+                return Err(RejectReason::BelowMinimum);
+            }
+            let base = input.source_notional * alloc / positions;
+            let coeff = input
+                .multiplier
+                .filter(|m| *m > Decimal::ZERO)
+                .unwrap_or(Decimal::ONE);
+            (base * coeff).round_dp(8)
+        }
     };
     if raw <= Decimal::ZERO {
         return Err(RejectReason::BelowMinimum);
     }
-    if input.available_balance_usd < input.min_order_usd.max(EXCHANGE_MIN_NOTIONAL) {
-        return Err(RejectReason::InsufficientBalance);
-    }
-    if input.strategy_remaining_usd < input.min_order_usd.max(EXCHANGE_MIN_NOTIONAL) {
-        return Err(RejectReason::StrategyBudget);
-    }
-    if input.account_exposure_remaining_usd < input.min_order_usd.max(EXCHANGE_MIN_NOTIONAL) {
-        return Err(RejectReason::ExposureCap);
+    let balance_floor = if input.allow_subminimum_paper_trades {
+        input.min_order_usd.max(Decimal::ZERO)
+    } else {
+        input.min_order_usd.max(EXCHANGE_MIN_NOTIONAL)
+    };
+  if balance_floor > Decimal::ZERO {
+        if input.available_balance_usd < balance_floor {
+            return Err(RejectReason::InsufficientBalance);
+        }
+        if input.strategy_remaining_usd < balance_floor {
+            return Err(RejectReason::StrategyBudget);
+        }
     }
     let capped = raw
         .min(input.max_order_usd)
         .min(input.strategy_remaining_usd)
-        .min(input.account_exposure_remaining_usd)
         .min(input.available_balance_usd)
         .round_dp_with_strategy(2, RoundingStrategy::ToZero);
-    let floor = input.min_order_usd.max(EXCHANGE_MIN_NOTIONAL);
-    if capped < floor {
+    let floor = if input.allow_subminimum_paper_trades {
+        input.min_order_usd.max(Decimal::ZERO)
+    } else {
+        input.min_order_usd.max(EXCHANGE_MIN_NOTIONAL)
+    };
+    if floor > Decimal::ZERO && capped < floor {
         if raw > input.available_balance_usd {
             return Err(RejectReason::InsufficientBalance);
         }
         if raw > input.strategy_remaining_usd {
             return Err(RejectReason::StrategyBudget);
-        }
-        if raw > input.account_exposure_remaining_usd {
-            return Err(RejectReason::ExposureCap);
         }
         return Err(RejectReason::BelowMinimum);
     }
@@ -492,7 +538,334 @@ impl OrderBook {
     }
 }
 
+/// How a PAPER copy order was simulated against liquidity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperExecutionMode {
+    /// Walked the live CLOB snapshot within the copy limit price.
+    Clob,
+    /// Synthetic depth at the leader trade price (no CLOB depth within limit).
+    SyntheticSourcePrice,
+}
+
+impl PaperExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clob => "clob",
+            Self::SyntheticSourcePrice => "synthetic_source_price",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PaperFillContext {
+    pub source_price: Decimal,
+    pub copy_limit_price: Decimal,
+    pub book_available: bool,
+  /// `clob_only` or `synthetic_experimental` when a fill is produced.
+    pub simulation_policy: &'static str,
+    /// True for PAPER micro/synthetic fills that are not CLOB-executable on Polymarket.
+    #[serde(default)]
+    pub paper_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_reason: Option<String>,
+    /// Best opposite-side level on the CLOB (may be outside the copy limit).
+    pub best_clob_price: Option<Decimal>,
+    /// Best level on the CLOB within the copy limit (buy: ask ≤ limit).
+    pub best_clob_price_within_limit: Option<Decimal>,
+    pub clob_liquidity_shares_within_limit: Option<Decimal>,
+    pub execution_price: Decimal,
+    /// Leader/source vs best CLOB (absolute bps) when the book was readable.
+    pub leader_vs_best_clob_bps: Option<i32>,
+    /// `(best_clob_price − execution) / execution` in bps for the actual fill VWAP.
+    pub deviation_from_best_clob_bps: Option<i32>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
+pub struct CopyFillSim {
+    pub fill: SimulatedFill,
+    pub paper_execution_mode: PaperExecutionMode,
+    pub context: PaperFillContext,
+}
+
+pub fn clob_book_insight(
+    book: &OrderBook,
+    side_buy: bool,
+    limit: Decimal,
+) -> (Option<Decimal>, Option<Decimal>, Decimal) {
+    let levels: Vec<&BookLevel> = if side_buy {
+        book.asks.iter().collect()
+    } else {
+        book.bids.iter().collect()
+    };
+    let best_any = levels.first().map(|l| l.price);
+    let within: Vec<&BookLevel> = if side_buy {
+        book.asks
+            .iter()
+            .filter(|l| l.price <= limit && l.price > Decimal::ZERO)
+            .collect()
+    } else {
+        book.bids
+            .iter()
+            .filter(|l| l.price >= limit && l.price > Decimal::ZERO)
+            .collect()
+    };
+    let best_within = within.first().map(|l| l.price);
+    let liq = within.iter().fold(Decimal::ZERO, |sum, l| sum + l.size);
+    (best_any, best_within, liq)
+}
+
+fn deviation_from_clob_bps(best_clob: Decimal, execution: Decimal) -> Option<i32> {
+    if best_clob <= Decimal::ZERO || execution <= Decimal::ZERO {
+        return None;
+    }
+    Some(slippage_bps(execution, best_clob))
+}
+
+pub fn paper_clob_diagnostic(
+    book: &Result<OrderBook, String>,
+    side_buy: bool,
+    source_price: Decimal,
+    limit: Decimal,
+) -> PaperFillContext {
+    let book_available = book.is_ok();
+    let (best_any, best_within, liq) = book
+        .as_ref()
+        .map(|b| clob_book_insight(b, side_buy, limit))
+        .unwrap_or((None, None, Decimal::ZERO));
+    let leader_gap = best_any.map(|b| slippage_bps(source_price, b));
+    PaperFillContext {
+        source_price,
+        copy_limit_price: limit,
+        book_available,
+        simulation_policy: "clob_only",
+        best_clob_price: best_any,
+        best_clob_price_within_limit: best_within,
+        clob_liquidity_shares_within_limit: if book_available {
+            Some(liq)
+        } else {
+            None
+        },
+        execution_price: Decimal::ZERO,
+        leader_vs_best_clob_bps: leader_gap,
+        deviation_from_best_clob_bps: None,
+        paper_only: false,
+        execution_reason: None,
+    }
+}
+
+fn context_from_fill(
+    book: &Result<OrderBook, String>,
+    side_buy: bool,
+    source_price: Decimal,
+    limit: Decimal,
+    fill: &SimulatedFill,
+    policy: &'static str,
+) -> PaperFillContext {
+    let mut ctx = paper_clob_diagnostic(book, side_buy, source_price, limit);
+    ctx.simulation_policy = policy;
+    ctx.execution_price = fill.vwap;
+    ctx.deviation_from_best_clob_bps = ctx
+        .best_clob_price
+        .and_then(|b| deviation_from_clob_bps(b, fill.vwap));
+    ctx
+}
+
+/// Returns true when leader price is too far from the best visible CLOB quote to allow PAPER copy.
+pub fn clob_market_gap_exceeds(source_price: Decimal, best_clob: Decimal, max_gap_bps: i32) -> bool {
+    if source_price <= Decimal::ZERO || best_clob <= Decimal::ZERO {
+        return false;
+    }
+    slippage_bps(source_price, best_clob) > max_gap_bps
+}
+
+/// PAPER simulation only: fills at the leader's trade price when the live book has no depth
+/// within the copy limit (typical after the leader's fill moves the market).
+pub fn paper_synthetic_fill_book(
+    side_buy: bool,
+    source_price: Decimal,
+    depth_shares: Decimal,
+    tick: Decimal,
+) -> OrderBook {
+    let price = if source_price > Decimal::ZERO {
+        source_price
+    } else {
+        Decimal::new(50, 2)
+    };
+    let size = depth_shares.max(Decimal::from(1_000_000));
+    let level = BookLevel { price, size };
+    OrderBook {
+        bids: if side_buy { vec![] } else { vec![level.clone()] },
+        asks: if side_buy { vec![level] } else { vec![] },
+        tick: if tick > Decimal::ZERO {
+            tick
+        } else {
+            Decimal::new(1, 2)
+        },
+        min_order_size: Decimal::ZERO,
+    }
+    .normalized()
+}
+
+/// Shares for a PAPER copy from sized notional (2-decimal SDK lot).
+pub fn paper_shares_from_notional(notional_usd: Decimal, source_price: Decimal) -> Decimal {
+    if notional_usd <= Decimal::ZERO || source_price <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    truncate_lot(notional_usd / source_price)
+}
+
+pub fn paper_qualifies_for_clob_walk(
+    shares: Decimal,
+    limit: Decimal,
+    market_min_shares: Decimal,
+) -> bool {
+    if shares <= Decimal::ZERO || limit <= Decimal::ZERO {
+        return false;
+    }
+    shares >= market_min_shares.max(Decimal::ZERO) && shares * limit >= EXCHANGE_MIN_NOTIONAL
+}
+
+pub fn paper_fill_at_leader_price(
+    shares: Decimal,
+    source_price: Decimal,
+    fee: Option<&FeeSchedule>,
+) -> Result<SimulatedFill, RejectReason> {
+    let shares = truncate_lot(shares);
+    if shares <= Decimal::ZERO || source_price <= Decimal::ZERO {
+        return Err(RejectReason::BelowMinimum);
+    }
+    let notional = (shares * source_price).round_dp(8);
+    let assessment = match fee {
+        Some(schedule) => taker_fee(shares, source_price, schedule),
+        None => FeeAssessment::unknown(),
+    };
+    Ok(SimulatedFill {
+        shares,
+        notional,
+        vwap: source_price,
+        fee_usd: assessment.amount,
+        fee_status: assessment.status,
+        complete: true,
+    })
+}
+
+/// PAPER: CLOB when size is exchange-qualified; otherwise synthetic at leader price (micro copy).
+pub fn simulate_paper_copy_fill(
+    book: &Result<OrderBook, String>,
+    side_buy: bool,
+    source_price: Decimal,
+    limit: Decimal,
+    target_shares: Decimal,
+    target_notional_usd: Decimal,
+    market_min_shares: Decimal,
+    fee: Option<&FeeSchedule>,
+) -> Result<CopyFillSim, RejectReason> {
+    let shares = if target_shares > Decimal::ZERO {
+        target_shares
+    } else {
+        paper_shares_from_notional(target_notional_usd, source_price)
+    };
+    if shares <= Decimal::ZERO {
+        return Err(RejectReason::BelowMinimum);
+    }
+
+    let mode_clob = |fill: SimulatedFill| CopyFillSim {
+        paper_execution_mode: PaperExecutionMode::Clob,
+        context: context_from_fill(book, side_buy, source_price, limit, &fill, "clob"),
+        fill,
+    };
+
+    if paper_qualifies_for_clob_walk(shares, limit, market_min_shares) {
+        if let Ok(b) = book {
+            if let Ok(fill) = walk_book(b, side_buy, limit, shares, fee, true) {
+                return Ok(mode_clob(fill));
+            }
+        }
+    }
+
+    let fill = paper_fill_at_leader_price(shares, source_price, fee)?;
+    let reason = if paper_qualifies_for_clob_walk(shares, limit, market_min_shares) {
+        "clob_unavailable".to_string()
+    } else {
+        "below_exchange_minimum".to_string()
+    };
+    let mut ctx = paper_clob_diagnostic(book, side_buy, source_price, limit);
+    ctx.simulation_policy = "paper_micro_synthetic";
+    ctx.paper_only = true;
+    ctx.execution_reason = Some(reason);
+    ctx.execution_price = fill.vwap;
+    ctx.deviation_from_best_clob_bps = ctx
+        .best_clob_price
+        .and_then(|b| deviation_from_clob_bps(b, fill.vwap));
+    Ok(CopyFillSim {
+        paper_execution_mode: PaperExecutionMode::SyntheticSourcePrice,
+        context: ctx,
+        fill,
+    })
+}
+
+/// LIVE: strict CLOB walk. PAPER: micro sizing + synthetic leader-price fill when needed.
+pub fn simulate_copy_fill(
+    book: &Result<OrderBook, String>,
+    paper_trading: bool,
+    allow_subminimum_paper_trades: bool,
+    _allow_synthetic_experimental: bool,
+    _max_clob_gap_bps: i32,
+    side_buy: bool,
+    source_price: Decimal,
+    limit: Decimal,
+    target_shares: Decimal,
+    target_notional_usd: Decimal,
+    market_min_shares: Decimal,
+    fee: Option<&FeeSchedule>,
+) -> Result<CopyFillSim, RejectReason> {
+    if paper_trading {
+        if allow_subminimum_paper_trades {
+            return simulate_paper_copy_fill(
+                book,
+                side_buy,
+                source_price,
+                limit,
+                target_shares,
+                target_notional_usd,
+                market_min_shares,
+                fee,
+            );
+        }
+        let shares = if target_shares > Decimal::ZERO {
+            target_shares
+        } else {
+            paper_shares_from_notional(target_notional_usd, source_price)
+        };
+        if shares <= Decimal::ZERO {
+            return Err(RejectReason::BelowMinimum);
+        }
+        if !paper_qualifies_for_clob_walk(shares, limit, market_min_shares) {
+            return Err(RejectReason::BelowMinimum);
+        }
+        let mode_clob = |fill: SimulatedFill| CopyFillSim {
+            paper_execution_mode: PaperExecutionMode::Clob,
+            context: context_from_fill(book, side_buy, source_price, limit, &fill, "paper_clob_strict"),
+            fill,
+        };
+        return match book {
+            Ok(b) => walk_book(b, side_buy, limit, shares, fee, true).map(mode_clob),
+            Err(_) => Err(RejectReason::NoLiquidity),
+        };
+    }
+    let mode_clob = |fill: SimulatedFill| CopyFillSim {
+        paper_execution_mode: PaperExecutionMode::Clob,
+        context: context_from_fill(book, side_buy, source_price, limit, &fill, "live_clob"),
+        fill,
+    };
+    match book {
+        Ok(b) => walk_book(b, side_buy, limit, target_shares, fee, true).map(mode_clob),
+        Err(_) => Err(RejectReason::NoLiquidity),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SimulatedFill {
     pub shares: Decimal,
     pub notional: Decimal,
@@ -508,6 +881,7 @@ pub fn walk_book(
     limit: Decimal,
     want_shares: Decimal,
     schedule: Option<&FeeSchedule>,
+    enforce_exchange_minimums: bool,
 ) -> Result<SimulatedFill, RejectReason> {
     if want_shares <= Decimal::ZERO {
         return Err(RejectReason::BelowMinimum);
@@ -542,7 +916,10 @@ pub fn walk_book(
         notional += (snapped * level.price).round_dp(2);
         left -= snapped;
     }
-    if shares <= Decimal::ZERO || notional < EXCHANGE_MIN_NOTIONAL {
+    if shares <= Decimal::ZERO {
+        return Err(RejectReason::NoLiquidity);
+    }
+    if enforce_exchange_minimums && notional < EXCHANGE_MIN_NOTIONAL {
         return Err(RejectReason::NoLiquidity);
     }
     let vwap = (notional / shares).round_dp(6);
@@ -644,6 +1021,7 @@ pub fn plan_exit(
     pending_exit_shares: Decimal,
     reference_price: Decimal,
     min_notional: Decimal,
+    allow_subminimum_paper_trades: bool,
 ) -> ExitPlan {
     if open_shares <= Decimal::ZERO || source_observed_shares <= Decimal::ZERO {
         return ExitPlan {
@@ -664,7 +1042,12 @@ pub fn plan_exit(
             reject: Some(RejectReason::BelowMinimum),
         };
     }
-    if notional < min_notional.max(EXCHANGE_MIN_NOTIONAL) {
+    let floor = if allow_subminimum_paper_trades {
+        min_notional.max(Decimal::ZERO)
+    } else {
+        min_notional.max(EXCHANGE_MIN_NOTIONAL)
+    };
+    if floor > Decimal::ZERO && notional < floor {
         return ExitPlan {
             shares: Decimal::ZERO,
             pending_exit_shares: pending_exit_shares + desired.min(open_shares),
@@ -787,10 +1170,11 @@ mod tests {
             max_order_usd: d("250"),
             min_order_usd: d("1"),
             strategy_remaining_usd: d("40"),
-            account_exposure_remaining_usd: d("1000"),
             available_balance_usd: d("1000"),
             strategy_allocated_capital_usd: None,
             source_trader_equity_usd: None,
+            source_open_positions_value_usd: None,
+            allow_subminimum_paper_trades: false,
         };
         assert_eq!(target_notional(&input).unwrap(), d("40"));
         input.strategy_remaining_usd = d("100");
@@ -814,10 +1198,11 @@ mod tests {
             max_order_usd: d("100"),
             min_order_usd: d("1"),
             strategy_remaining_usd: d("100"),
-            account_exposure_remaining_usd: d("100"),
             available_balance_usd: d("100"),
             strategy_allocated_capital_usd: None,
             source_trader_equity_usd: None,
+            source_open_positions_value_usd: None,
+            allow_subminimum_paper_trades: false,
         };
         assert_eq!(target_notional(&proportional).unwrap(), d("20"));
         let mult = SizingInput {
@@ -841,12 +1226,33 @@ mod tests {
             max_order_usd: d("10000"),
             min_order_usd: d("1"),
             strategy_remaining_usd: d("2000"),
-            account_exposure_remaining_usd: d("10000"),
             available_balance_usd: d("10000"),
             strategy_allocated_capital_usd: Some(d("2000")),
             source_trader_equity_usd: Some(d("20000")),
+            source_open_positions_value_usd: None,
+            allow_subminimum_paper_trades: false,
         };
         assert_eq!(target_notional(&input).unwrap(), d("400"));
+    }
+
+    #[test]
+    fn position_value_ratio_scales_by_allocation_over_open_positions() {
+        let input = SizingInput {
+            mode: SizingMode::PositionValueRatio,
+            fixed_amount_usd: None,
+            proportion: None,
+            multiplier: None,
+            source_notional: d("200"),
+            max_order_usd: d("10000"),
+            min_order_usd: d("1"),
+            strategy_remaining_usd: d("2000"),
+            available_balance_usd: d("10000"),
+            strategy_allocated_capital_usd: Some(d("2000")),
+            source_trader_equity_usd: None,
+            source_open_positions_value_usd: Some(d("4000")),
+            allow_subminimum_paper_trades: false,
+        };
+        assert_eq!(target_notional(&input).unwrap(), d("100"));
     }
 
     #[test]
@@ -880,19 +1286,19 @@ mod tests {
             min_order_size: Decimal::ZERO,
         }
         .normalized();
-        let fill = walk_book(&book, true, d("0.50"), d("20"), None).unwrap();
+        let fill = walk_book(&book, true, d("0.50"), d("20"), None, true).unwrap();
         assert_eq!(fill.shares, d("4"));
         assert!(!fill.complete);
-        assert!(walk_book(&book, true, d("0.40"), d("5"), None).is_err());
+        assert!(walk_book(&book, true, d("0.40"), d("5"), None, true).is_err());
         assert_eq!(fill.fee_status, "unknown");
     }
 
     #[test]
     fn exit_never_sells_more_than_open_and_parks_dust() {
-        let dust = plan_exit(d("10"), d("10"), d("0.1"), d("0"), d("0.40"), d("1"));
+        let dust = plan_exit(d("10"), d("10"), d("0.1"), d("0"), d("0.40"), d("1"), false);
         assert_eq!(dust.reject, Some(RejectReason::BelowMinimum));
         assert!(dust.pending_exit_shares > Decimal::ZERO);
-        let full = plan_exit(d("10"), d("8"), d("4"), d("0"), d("0.50"), d("1")).unwrap_shares();
+        let full = plan_exit(d("10"), d("8"), d("4"), d("0"), d("0.50"), d("1"), false).unwrap_shares();
         assert!(full <= d("10"));
     }
 
@@ -945,6 +1351,7 @@ mod tests {
             Decimal::ZERO,
             d("0.4"),
             d("1"),
+            false,
         );
         assert_eq!(plan.reject, Some(RejectReason::NoPosition));
         assert_eq!(plan.shares, Decimal::ZERO);
@@ -1227,6 +1634,278 @@ mod tests {
         let a = dedup_key("0xABC", "0xAa", "1", "BUY");
         let b = dedup_key("0xabc", "0xaa", "1", "buy");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn paper_sim_uses_source_price_when_clob_asks_above_limit() {
+        let thin = OrderBook {
+            bids: vec![],
+            asks: vec![BookLevel {
+                price: d("0.93"),
+                size: d("1000"),
+            }],
+            tick: d("0.01"),
+            min_order_size: Decimal::ZERO,
+        };
+        let book = Ok(thin);
+        let fee = FeeSchedule {
+            fees_enabled: false,
+            rate: Decimal::ZERO,
+            exponent: 1,
+            taker_only: true,
+            rebate_rate: None,
+            source: "test".into(),
+        };
+        assert_eq!(
+            walk_book(&book.as_ref().unwrap(), true, d("0.59"), d("17"), Some(&fee), true),
+            Err(RejectReason::NoLiquidity)
+        );
+        let syn = simulate_copy_fill(
+            &book,
+            true,
+            true,
+            false,
+            10_000,
+            true,
+            d("0.5841943"),
+            d("0.59"),
+            d("17"),
+            d("9.93"),
+            Decimal::ZERO,
+            Some(&fee),
+        )
+        .expect("paper synthetic when CLOB empty within limit");
+        assert_eq!(
+            syn.paper_execution_mode,
+            PaperExecutionMode::SyntheticSourcePrice
+        );
+        assert!(syn.context.paper_only);
+    }
+
+    #[test]
+    fn paper_clob_fill_when_liquidity_within_limit() {
+        let book = Ok(OrderBook {
+            bids: vec![],
+            asks: vec![BookLevel {
+                price: d("0.55"),
+                size: d("1000"),
+            }],
+            tick: d("0.01"),
+            min_order_size: Decimal::ZERO,
+        });
+        let fee = FeeSchedule {
+            fees_enabled: false,
+            rate: Decimal::ZERO,
+            exponent: 1,
+            taker_only: true,
+            rebate_rate: None,
+            source: "test".into(),
+        };
+        let sim = simulate_copy_fill(
+            &book,
+            true,
+            false,
+            false,
+            500,
+            true,
+            d("0.54"),
+            d("0.55"),
+            d("10"),
+            d("5.5"),
+            Decimal::ZERO,
+            Some(&fee),
+        )
+        .unwrap();
+        assert_eq!(sim.paper_execution_mode, PaperExecutionMode::Clob);
+        assert_eq!(sim.fill.shares, d("10"));
+    }
+
+    #[test]
+    fn synthetic_fill_respects_max_slippage_vs_source() {
+        let source = d("0.50");
+        let limit = d("0.50");
+        let synthetic = paper_synthetic_fill_book(true, source, d("10"), d("0.01"));
+        let fill = walk_book(&synthetic, true, limit, d("10"), None, false).unwrap();
+        assert!(slippage_bps(source, fill.vwap) <= 0);
+    }
+
+    #[test]
+    fn paper_book_unavailable_uses_leader_price_synthetic() {
+        let book: Result<OrderBook, String> = Err("unavailable".into());
+        let fee = FeeSchedule {
+            fees_enabled: false,
+            rate: Decimal::ZERO,
+            exponent: 1,
+            taker_only: true,
+            rebate_rate: None,
+            source: "test".into(),
+        };
+        let sim = simulate_copy_fill(
+            &book,
+            true,
+            true,
+            false,
+            500,
+            true,
+            d("0.5"),
+            d("0.55"),
+            d("10"),
+            d("5"),
+            Decimal::ZERO,
+            Some(&fee),
+        )
+        .expect("synthetic without book");
+        assert_eq!(
+            sim.paper_execution_mode,
+            PaperExecutionMode::SyntheticSourcePrice
+        );
+        assert_eq!(sim.fill.vwap, d("0.5"));
+    }
+
+    #[test]
+    fn paper_micro_buy_sub_dollar_notional() {
+        let book: Result<OrderBook, String> = Err("unavailable".into());
+        let fee = FeeSchedule {
+            fees_enabled: false,
+            rate: Decimal::ZERO,
+            exponent: 1,
+            taker_only: true,
+            rebate_rate: None,
+            source: "test".into(),
+        };
+        for (notional, price) in [(d("0.50"), d("0.08")), (d("0.10"), d("0.05")), (d("0.01"), d("0.01"))]
+        {
+            let shares = paper_shares_from_notional(notional, price);
+            assert!(shares > Decimal::ZERO);
+            let sim = simulate_copy_fill(
+                &book,
+                true,
+                true,
+                false,
+                500,
+                true,
+                price,
+                price,
+                shares,
+                notional,
+                d("5"),
+                Some(&fee),
+            )
+            .expect("micro paper buy");
+            assert_eq!(sim.fill.notional, notional);
+            assert_eq!(
+                sim.paper_execution_mode,
+                PaperExecutionMode::SyntheticSourcePrice
+            );
+        }
+    }
+
+    #[test]
+    fn paper_without_subminimum_flag_rejects_micro_fill() {
+        let book: Result<OrderBook, String> = Err("unavailable".into());
+        let fee = FeeSchedule {
+            fees_enabled: false,
+            rate: Decimal::ZERO,
+            exponent: 1,
+            taker_only: true,
+            rebate_rate: None,
+            source: "test".into(),
+        };
+        assert_eq!(
+            simulate_copy_fill(
+                &book,
+                true,
+                false,
+                false,
+                500,
+                true,
+                d("0.08"),
+                d("0.08"),
+                d("6.25"),
+                d("0.50"),
+                d("5"),
+                Some(&fee),
+            ),
+            Err(RejectReason::BelowMinimum)
+        );
+    }
+
+    #[test]
+    fn live_still_enforces_exchange_minimum() {
+        let book = Ok(OrderBook {
+            bids: vec![],
+            asks: vec![BookLevel {
+                price: d("0.08"),
+                size: d("100"),
+            }],
+            tick: d("0.01"),
+            min_order_size: d("5"),
+        });
+        let fee = FeeSchedule {
+            fees_enabled: false,
+            rate: Decimal::ZERO,
+            exponent: 1,
+            taker_only: true,
+            rebate_rate: None,
+            source: "test".into(),
+        };
+        assert_eq!(
+            simulate_copy_fill(
+                &book,
+                false,
+                false,
+                false,
+                500,
+                true,
+                d("0.08"),
+                d("0.08"),
+                d("2.5"),
+                d("0.20"),
+                d("5"),
+                Some(&fee),
+            ),
+            Err(RejectReason::NoLiquidity)
+        );
+    }
+
+    #[test]
+    fn clob_gap_guard_blocks_sell_direction() {
+        let book = Ok(OrderBook {
+            bids: vec![BookLevel {
+                price: d("0.40"),
+                size: d("1000"),
+            }],
+            asks: vec![],
+            tick: d("0.01"),
+            min_order_size: Decimal::ZERO,
+        });
+        let fee = FeeSchedule {
+            fees_enabled: false,
+            rate: Decimal::ZERO,
+            exponent: 1,
+            taker_only: true,
+            rebate_rate: None,
+            source: "test".into(),
+        };
+        let sim = simulate_copy_fill(
+            &book,
+            true,
+            true,
+            false,
+            100,
+            false,
+            d("0.50"),
+            d("0.45"),
+            d("10"),
+            d("5"),
+            Decimal::ZERO,
+            Some(&fee),
+        )
+        .expect("paper sell synthetic when bids below limit");
+        assert_eq!(
+            sim.paper_execution_mode,
+            PaperExecutionMode::SyntheticSourcePrice
+        );
     }
 
     impl ExitPlan {

@@ -5,12 +5,14 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::copy_sizing::{capped_copy_notional, BuyNotionalLimits, StrategyModeParams};
+use crate::copy_sizing::{capped_copy_notional, raw_copy_notional, BuyNotionalLimits, StrategyModeParams};
 use crate::db::begin_as;
 use crate::engine::{
-    available_after_reserve, conservative_fee_price, limit_price, order_reserves, plan_exit,
-    reconcile_live_status, reserves_after_execution, slippage_bps, trace_buy_size, truncate_lot,
-    walk_book, FeeSchedule, OrderBook, RejectReason, RemoteObservation, EXCHANGE_MIN_NOTIONAL,
+    available_after_reserve, conservative_fee_price, limit_price, order_reserves, paper_clob_diagnostic,
+    paper_shares_from_notional, plan_exit, reconcile_live_status, reserves_after_execution,
+    simulate_copy_fill, slippage_bps,
+    trace_buy_size, truncate_lot, walk_book, FeeSchedule, OrderBook, RejectReason,
+    RemoteObservation, EXCHANGE_MIN_NOTIONAL,
 };
 use crate::polymarket::live::{place_fak, LiveOrderRequest};
 use crate::polymarket::RawTrade;
@@ -31,6 +33,7 @@ pub struct PipelineConfig {
     pub confirm_live: bool,
     pub default_fee_rate: Decimal,
     pub default_fee_exponent: u32,
+    pub paper_allow_synthetic_fills: bool,
 }
 
 pub async fn ingest(pool: &PgPool, trade: &RawTrade) -> anyhow::Result<IngestOutcome> {
@@ -180,6 +183,7 @@ pub async fn process_event(
                 s.allocation_mode, s.allocation_percent,
                 s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd, s.max_position_usd,
                 s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
+                s.allow_subminimum_paper_trades,
                 s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets, s.created_at,
                 a.operating_mode, a.emergency_stop, a.trading_control_state, a.live_confirmed_at, a.signature_type, a.funder_address,
                 a.last_exchange_balance_usd, a.status AS account_status,
@@ -433,6 +437,8 @@ async fn decide_one(
     let mut target_shares = Decimal::ZERO;
     let mut target_notional_usd = Decimal::ZERO;
     let mut size_trace: Option<crate::engine::SizeTrace> = None;
+    let mut sizing_audit: Option<Value> = None;
+    let mut position_value_observed_at: Option<DateTime<Utc>> = None;
     if reason.is_none() && side_buy {
         if open_positions >= strategy.max_open_positions as i64 {
             let existing_token: i64 = sqlx::query_scalar(
@@ -450,6 +456,7 @@ async fn decide_one(
         }
         let mut portfolio_equity: Option<Decimal> = None;
         let mut portfolio_equity_status = None;
+        let mut open_positions_value: Option<Decimal> = None;
         if reason.is_none() && strategy.sizing_mode == "portfolio_ratio" {
             let mut snap =
                 crate::source_equity::load_snapshot(pool, strategy.source_trader_id, app_cfg)
@@ -477,6 +484,36 @@ async fn decide_one(
                 _ => reason = Some(RejectReason::SourceEquityUnavailable),
             }
         }
+        if reason.is_none() && strategy.sizing_mode == "position_value_ratio" {
+            let mut snap =
+                crate::source_equity::load_snapshot(pool, strategy.source_trader_id, app_cfg)
+                    .await?;
+            if snap
+                .as_ref()
+                .map(crate::source_equity::snapshot_needs_position_value_refresh)
+                .unwrap_or(true)
+            {
+                let live = crate::source_equity::fetch_live_equity(
+                    data,
+                    app_cfg,
+                    &strategy.wallet_address,
+                )
+                .await;
+                crate::source_equity::upsert_snapshot(pool, strategy.source_trader_id, &live)
+                    .await?;
+                snap = Some(live);
+            }
+            match snap.as_ref() {
+                Some(s) => {
+                    position_value_observed_at = Some(s.observed_at);
+                    match crate::source_equity::position_value_for_sizing(s) {
+                        Ok(pv) => open_positions_value = Some(pv),
+                        Err(r) => reason = Some(r),
+                    }
+                }
+                None => reason = Some(RejectReason::SourcePositionValueUnavailable),
+            }
+        }
         if reason.is_none() {
             let mode_params = StrategyModeParams {
                 sizing_mode: strategy.sizing_mode.clone(),
@@ -486,22 +523,52 @@ async fn decide_one(
                 strategy_allocated_capital_usd: effective_budget,
                 source_trader_equity_usd: portfolio_equity,
                 source_equity_status: portfolio_equity_status,
+                source_open_positions_value_usd: open_positions_value,
             };
+            let paper_mode = strategy.operating_mode == "paper_trading";
+            let allow_subminimum =
+                paper_mode && strategy.allow_subminimum_paper_trades;
             let limits = BuyNotionalLimits {
                 max_order_usd: strategy.max_order_usd,
                 max_position_usd: strategy.max_position_usd,
                 min_order_usd: strategy.min_order_usd,
                 strategy_remaining_usd: (effective_budget - strategy_exposure).max(Decimal::ZERO),
-                account_exposure_remaining_usd: (strategy
-                    .account_max_exposure
-                    .min(strategy.max_exposure_usd)
-                    - exposure)
-                    .max(Decimal::ZERO),
                 available_balance_usd: available,
+                allow_subminimum_paper_trades: allow_subminimum,
             };
+            let market_min_shares = book
+                .as_ref()
+                .map(|b| b.min_order_size)
+                .unwrap_or(Decimal::ZERO);
+            let raw_target = raw_copy_notional(&mode_params, event.notional_usd).ok();
             match capped_copy_notional(&mode_params, event.notional_usd, &limits) {
                 Ok(notional) => {
                     target_notional_usd = notional;
+                    sizing_audit = Some(json!({
+                        "sizing_mode": strategy.sizing_mode,
+                        "source_notional_usd": event.notional_usd,
+                        "strategy_allocated_capital_usd": effective_budget,
+                        "open_positions_value_usd": open_positions_value,
+                        "open_positions_value_observed_at": position_value_observed_at,
+                        "portfolio_equity_usd": portfolio_equity,
+                        "raw_target_notional_usd": raw_target,
+                        "capped_target_notional_usd": notional,
+                        "estimated_shares": null,
+                        "execution_mode": if paper_mode { "paper" } else { "live" },
+                        "allow_subminimum_paper_trades": strategy.allow_subminimum_paper_trades,
+                        "pvr_trade_multiplier": strategy
+                            .multiplier
+                            .filter(|m| *m > Decimal::ZERO)
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| "1".into()),
+                        "exchange_min_notional_usd": EXCHANGE_MIN_NOTIONAL,
+                        "market_min_shares": market_min_shares,
+                        "max_order_usd": strategy.max_order_usd,
+                        "max_position_usd": strategy.max_position_usd,
+                        "min_order_usd": strategy.min_order_usd,
+                        "strategy_remaining_usd": limits.strategy_remaining_usd,
+                        "available_balance_usd": limits.available_balance_usd,
+                    }));
                     let (min_order_size, liquidity) = match &book {
                         Ok(book) => (
                             book.min_order_size,
@@ -512,9 +579,6 @@ async fn decide_one(
                         Err(_) => (Decimal::ZERO, Decimal::MAX),
                     };
                     let spend_cap = (effective_budget - strategy_exposure)
-                        .min(
-                            strategy.account_max_exposure.min(strategy.max_exposure_usd) - exposure,
-                        )
                         .min(strategy.max_order_usd)
                         .min(available)
                         .max(Decimal::ZERO);
@@ -529,21 +593,68 @@ async fn decide_one(
                         fee,
                         fee_price,
                     );
-                    target_shares = trace.sdk_normalized_shares;
+                    if allow_subminimum {
+                        target_shares = if trace.sdk_normalized_shares > Decimal::ZERO {
+                            trace.sdk_normalized_shares
+                        } else {
+                            paper_shares_from_notional(notional, event.price)
+                        };
+                    } else {
+                        target_shares = trace.sdk_normalized_shares;
+                    }
+                    if let Some(audit) = sizing_audit.as_mut() {
+                        if let Some(obj) = audit.as_object_mut() {
+                            obj.insert(
+                                "estimated_shares".into(),
+                                json!(target_shares.to_string()),
+                            );
+                        }
+                    }
                     if trace.fee_unknown {
                         reason = Some(RejectReason::FeeUnknown);
-                    } else if trace.below_min_order_size
-                        || target_shares * limit < EXCHANGE_MIN_NOTIONAL
+                    } else if (!paper_mode || !allow_subminimum)
+                        && (trace.below_min_order_size
+                            || target_shares * limit < EXCHANGE_MIN_NOTIONAL)
                     {
                         reason = Some(if spend_cap < notional {
                             RejectReason::StrategyBudget
                         } else {
                             RejectReason::BelowMinimum
                         });
+                    } else if paper_mode && target_shares <= Decimal::ZERO {
+                        reason = Some(RejectReason::BelowMinimum);
+                    } else if paper_mode {
+                        let (pos_r, fee_r) =
+                            order_reserves(true, limit, target_shares, fee_price, fee);
+                        if pos_r + fee_r > spend_cap {
+                            reason = Some(RejectReason::StrategyBudget);
+                        }
                     }
                     size_trace = Some(trace);
                 }
-                Err(err) => reason = Some(err),
+                Err(err) => {
+                    if let Some(raw) = raw_target {
+                        target_notional_usd = raw.round_dp(2);
+                        sizing_audit = sizing_audit.or_else(|| {
+                            Some(json!({
+                                "sizing_mode": strategy.sizing_mode,
+                                "source_notional_usd": event.notional_usd,
+                                "strategy_allocated_capital_usd": effective_budget,
+                                "open_positions_value_usd": open_positions_value,
+                                "open_positions_value_observed_at": position_value_observed_at,
+                                "portfolio_equity_usd": portfolio_equity,
+                                "raw_target_notional_usd": raw,
+                                "rejection_reason": err.as_str(),
+                                "pvr_trade_multiplier": strategy
+                                    .multiplier
+                                    .filter(|m| *m > Decimal::ZERO)
+                                    .map(|m| m.to_string())
+                                    .unwrap_or_else(|| "1".into()),
+                            }))
+                        });
+                    }
+                    reason = Some(err);
+                }
             }
         }
     }
@@ -565,6 +676,8 @@ async fn decide_one(
 
     if reason.is_none() && !side_buy {
         let pos = position.as_ref();
+        let allow_subminimum = strategy.operating_mode == "paper_trading"
+            && strategy.allow_subminimum_paper_trades;
         let plan = plan_exit(
             pos.map(|p| p.open_shares).unwrap_or(Decimal::ZERO),
             pos.map(|p| p.source_observed_shares)
@@ -573,6 +686,7 @@ async fn decide_one(
             pos.map(|p| p.pending_exit_shares).unwrap_or(Decimal::ZERO),
             limit,
             strategy.min_order_usd,
+            allow_subminimum,
         );
         if let Some(reject) = plan.reject {
             if let Some(pos) = pos {
@@ -598,20 +712,53 @@ async fn decide_one(
 
     let mut book_price = None;
     let mut sim = None;
+    let mut fill_simulation: Option<Value> = None;
     if reason.is_none() {
-        match book {
-            Ok(book) => match walk_book(book, side_buy, limit, target_shares, fee) {
-                Ok(fill) => {
-                    book_price = Some(fill.vwap);
-                    if slippage_bps(event.price, fill.vwap) > slip {
-                        reason = Some(RejectReason::Slippage);
-                    } else {
-                        sim = Some(fill);
+        let paper = strategy.operating_mode == "paper_trading";
+        let allow_subminimum = paper && strategy.allow_subminimum_paper_trades;
+        let market_min_shares = book
+            .as_ref()
+            .map(|b| b.min_order_size)
+            .unwrap_or(Decimal::ZERO);
+        match simulate_copy_fill(
+            book,
+            paper,
+            allow_subminimum,
+            cfg.paper_allow_synthetic_fills,
+            slip,
+            side_buy,
+            event.price,
+            limit,
+            target_shares,
+            target_notional_usd,
+            market_min_shares,
+            fee,
+        ) {
+            Ok(sim_result) => {
+                book_price = Some(sim_result.fill.vwap);
+                if slippage_bps(event.price, sim_result.fill.vwap) > slip {
+                    reason = Some(RejectReason::Slippage);
+                } else {
+                    if strategy.operating_mode == "paper_trading" {
+                        fill_simulation = Some(json!({
+                            "paper_execution_mode": sim_result.paper_execution_mode.as_str(),
+                            "context": sim_result.context,
+                        }));
                     }
+                    sim = Some(sim_result);
                 }
-                Err(err) => reason = Some(err),
-            },
-            Err(_) => reason = Some(RejectReason::NoLiquidity),
+            }
+            Err(err) => {
+                if paper {
+                    fill_simulation = Some(json!({
+                        "rejected": true,
+                        "reason": err.as_str(),
+                        "context": paper_clob_diagnostic(book, side_buy, event.price, limit),
+                        "allow_synthetic_experimental": cfg.paper_allow_synthetic_fills,
+                    }));
+                }
+                reason = Some(err);
+            }
         }
     }
 
@@ -627,7 +774,9 @@ async fn decide_one(
         "rejected"
     };
     let reason_text = reason
-        .map(|r| r.as_str().to_string())
+        .as_ref()
+        .map(RejectReason::as_str)
+        .map(str::to_string)
         .unwrap_or_else(|| "approved".into());
     let decision_id: Uuid = sqlx::query_scalar(
         "INSERT INTO copy_decisions (
@@ -659,20 +808,36 @@ async fn decide_one(
         "copy_buy": strategy.copy_buy,
         "copy_sell": strategy.copy_sell
     }))
-    .bind(json!({
-        "exposure_usd": exposure,
-        "strategy_exposure_usd": strategy_exposure,
-        "open_positions": open_positions,
-        "available_balance_usd": available,
-        "kill_switch": kill,
-        "requested_notional_usd": target_notional_usd,
-        "grid_shares": target_shares,
-        "limit_price": limit,
-        "reserved_notional_usd": (target_shares * limit).round_dp(2),
-        "strategy_budget_usd": strategy.strategy_budget_usd,
-        "remaining_strategy_budget_usd": (strategy.strategy_budget_usd - strategy_exposure).max(Decimal::ZERO),
-        "size_trace": size_trace
-    }))
+    .bind({
+        let mut checks = json!({
+            "exposure_usd": exposure,
+            "strategy_exposure_usd": strategy_exposure,
+            "open_positions": open_positions,
+            "available_balance_usd": available,
+            "kill_switch": kill,
+            "allow_subminimum_paper_trades": strategy.allow_subminimum_paper_trades,
+            "calculated_notional_usd": target_notional_usd,
+            "exchange_min_notional_usd": EXCHANGE_MIN_NOTIONAL,
+            "market_min_shares": book.as_ref().map(|b| b.min_order_size).unwrap_or(Decimal::ZERO),
+            "requested_notional_usd": target_notional_usd,
+            "grid_shares": target_shares,
+            "limit_price": limit,
+            "reserved_notional_usd": (target_shares * limit).round_dp(2),
+            "strategy_budget_usd": strategy.strategy_budget_usd,
+            "remaining_strategy_budget_usd": (strategy.strategy_budget_usd - strategy_exposure).max(Decimal::ZERO),
+            "size_trace": size_trace,
+        });
+        if let Some(r) = reason.as_ref() {
+            checks["rejection_reason"] = json!(r.as_str());
+        }
+        if let Some(audit) = sizing_audit {
+            checks["sizing_audit"] = audit;
+        }
+        if let Some(fill_sim) = fill_simulation {
+            checks["fill_simulation"] = fill_sim;
+        }
+        checks
+    })
     .bind(event.received_at)
     .fetch_one(&mut *tx)
     .await?;
@@ -699,7 +864,8 @@ async fn decide_one(
         return Ok(decision_id);
     }
 
-    let fill = sim.expect("approved simulation");
+    let sim_result = sim.expect("approved simulation");
+    let fill = &sim_result.fill;
     let order_id: Uuid = sqlx::query_scalar(
         "INSERT INTO orders (
             user_id, trading_account_id, decision_id, source_event_id, client_order_id, operating_mode, order_type, side,
@@ -746,7 +912,7 @@ async fn decide_one(
             event,
             decision_id,
             order_id,
-            &fill,
+            &sim_result,
             side_buy,
         )
         .await?;
@@ -766,15 +932,20 @@ async fn settle_paper(
     event: &EventRow,
     decision_id: Uuid,
     order_id: Uuid,
-    fill: &crate::engine::SimulatedFill,
+    sim: &crate::engine::CopyFillSim,
     side_buy: bool,
 ) -> anyhow::Result<()> {
     let mut tx = begin_as(pool, None, "worker").await?;
+    let fill = &sim.fill;
     let fee = fill.fee_usd.unwrap_or(Decimal::ZERO);
     let fee_status = fill.fee_status;
+    let fill_ctx = serde_json::to_value(&sim.context)?;
+  let contributes = true;
     let fill_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO fills (user_id, trading_account_id, order_id, price, shares, notional_usd, fee_usd, fee_status, slippage_vs_source_bps, slippage_vs_limit_bps)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
+        "INSERT INTO fills (user_id, trading_account_id, order_id, price, shares, notional_usd, fee_usd, fee_status,
+                slippage_vs_source_bps, slippage_vs_limit_bps, paper_execution_mode, paper_execution_context,
+                contributes_to_paper_ledger)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id",
     )
     .bind(strategy.user_id)
     .bind(strategy.trading_account_id)
@@ -785,9 +956,32 @@ async fn settle_paper(
     .bind(fill.fee_usd)
     .bind(fee_status)
     .bind(slippage_bps(event.price, fill.vwap))
-    .bind(slippage_bps(event.price, fill.vwap))
+    .bind(slippage_bps(sim.context.copy_limit_price, fill.vwap))
+    .bind(sim.paper_execution_mode.as_str())
+    .bind(fill_ctx)
+    .bind(contributes)
     .fetch_one(&mut *tx)
     .await?;
+    if !contributes {
+        crate::strategy_accounting::release_copy_order_reserves(
+            &mut tx,
+            order_id,
+            &format!("experimental-fill-release:{}", fill_id),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE orders SET status = 'filled', submitted_at = now(), updated_at = now(),
+                position_reserved_usd = 0, fee_reserved_usd = 0,
+                exchange_response = $2
+             WHERE id = $1",
+        )
+        .bind(order_id)
+        .bind(json!({"paper": "synthetic_experimental", "ledger": "isolated"}))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
     let sell_cost_released = if !side_buy {
         let pos = sqlx::query_as::<_, PositionRow>(
             "SELECT id, open_shares, avg_price, cost_basis_usd, realized_pnl_usd, source_observed_shares, pending_exit_shares
@@ -1260,7 +1454,10 @@ pub async fn paper_sell_position(
     }
     let sell_shares = want_shares.min(available);
     let book = book.as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
-    if book.min_order_size > Decimal::ZERO && sell_shares < book.min_order_size {
+    if pos.operating_mode != "paper_trading"
+        && book.min_order_size > Decimal::ZERO
+        && sell_shares < book.min_order_size
+    {
         anyhow::bail!(
             "below_minimum_order_size: sellable {} < market min {}",
             sell_shares,
@@ -1277,7 +1474,8 @@ pub async fn paper_sell_position(
         .max(tick);
     let limit = limit_price(false, ref_price, slip, tick);
     let fill =
-        walk_book(book, false, limit, sell_shares, fee).map_err(|r| anyhow::anyhow!(r.as_str()))?;
+        walk_book(book, false, limit, sell_shares, fee, pos.operating_mode != "paper_trading")
+            .map_err(|r| anyhow::anyhow!(r.as_str()))?;
     let order_id: Uuid = sqlx::query_scalar(
         "INSERT INTO orders (
             user_id, trading_account_id, client_order_id, operating_mode, order_type, side,
@@ -1705,6 +1903,7 @@ struct StrategyRow {
     max_open_positions: i32,
     max_slippage_bps: i32,
     min_order_usd: Decimal,
+    allow_subminimum_paper_trades: bool,
     copy_buy: bool,
     copy_sell: bool,
     cooldown_seconds: i32,

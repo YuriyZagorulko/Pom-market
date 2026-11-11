@@ -10,19 +10,19 @@ const base: CopyStrategyCreateInput = {
   sourceTraderId: "trader-1",
   allocationMode: "fixed_usd",
   allocationPercent: "25",
-  sizingMode: "portfolio_ratio",
+  sizingMode: "position_value_ratio",
   strategyBudgetUsd: "2000",
   maxPositionUsd: "200",
-  maxExposureUsd: "2000",
   maxOpenPositions: "10",
   maxSlippageBps: "150",
   minOrderUsd: "1",
   cooldownSeconds: "0",
   copyBuy: true,
   copySell: true,
+  allowSubminimumPaperTrades: false,
   copyPercent: "10",
   fixedAmountUsd: "25",
-  multiplier: "1.5",
+  pvrTradeMultiplier: "1",
   monitoringEnabled: true,
   accountOperatingMode: "paper_trading",
 };
@@ -45,39 +45,44 @@ describe("validateCopyStrategyCreateInput", () => {
     expect(
       validateCopyStrategyCreateInput({ ...base, sizingMode: "fixed_amount", fixedAmountUsd: "0" }),
     ).toMatch(/Fixed amount/i);
-    expect(
-      validateCopyStrategyCreateInput({ ...base, sizingMode: "multiplier", multiplier: "-1" }),
-    ).toMatch(/Multiplier/i);
   });
 
-  it("accepts valid portfolio-relative input", () => {
+  it("accepts position value ratio without extra fields", () => {
     expect(validateCopyStrategyCreateInput(base)).toBeNull();
   });
 });
 
 describe("buildCopyStrategyCreateBody", () => {
-  it("maps portfolio-relative default body", () => {
+  it("defaults to position_value_ratio", () => {
     const body = buildCopyStrategyCreateBody(base);
     expect(body).toMatchObject({
       trading_account_id: "acc-1",
       source_trader_id: "trader-1",
-      sizing_mode: "portfolio_ratio",
+      sizing_mode: "position_value_ratio",
       allocation_mode: "fixed_usd",
       strategy_budget_usd: 2000,
-      max_open_positions: 10,
-      max_slippage_bps: 150,
-      cooldown_seconds: 0,
     });
     expect(body).not.toHaveProperty("enabled");
   });
 
-  it("maps proportional, fixed, and multiplier sizing", () => {
+  it("sends pvr multiplier when not 1", () => {
+    expect(buildCopyStrategyCreateBody({ ...base, pvrTradeMultiplier: "10" }).multiplier).toBe(10);
+    expect(buildCopyStrategyCreateBody(base).multiplier).toBeUndefined();
+  });
+
+  it("includes allow_subminimum when enabled", () => {
+    expect(
+      buildCopyStrategyCreateBody({ ...base, allowSubminimumPaperTrades: true })
+        .allow_subminimum_paper_trades,
+    ).toBe(true);
+  });
+
+  it("maps proportional and fixed sizing", () => {
     expect(
       buildCopyStrategyCreateBody({ ...base, sizingMode: "proportional" }).copy_percent,
     ).toBe(10);
     expect(
       buildCopyStrategyCreateBody({ ...base, sizingMode: "fixed_amount" }).fixed_amount_usd,
     ).toBe(25);
-    expect(buildCopyStrategyCreateBody({ ...base, sizingMode: "multiplier" }).multiplier).toBe(1.5);
   });
 });

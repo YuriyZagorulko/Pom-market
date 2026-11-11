@@ -8,6 +8,7 @@
     "build:admin": "pnpm --filter @pom/admin build",
     "build:user": "pnpm --filter @pom/user build",
     "test:user": "pnpm --filter @pom/user test",
+    "test:format": "pnpm --filter @pom/format test",
     "test:e2e": "pnpm --filter @pom/e2e test"
   }
 }

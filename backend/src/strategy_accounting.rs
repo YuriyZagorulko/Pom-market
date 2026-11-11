@@ -15,6 +15,15 @@ use crate::account_allocation::{
 };
 use crate::db::Tx;
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CapitalSyncOutcome {
+    pub configured_capital_usd: Decimal,
+    pub funded_capital_usd: Decimal,
+    pub available_cash_usd: Decimal,
+    pub delta_applied_usd: Decimal,
+    pub bootstrap_quality: String,
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct StrategyCapitalRow {
     pub strategy_id: Uuid,
@@ -402,13 +411,19 @@ pub async fn sync_strategy_funded_to_target(
     strategy_id: Uuid,
     target_funded: Decimal,
     idempotency_prefix: &str,
-) -> Result<(), String> {
+) -> Result<Decimal, String> {
     if target_funded < Decimal::ZERO {
         return Err("allocation target must be non-negative".into());
     }
     ensure_strategy_capital_row(tx, user_id, trading_account_id, strategy_id)
         .await
         .map_err(|e| e.to_string())?;
+    let funded_before = {
+        let cap = lock_strategy_capital(tx, strategy_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        cap.funded_capital_usd
+    };
     let cap = lock_strategy_capital(tx, strategy_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -433,7 +448,11 @@ pub async fn sync_strategy_funded_to_target(
         let key = format!("{idempotency_prefix}:withdraw:{}", -delta);
         withdraw_from_strategy(tx, user_id, trading_account_id, strategy_id, -delta, &key).await?;
     }
-    Ok(())
+    let _ = funded_before;
+    let after = lock_strategy_capital(tx, strategy_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(after.funded_capital_usd - funded_before)
 }
 
 /// Fund or withdraw ledger cash to match the strategy's configured allocation cap (PAPER only).
@@ -442,7 +461,7 @@ pub async fn sync_strategy_capital_to_configured_cap(
     user_id: Uuid,
     strategy_id: Uuid,
     idempotency_prefix: &str,
-) -> Result<(), String> {
+) -> Result<CapitalSyncOutcome, String> {
     let row: Option<(Uuid, String, Decimal, Option<Decimal>, String)> = sqlx::query_as(
         "SELECT s.trading_account_id, s.allocation_mode, s.strategy_budget_usd, s.allocation_percent, a.operating_mode
          FROM copy_strategies s
@@ -458,14 +477,14 @@ pub async fn sync_strategy_capital_to_configured_cap(
         return Err("strategy not found".into());
     };
     if operating_mode != "paper_trading" {
-        return Ok(());
+        return Err("strategy capital sync is only available in paper_trading mode".into());
     }
     let alloc = parse_allocation_from_request(Some(&mode), budget, pct)?;
     let equity = paper_account_equity_usd(tx, account_id)
         .await
         .map_err(|e| e.to_string())?;
     let target = effective_allocation_cap(&alloc, equity);
-    sync_strategy_funded_to_target(
+    let delta_applied = sync_strategy_funded_to_target(
         tx,
         user_id,
         account_id,
@@ -473,7 +492,17 @@ pub async fn sync_strategy_capital_to_configured_cap(
         target,
         idempotency_prefix,
     )
-    .await
+    .await?;
+    let cap = lock_strategy_capital(tx, strategy_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(CapitalSyncOutcome {
+        configured_capital_usd: target,
+        funded_capital_usd: cap.funded_capital_usd,
+        available_cash_usd: cap.available_cash_usd,
+        delta_applied_usd: delta_applied,
+        bootstrap_quality: cap.bootstrap_quality,
+    })
 }
 
 pub async fn withdraw_from_strategy(

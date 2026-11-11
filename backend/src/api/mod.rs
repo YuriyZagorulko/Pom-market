@@ -39,7 +39,8 @@ use crate::security::{
 use crate::source_equity;
 use crate::strategy_accounting::{
     allocate_to_strategy, apply_account_paper_funding, bootstrap_account_strategies,
-    reconcile_account, sync_strategy_capital_to_configured_cap, withdraw_from_strategy,
+    ensure_strategy_capital_row, reconcile_account, sync_strategy_capital_to_configured_cap,
+    withdraw_from_strategy,
 };
 use crate::strategy_budget::utilization_report_for_user;
 
@@ -267,6 +268,10 @@ pub fn router(state: AppState) -> Router {
             post(capital_withdraw),
         )
         .route(
+            "/api/v1/strategies/{id}/capital/sync-configured",
+            post(capital_sync_configured),
+        )
+        .route(
             "/api/v1/strategies/{id}/analytics/overview",
             get(strategy_analytics::overview),
         )
@@ -286,6 +291,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/strategies/{id}/analytics/performance",
             get(strategy_analytics::performance),
         )
+        .route("/api/v1/strategies/{id}/readiness", get(strategy_readiness))
         .route(
             "/api/v1/source-traders/{id}/copy-preview",
             post(copy_preview),
@@ -1869,8 +1875,10 @@ async fn delete_trader(
 
 #[derive(Deserialize)]
 struct StrategyBody {
-    trading_account_id: Uuid,
-    source_trader_id: Uuid,
+    #[serde(default)]
+    trading_account_id: Option<Uuid>,
+    #[serde(default)]
+    source_trader_id: Option<Uuid>,
     sizing_mode: Option<String>,
     allocation_mode: Option<String>,
     allocation_percent: Option<Decimal>,
@@ -1895,6 +1903,8 @@ struct StrategyBody {
     enabled: Option<bool>,
     /// Optional label; does not change source trader.
     display_name: Option<String>,
+    #[serde(default)]
+    allow_subminimum_paper_trades: Option<bool>,
 }
 
 async fn create_strategy(
@@ -1903,12 +1913,29 @@ async fn create_strategy(
     Json(body): Json<StrategyBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
-    let mode = body.sizing_mode.unwrap_or_else(|| "portfolio_ratio".into());
-    if !matches!(
-        mode.as_str(),
-        "fixed_amount" | "proportional" | "multiplier" | "portfolio_ratio"
-    ) {
-        return Err(bad("unknown sizing mode"));
+    let trading_account_id = body
+        .trading_account_id
+        .ok_or_else(|| bad("trading_account_id is required"))?;
+    let source_trader_id = body
+        .source_trader_id
+        .ok_or_else(|| bad("source_trader_id is required"))?;
+    let mode = body
+        .sizing_mode
+        .unwrap_or_else(|| "position_value_ratio".into());
+    let pvr_multiplier =
+        crate::copy_sizing::parse_pvr_multiplier(body.multiplier).map_err(bad)?;
+    if pvr_multiplier.is_some() && mode != "position_value_ratio" {
+        return Err(bad(
+            "multiplier applies only to position_value_ratio strategies",
+        ));
+    }
+    if let Some(msg) = crate::sizing_mode::reject_retired_on_write(&mode) {
+        return Err(bad(msg));
+    }
+    if !crate::sizing_mode::is_user_sizing_mode(&mode) {
+        return Err(bad(
+            "sizing_mode must be position_value_ratio, fixed_amount, or proportional",
+        ));
     }
     let budget = body.strategy_budget_usd.unwrap_or(Decimal::from(2000));
     if budget > Decimal::from(10_000_000) {
@@ -1925,7 +1952,7 @@ async fn create_strategy(
         if let Some(pct) = body.copy_percent {
             proportion = Some(
                 percent_to_proportion(pct)
-                    .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 100"))?,
+                    .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 10000"))?,
             );
         }
         if proportion.is_none() {
@@ -1937,11 +1964,11 @@ async fn create_strategy(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
-    let _ = load_account(&mut tx, user.id, body.trading_account_id).await?;
+    let _ = load_account(&mut tx, user.id, trading_account_id).await?;
     let owns_trader: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM source_traders WHERE id = $1 AND user_id = $2)",
     )
-    .bind(body.source_trader_id)
+    .bind(source_trader_id)
     .bind(user.id)
     .fetch_one(&mut *tx)
     .await
@@ -1954,7 +1981,7 @@ async fn create_strategy(
     }
     let monitoring: bool =
         sqlx::query_scalar("SELECT monitoring_enabled FROM source_traders WHERE id = $1")
-            .bind(body.source_trader_id)
+            .bind(source_trader_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(internal)?;
@@ -1963,7 +1990,7 @@ async fn create_strategy(
             "enable monitoring on the source account before creating a copy strategy",
         ));
     }
-    validate_new_allocation_in_tx(&mut tx, body.trading_account_id, &alloc, None)
+    validate_new_allocation_in_tx(&mut tx, trading_account_id, &alloc, None)
         .await
         .map_err(bad)?;
     let id: Uuid = sqlx::query_scalar(
@@ -1971,25 +1998,31 @@ async fn create_strategy(
             user_id, trading_account_id, source_trader_id, enabled, sizing_mode, allocation_mode, allocation_percent,
             fixed_amount_usd, proportion, multiplier,
             strategy_budget_usd, max_position_usd, max_exposure_usd, max_open_positions, max_slippage_bps, min_order_usd,
+            allow_subminimum_paper_trades,
             copy_buy, copy_sell, cooldown_seconds, allowed_markets
-         ) VALUES ($1,$2,$3,false,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         ) VALUES ($1,$2,$3,false,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
          RETURNING id",
     )
     .bind(user.id)
-    .bind(body.trading_account_id)
-    .bind(body.source_trader_id)
+    .bind(trading_account_id)
+    .bind(source_trader_id)
     .bind(&mode)
     .bind(alloc.allocation_mode.as_str())
     .bind(alloc.allocation_percent)
     .bind(body.fixed_amount_usd.or(Some(Decimal::from(10))))
     .bind(proportion)
-    .bind(body.multiplier)
+    .bind(if mode == "position_value_ratio" {
+        pvr_multiplier
+    } else {
+        None
+    })
     .bind(budget)
     .bind(body.max_position_usd.unwrap_or(Decimal::from(50)))
-    .bind(body.max_exposure_usd.unwrap_or(Decimal::from(100)))
+    .bind(budget)
     .bind(body.max_open_positions.unwrap_or(10))
     .bind(body.max_slippage_bps.unwrap_or(150))
     .bind(body.min_order_usd.unwrap_or(Decimal::ONE))
+    .bind(body.allow_subminimum_paper_trades.unwrap_or(false))
     .bind(body.copy_buy.unwrap_or(true))
     .bind(body.copy_sell.unwrap_or(true))
     .bind(body.cooldown_seconds.unwrap_or(0))
@@ -1997,6 +2030,9 @@ async fn create_strategy(
     .fetch_one(&mut *tx)
     .await
     .map_err(|_| bad("strategy already exists for this account and trader"))?;
+    ensure_strategy_capital_row(&mut tx, user.id, trading_account_id, id)
+        .await
+        .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
     Ok((
         StatusCode::CREATED,
@@ -2018,6 +2054,7 @@ async fn list_strategies(
                 COALESCE(s.display_name, t.alias) AS display_name, s.enabled, s.sizing_mode, s.allocation_mode, s.allocation_percent,
                 s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd,
                 s.max_position_usd, s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
+                s.allow_subminimum_paper_trades,
                 s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets
          FROM copy_strategies s
          JOIN source_traders t ON t.id = s.source_trader_id
@@ -2073,8 +2110,48 @@ async fn patch_strategy(
     if let Some(pct) = body.copy_percent {
         proportion = Some(
             percent_to_proportion(pct)
-                .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 100"))?,
+                .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 10000"))?,
         );
+    }
+    if let Some(ref mode) = body.sizing_mode {
+        if let Some(msg) = crate::sizing_mode::reject_retired_on_write(mode) {
+            return Err(bad(msg));
+        }
+        if crate::sizing_mode::LEGACY_SIZING_MODES.contains(&mode.as_str()) {
+            let current: String = sqlx::query_scalar(
+                "SELECT sizing_mode FROM copy_strategies WHERE id = $1 AND user_id = $2",
+            )
+            .bind(id)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?;
+            if current != *mode {
+                return Err(bad(
+                    "portfolio_ratio is deprecated; use position_value_ratio or another supported mode",
+                ));
+            }
+        } else if !crate::sizing_mode::is_user_sizing_mode(mode) {
+            return Err(bad("unknown sizing mode"));
+        }
+    }
+    let pvr_multiplier =
+        crate::copy_sizing::parse_pvr_multiplier(body.multiplier).map_err(bad)?;
+    if pvr_multiplier.is_some() {
+        let current_sizing: String = sqlx::query_scalar(
+            "SELECT sizing_mode FROM copy_strategies WHERE id = $1 AND user_id = $2",
+        )
+        .bind(id)
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
+        let effective_mode = body.sizing_mode.as_deref().unwrap_or(current_sizing.as_str());
+        if effective_mode != "position_value_ratio" {
+            return Err(bad(
+                "multiplier applies only to position_value_ratio strategies",
+            ));
+        }
     }
     let new_budget = body.strategy_budget_usd.unwrap_or(current.2);
     if new_budget > Decimal::from(10_000_000) {
@@ -2084,12 +2161,21 @@ async fn patch_strategy(
         .allocation_mode
         .as_deref()
         .unwrap_or(current.1.as_str());
-    let new_alloc_pct = body.allocation_percent.or(current.3);
+    let new_alloc_pct = if new_alloc_mode == "percent_of_account" {
+        body.allocation_percent.or(current.3)
+    } else {
+        None
+    };
     let alloc = parse_allocation_from_request(Some(new_alloc_mode), new_budget, new_alloc_pct)
         .map_err(bad)?;
     validate_new_allocation_in_tx(&mut tx, current.0, &alloc, Some(id))
         .await
         .map_err(bad)?;
+    let patch_alloc_pct: Option<Decimal> = if new_alloc_mode == "percent_of_account" {
+        body.allocation_percent.or(alloc.allocation_percent)
+    } else {
+        None
+    };
     if let Some(name) = body.display_name.as_deref() {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -2109,16 +2195,17 @@ async fn patch_strategy(
             multiplier = COALESCE($8, multiplier),
             strategy_budget_usd = COALESCE($9, strategy_budget_usd),
             max_position_usd = COALESCE($10, max_position_usd),
-            max_exposure_usd = COALESCE($11, max_exposure_usd),
-            max_open_positions = COALESCE($12, max_open_positions),
-            max_slippage_bps = COALESCE($13, max_slippage_bps),
-            min_order_usd = COALESCE($14, min_order_usd),
-            copy_buy = COALESCE($15, copy_buy),
-            copy_sell = COALESCE($16, copy_sell),
-            cooldown_seconds = COALESCE($17, cooldown_seconds),
-            allowed_markets = COALESCE($18, allowed_markets),
-            enabled = COALESCE($19, enabled),
-            display_name = CASE WHEN $20::text IS NULL THEN display_name ELSE NULLIF(trim($20), '') END,
+            max_exposure_usd = COALESCE($9, strategy_budget_usd),
+            max_open_positions = COALESCE($11, max_open_positions),
+            max_slippage_bps = COALESCE($12, max_slippage_bps),
+            min_order_usd = COALESCE($13, min_order_usd),
+            copy_buy = COALESCE($14, copy_buy),
+            copy_sell = COALESCE($15, copy_sell),
+            cooldown_seconds = COALESCE($16, cooldown_seconds),
+            allowed_markets = COALESCE($17, allowed_markets),
+            enabled = COALESCE($18, enabled),
+            display_name = CASE WHEN $19::text IS NULL THEN display_name ELSE NULLIF(trim($19), '') END,
+            allow_subminimum_paper_trades = COALESCE($20, allow_subminimum_paper_trades),
             updated_at = now()
          WHERE id = $1 AND user_id = $2",
     )
@@ -2126,13 +2213,12 @@ async fn patch_strategy(
     .bind(user.id)
     .bind(body.sizing_mode)
     .bind(body.allocation_mode)
-    .bind(body.allocation_percent)
+    .bind(patch_alloc_pct)
     .bind(body.fixed_amount_usd)
     .bind(proportion)
     .bind(body.multiplier)
     .bind(body.strategy_budget_usd)
     .bind(body.max_position_usd)
-    .bind(body.max_exposure_usd)
     .bind(body.max_open_positions)
     .bind(body.max_slippage_bps)
     .bind(body.min_order_usd)
@@ -2142,6 +2228,7 @@ async fn patch_strategy(
     .bind(body.allowed_markets)
     .bind(body.enabled)
     .bind(body.display_name.as_deref())
+    .bind(body.allow_subminimum_paper_trades)
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
@@ -2152,13 +2239,38 @@ async fn patch_strategy(
             .fetch_one(&mut *tx)
             .await
             .map_err(internal)?;
-    if enabled_after {
-        sync_strategy_capital_to_configured_cap(&mut tx, user.id, id, &format!("patch:{id}"))
-            .await
-            .map_err(bad)?;
-    }
+    let capital_sync = if enabled_after {
+        Some(
+            sync_strategy_capital_to_configured_cap(&mut tx, user.id, id, &format!("patch:{id}"))
+                .await
+                .map_err(bad)?,
+        )
+    } else {
+        None
+    };
     tx.commit().await.map_err(internal)?;
-    Ok(Json(json!({"ok": true})))
+    Ok(Json(json!({
+        "ok": true,
+        "capital_sync": capital_sync,
+    })))
+}
+
+async fn strategy_readiness(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let body = crate::strategy_readiness::readiness_for_user(&state.pool, user.id, id, &state.cfg)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                ApiError(StatusCode::NOT_FOUND, "strategy not found".into())
+            } else {
+                internal(e)
+            }
+        })?;
+    Ok(Json(serde_json::to_value(body).unwrap_or(json!({}))))
 }
 
 async fn strategy_utilization(
@@ -2261,6 +2373,8 @@ struct CopyPreviewBody {
     allowed_markets: Option<Value>,
     limit: Option<i32>,
     refresh_source_equity: Option<bool>,
+    #[serde(default)]
+    allow_subminimum_paper_trades: Option<bool>,
 }
 
 async fn copy_preview(
@@ -2287,6 +2401,15 @@ async fn copy_preview(
     .map_err(internal)?
     .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "trader not found".into()))?;
     let _ = load_account(&mut tx, user.id, body.trading_account_id).await?;
+    let operating_mode: String = sqlx::query_scalar(
+        "SELECT operating_mode FROM trading_accounts WHERE id = $1 AND user_id = $2",
+    )
+    .bind(body.trading_account_id)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let paper_trading = operating_mode == "paper_trading";
     let alloc = parse_allocation_from_request(
         body.allocation_mode.as_deref(),
         body.strategy_budget_usd,
@@ -2313,7 +2436,7 @@ async fn copy_preview(
         if let Some(pct) = body.copy_percent {
             proportion = Some(
                 percent_to_proportion(pct)
-                    .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 100"))?,
+                    .ok_or_else(|| bad("copy_percent must be greater than 0 and at most 10000"))?,
             );
         }
         if proportion.is_none() {
@@ -2339,26 +2462,39 @@ async fn copy_preview(
     let mut equity_snap = source_equity::load_snapshot(&state.pool, id, &state.cfg)
         .await
         .map_err(internal)?;
-    let needs_equity = body.sizing_mode == "portfolio_ratio"
-        || body
-            .refresh_source_equity
-            .unwrap_or(body.sizing_mode == "portfolio_ratio");
-    if needs_equity
-        && equity_snap
-            .as_ref()
-            .map(|s| !s.status.allows_portfolio_buy())
-            .unwrap_or(true)
-    {
-        let live = source_equity::fetch_live_equity(&state.polymarket, &state.cfg, &wallet).await;
-        source_equity::upsert_snapshot(&state.pool, id, &live)
-            .await
-            .map_err(internal)?;
-        equity_snap = Some(live);
+    let refresh_default = matches!(
+        body.sizing_mode.as_str(),
+        "portfolio_ratio" | "position_value_ratio"
+    );
+    let refresh = body
+        .refresh_source_equity
+        .unwrap_or(refresh_default);
+    if refresh {
+        let stale_portfolio = body.sizing_mode == "portfolio_ratio"
+            && equity_snap
+                .as_ref()
+                .map(|s| !s.status.allows_portfolio_buy())
+                .unwrap_or(true);
+        let stale_positions = body.sizing_mode == "position_value_ratio"
+            && equity_snap
+                .as_ref()
+                .map(source_equity::snapshot_needs_position_value_refresh)
+                .unwrap_or(true);
+        if stale_portfolio || stale_positions {
+            let live =
+                source_equity::fetch_live_equity(&state.polymarket, &state.cfg, &wallet).await;
+            source_equity::upsert_snapshot(&state.pool, id, &live)
+                .await
+                .map_err(internal)?;
+            equity_snap = Some(live);
+        }
     }
     let (source_equity_usd, source_equity_status) = equity_snap
         .as_ref()
         .map(|s| (s.total_equity_usd, Some(s.status)))
         .unwrap_or((None, None));
+    let source_open_positions_value_usd =
+        equity_snap.as_ref().and_then(|s| s.positions_value_usd);
     let scaling = source_equity_usd.and_then(|eq| scaling_ratio(effective_cap, eq));
 
     let allowed = body.allowed_markets.unwrap_or_else(|| json!([]));
@@ -2375,12 +2511,21 @@ async fn copy_preview(
             .max(effective_cap),
         account_max_exposure: risk.max_exposure_usd,
         max_order_usd: risk.max_order_usd,
-        min_order_usd: body.min_order_usd.unwrap_or(Decimal::ONE).max(Decimal::ONE),
+        min_order_usd: if paper_trading {
+            body.min_order_usd.unwrap_or(Decimal::ZERO).max(Decimal::ZERO)
+        } else {
+            body.min_order_usd.unwrap_or(Decimal::ONE).max(Decimal::ONE)
+        },
         copy_buy: body.copy_buy.unwrap_or(true),
         copy_sell: body.copy_sell.unwrap_or(true),
         source_equity_usd,
         source_equity_status,
+        source_open_positions_value_usd,
         scaling_ratio_percent: scaling,
+        paper_trading,
+        allow_subminimum_paper_trades: body
+            .allow_subminimum_paper_trades
+            .unwrap_or(false),
     };
 
     let events: Vec<PreviewEvent> = rows
@@ -2735,12 +2880,11 @@ async fn enable_strategy(
             sizing_mode: String,
             proportion: Option<Decimal>,
             fixed_amount_usd: Option<Decimal>,
-            multiplier: Option<Decimal>,
             paper_cash_usd: Decimal,
         }
         let row = sqlx::query_as::<_, EnableCheck>(
             "SELECT st.monitoring_enabled, a.operating_mode, a.status AS account_status, a.emergency_stop,
-                    s.strategy_budget_usd, s.min_order_usd, s.sizing_mode, s.proportion, s.fixed_amount_usd, s.multiplier,
+                    s.strategy_budget_usd, s.min_order_usd, s.sizing_mode, s.proportion, s.fixed_amount_usd,
                     r.paper_cash_usd
              FROM copy_strategies s
              JOIN source_traders st ON st.id = s.source_trader_id
@@ -2787,18 +2931,21 @@ async fn enable_strategy(
             "fixed_amount" if row.fixed_amount_usd.is_none() => {
                 return Err(bad("set fixed amount before enabling the strategy"));
             }
-            "multiplier" if row.multiplier.is_none() => {
-                return Err(bad("set multiplier before enabling the strategy"));
-            }
             _ => {}
         }
         if row.operating_mode == "paper_trading" && row.paper_cash_usd < row.min_order_usd {
             return Err(bad("increase paper cash on the trading account"));
         }
-        sync_strategy_capital_to_configured_cap(&mut tx, user.id, id, &format!("enable:{id}"))
-            .await
-            .map_err(bad)?;
     }
+    let capital_sync = if body.enabled {
+        Some(
+            sync_strategy_capital_to_configured_cap(&mut tx, user.id, id, &format!("enable:{id}"))
+                .await
+                .map_err(bad)?,
+        )
+    } else {
+        None
+    };
     sqlx::query("UPDATE copy_strategies SET enabled = $3, updated_at = now() WHERE id = $1 AND user_id = $2")
         .bind(id)
         .bind(user.id)
@@ -2807,7 +2954,44 @@ async fn enable_strategy(
         .await
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
-    Ok(Json(json!({"enabled": body.enabled})))
+    Ok(Json(json!({
+        "enabled": body.enabled,
+        "capital_sync": capital_sync,
+    })))
+}
+
+async fn capital_sync_configured(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let enabled: bool = sqlx::query_scalar(
+        "SELECT enabled FROM copy_strategies WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))?;
+    if !enabled {
+        return Err(bad("enable the strategy before syncing capital to the configured allocation"));
+    }
+    let stamp = chrono::Utc::now().timestamp_millis();
+    let outcome = sync_strategy_capital_to_configured_cap(
+        &mut tx,
+        user.id,
+        id,
+        &format!("sync-configured:{id}:{stamp}"),
+    )
+    .await
+    .map_err(bad)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(serde_json::to_value(outcome).unwrap_or(json!({}))))
 }
 
 async fn delete_strategy(
@@ -3167,6 +3351,7 @@ async fn list_fills(
     let rows = sqlx::query_as::<_, FillListRow>(
         "SELECT f.id, f.order_id, f.trading_account_id, f.price, f.shares, f.notional_usd, f.fee_usd, f.fee_status, f.tx_hash,
                 f.slippage_vs_source_bps, f.slippage_vs_limit_bps, f.filled_at,
+                f.paper_execution_mode, f.paper_execution_context,
                 se.market_title, se.outcome, se.market_icon, o.side AS order_side
          FROM fills f
          LEFT JOIN orders o ON o.id = f.order_id
@@ -3691,6 +3876,7 @@ async fn one_strategy(
                 COALESCE(s.display_name, t.alias) AS display_name, s.enabled, s.sizing_mode, s.allocation_mode, s.allocation_percent,
                 s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd,
                 s.max_position_usd, s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
+                s.allow_subminimum_paper_trades,
                 s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets
          FROM copy_strategies s
          JOIN source_traders t ON t.id = s.source_trader_id
@@ -3825,6 +4011,7 @@ struct StrategyView {
     max_open_positions: i32,
     max_slippage_bps: i32,
     min_order_usd: Decimal,
+    allow_subminimum_paper_trades: bool,
     copy_buy: bool,
     copy_sell: bool,
     cooldown_seconds: i32,
@@ -3942,6 +4129,8 @@ struct FillListRow {
     slippage_vs_source_bps: Option<i32>,
     slippage_vs_limit_bps: Option<i32>,
     filled_at: chrono::DateTime<Utc>,
+    paper_execution_mode: Option<String>,
+    paper_execution_context: Option<serde_json::Value>,
     market_title: Option<String>,
     outcome: Option<String>,
     market_icon: Option<String>,

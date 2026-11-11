@@ -5,16 +5,27 @@ import {
   buildAccountRenameBody,
   buildAccountRiskPatchBody,
   buildCredentialsRotateBody,
+  buildPaperFundingRequest,
   parseStrictInt,
   parseUsdAmount,
 } from "./account-forms";
 
 describe("account risk serialization (regression)", () => {
+  it("formats API defaults for numeric inputs", () => {
+    const v = accountRiskFormValues({
+      max_order_usd: "50.00000000",
+      max_daily_loss_usd: "100.00000000",
+      max_slippage_bps: 150,
+      paper_cash_usd: "5000.00000000",
+    });
+    expect(v.max_order_usd).toBe("50");
+    expect(v.paper_cash_usd).toBe("5000");
+    expect(v.max_slippage_bps).toBe("150");
+  });
   it('sends max_slippage_bps as JSON number, not string "150"', () => {
     const result = buildAccountRiskPatchBody({
       max_order_usd: "50.00000000",
       max_daily_loss_usd: "100.00000000",
-      max_exposure_usd: "500.00000000",
       max_slippage_bps: "150",
       paper_cash_usd: "5000",
     });
@@ -25,15 +36,14 @@ describe("account risk serialization (regression)", () => {
     const json = JSON.stringify(result.body);
     expect(json).toContain('"max_slippage_bps":150');
     expect(json).not.toMatch(/"max_slippage_bps":"150"/);
-    expect(result.body.max_order_usd).toBe("50.00000000");
-    expect(result.body.paper_cash_usd).toBe("5000");
+    expect(result.body.max_order_usd).toBe("50");
+    expect(result.body).not.toHaveProperty("paper_cash_usd");
   });
 
   it("rejects fractional slippage bps", () => {
     const result = buildAccountRiskPatchBody({
       max_order_usd: "50",
       max_daily_loss_usd: "100",
-      max_exposure_usd: "500",
       max_slippage_bps: "150.5",
       paper_cash_usd: "5000",
     });
@@ -48,7 +58,6 @@ describe("account risk serialization (regression)", () => {
     const result = buildAccountRiskPatchBody({
       max_order_usd: "1",
       max_daily_loss_usd: "1",
-      max_exposure_usd: "1",
       max_slippage_bps: "",
       paper_cash_usd: "1",
     });
@@ -66,14 +75,28 @@ describe("account risk serialization (regression)", () => {
     const result = buildAccountRiskPatchBody({
       max_order_usd: "50.12345678",
       max_daily_loss_usd: "0.01",
-      max_exposure_usd: "999999.99",
       max_slippage_bps: "0",
       paper_cash_usd: "5000.00000000",
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.body.max_order_usd).toBe("50.12345678");
-    expect(result.body.paper_cash_usd).toBe("5000.00000000");
+  });
+
+  it("paper funding delta is separate from risk PATCH", () => {
+    const patch = buildAccountRiskPatchBody({
+      max_order_usd: "50",
+      max_daily_loss_usd: "100",
+      max_slippage_bps: "150",
+      paper_cash_usd: "10000",
+    });
+    expect(patch.ok).toBe(true);
+    if (!patch.ok) return;
+    expect(patch.body).not.toHaveProperty("paper_cash_usd");
+    const fund = buildPaperFundingRequest("5000", { paper_cash_usd: "10000" }, "key-1");
+    expect(fund).toMatchObject({ ok: true, body: { delta_usd: "5000" } });
+    const noop = buildPaperFundingRequest("5000", { paper_cash_usd: "5000" }, "key-2");
+    expect(noop).toEqual({ ok: true, body: null });
   });
 
   it("accepts boundary slippage 0 and rejects above max", () => {

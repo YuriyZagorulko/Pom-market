@@ -1,3 +1,5 @@
+import { formatNumericInputDisplay } from "@pom/format";
+
 /**
  * Shared serialization for Account Edit → API (avoid FormData stringifying all fields).
  */
@@ -7,15 +9,18 @@ export type FormResult<T> = { ok: true; body: T } | { ok: false; error: string }
 export type AccountRiskPatchBody = {
   max_order_usd: string;
   max_daily_loss_usd: string;
-  max_exposure_usd: string;
   max_slippage_bps: number;
-  paper_cash_usd: string;
+};
+
+export type AccountPaperFundingBody = {
+  delta_usd: string;
+  reason: string;
+  idempotency_key: string;
 };
 
 export type AccountRiskFormValues = {
   max_order_usd: string;
   max_daily_loss_usd: string;
-  max_exposure_usd: string;
   max_slippage_bps: string;
   paper_cash_usd: string;
 };
@@ -30,28 +35,20 @@ export type AccountRenameBody = {
   name: string;
 };
 
-const USD_FIELDS = [
-  "max_order_usd",
-  "max_daily_loss_usd",
-  "max_exposure_usd",
-  "paper_cash_usd",
-] as const;
+const RISK_USD_FIELDS = ["max_order_usd", "max_daily_loss_usd"] as const;
 
-const USD_LABELS: Record<(typeof USD_FIELDS)[number], string> = {
+const USD_LABELS: Record<(typeof RISK_USD_FIELDS)[number], string> = {
   max_order_usd: "Max order USD",
   max_daily_loss_usd: "Max daily loss USD",
-  max_exposure_usd: "Max exposure USD",
-  paper_cash_usd: "Paper cash USD",
 };
 
 /** Map GET /accounts/{id} risk object into form default strings. */
 export function accountRiskFormValues(risk: Record<string, string | number>): AccountRiskFormValues {
   return {
-    max_order_usd: String(risk.max_order_usd ?? ""),
-    max_daily_loss_usd: String(risk.max_daily_loss_usd ?? ""),
-    max_exposure_usd: String(risk.max_exposure_usd ?? ""),
-    max_slippage_bps: String(risk.max_slippage_bps ?? ""),
-    paper_cash_usd: String(risk.paper_cash_usd ?? ""),
+    max_order_usd: formatNumericInputDisplay(risk.max_order_usd),
+    max_daily_loss_usd: formatNumericInputDisplay(risk.max_daily_loss_usd),
+    max_slippage_bps: formatNumericInputDisplay(risk.max_slippage_bps),
+    paper_cash_usd: formatNumericInputDisplay(risk.paper_cash_usd),
   };
 }
 
@@ -105,14 +102,14 @@ export function parseStrictInt(
   return { ok: true, body: n };
 }
 
-/** Build PATCH /api/v1/accounts/{id}/risk body with correct JSON types. */
+/** Build PATCH /api/v1/accounts/{id}/risk body (limits only; not paper_cash_usd). */
 export function buildAccountRiskPatchBody(form: Record<string, FormDataEntryValue>): FormResult<AccountRiskPatchBody> {
   const body: Partial<AccountRiskPatchBody> = {};
-  for (const field of USD_FIELDS) {
+  for (const field of RISK_USD_FIELDS) {
     const raw = String(form[field] ?? "");
     const parsed = parseUsdAmount(raw, USD_LABELS[field]);
     if (!parsed.ok) return parsed;
-    body[field] = parsed.body;
+    body[field] = formatNumericInputDisplay(parsed.body);
   }
   const slippage = parseStrictInt(String(form.max_slippage_bps ?? ""), "Max slippage (bps)", {
     min: 0,
@@ -121,6 +118,35 @@ export function buildAccountRiskPatchBody(form: Record<string, FormDataEntryValu
   if (!slippage.ok) return slippage;
   body.max_slippage_bps = slippage.body;
   return { ok: true, body: body as AccountRiskPatchBody };
+}
+
+/** Paper cash uses POST …/capital/paper-funding (delta), not PATCH risk. */
+export function buildPaperFundingRequest(
+  currentPaperCash: string | number,
+  form: Record<string, FormDataEntryValue>,
+  idempotencyKey: string,
+): FormResult<AccountPaperFundingBody | null> {
+  const raw = String(form.paper_cash_usd ?? "");
+  const parsed = parseUsdAmount(raw, "Paper cash USD");
+  if (!parsed.ok) return parsed;
+  const current = Number(formatNumericInputDisplay(currentPaperCash));
+  const target = Number(parsed.body);
+  if (!Number.isFinite(current) || !Number.isFinite(target)) {
+    return { ok: false, error: "Paper cash USD must be a valid number." };
+  }
+  const delta = target - current;
+  if (delta === 0) {
+    return { ok: true, body: null };
+  }
+  const deltaStr = formatNumericInputDisplay(String(delta));
+  return {
+    ok: true,
+    body: {
+      delta_usd: deltaStr,
+      reason: "account_ui_paper_funding",
+      idempotency_key: idempotencyKey,
+    },
+  };
 }
 
 export function buildAccountRenameBody(form: Record<string, FormDataEntryValue>): FormResult<AccountRenameBody> {

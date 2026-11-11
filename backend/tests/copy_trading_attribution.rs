@@ -148,6 +148,7 @@ async fn sell_idempotency_and_manual_position_isolation() {
         confirm_live: false,
         default_fee_rate: Decimal::ZERO,
         default_fee_exponent: 1,
+        paper_allow_synthetic_fills: false,
     };
     let book = FixedBook;
     let (data, app_cfg) = test_support::pipeline_runtime();
@@ -279,6 +280,7 @@ async fn two_strategies_same_token_isolated() {
         confirm_live: false,
         default_fee_rate: Decimal::ZERO,
         default_fee_exponent: 1,
+        paper_allow_synthetic_fills: false,
     };
     let book = FixedBook;
     let (data, app_cfg) = test_support::pipeline_runtime();

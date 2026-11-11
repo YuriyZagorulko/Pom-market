@@ -122,6 +122,7 @@ async fn copy_buy_skipped_until_capital_bootstrap() {
         confirm_live: false,
         default_fee_rate: Decimal::ZERO,
         default_fee_exponent: 1,
+        paper_allow_synthetic_fills: false,
     };
     let (data, app_cfg) = test_support::pipeline_runtime();
     let book = common::FixedBook;

@@ -95,6 +95,7 @@ async fn proportional_budget_utilization_and_attribution() {
         confirm_live: false,
         default_fee_rate: Decimal::ZERO,
         default_fee_exponent: 1,
+        paper_allow_synthetic_fills: false,
     };
     let book = FixedBook;
     let (data, app_cfg) = test_support::pipeline_runtime();

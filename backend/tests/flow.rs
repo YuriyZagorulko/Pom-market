@@ -272,6 +272,19 @@ async fn paper_workflow_and_tenant_isolation() {
     .await;
     let strategy_id = strategy["id"].as_str().unwrap();
     assert_eq!(strategy["enabled"], false);
+    let patch = send(
+        &http,
+        &base,
+        "PATCH",
+        &format!("/api/v1/strategies/{strategy_id}"),
+        &ada_token,
+        json!({
+            "display_name": "Ada strategy",
+            "max_position_usd": "25"
+        }),
+    )
+    .await;
+    assert_eq!(patch["ok"], true);
     send(
         &http,
         &base,
@@ -324,6 +337,7 @@ async fn paper_workflow_and_tenant_isolation() {
         confirm_live: false,
         default_fee_rate: Decimal::ZERO,
         default_fee_exponent: 1,
+        paper_allow_synthetic_fills: false,
     };
     let data = pommarket::polymarket::http::PublicClient::new(
         cfg.data_api_host.clone(),

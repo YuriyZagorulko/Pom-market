@@ -31,7 +31,13 @@ pub struct CopyPreviewParams {
     pub copy_sell: bool,
     pub source_equity_usd: Option<Decimal>,
     pub source_equity_status: Option<EquityStatus>,
+    /// Open-position MTM for position_value_ratio preview rows.
+    pub source_open_positions_value_usd: Option<Decimal>,
     pub scaling_ratio_percent: Option<Decimal>,
+    #[serde(default)]
+    pub paper_trading: bool,
+    #[serde(default)]
+    pub allow_subminimum_paper_trades: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,13 +74,15 @@ pub fn parse_sizing_mode(mode: &str) -> SizingMode {
         "proportional" => SizingMode::Proportional,
         "multiplier" => SizingMode::Multiplier,
         "portfolio_ratio" => SizingMode::PortfolioRatio,
+        "position_value_ratio" => SizingMode::PositionValueRatio,
         _ => SizingMode::FixedAmount,
     }
 }
 
-/// Percent UX → DB coefficient.
+/// UI percent → DB coefficient (`proportion`). Standard copy % is 1–100; legacy multipliers may exceed 100 (e.g. 150 → 1.5).
 pub fn percent_to_proportion(percent: Decimal) -> Option<Decimal> {
-    if percent <= Decimal::ZERO || percent > Decimal::from(100) {
+    let max = Decimal::from(10_000);
+    if percent <= Decimal::ZERO || percent > max {
         return None;
     }
     Some((percent / Decimal::from(100)).round_dp(8))
@@ -98,8 +106,24 @@ pub fn portfolio_ratio_notional(
         strategy_allocated_capital_usd: strategy_allocated,
         source_trader_equity_usd: Some(source_equity),
         source_equity_status: Some(EquityStatus::Partial),
+        source_open_positions_value_usd: None,
     };
     raw_copy_notional(&params, source_notional)
+}
+
+/// Thin wrapper for formula tests.
+pub fn position_value_ratio_notional(
+    source_notional: Decimal,
+    strategy_allocated: Decimal,
+    open_positions_value: Decimal,
+    trade_multiplier: Option<Decimal>,
+) -> Result<Decimal, RejectReason> {
+    crate::copy_sizing::position_value_ratio_notional(
+        source_notional,
+        strategy_allocated,
+        open_positions_value,
+        trade_multiplier,
+    )
 }
 
 fn mode_params(params: &CopyPreviewParams) -> StrategyModeParams {
@@ -111,6 +135,7 @@ fn mode_params(params: &CopyPreviewParams) -> StrategyModeParams {
         strategy_allocated_capital_usd: params.effective_allocation_cap_usd,
         source_trader_equity_usd: params.source_equity_usd,
         source_equity_status: params.source_equity_status,
+        source_open_positions_value_usd: params.source_open_positions_value_usd,
     }
 }
 
@@ -154,9 +179,12 @@ pub fn simulate_copy_preview(
         let mut reason: Option<String> = None;
         let mut raw_copy: Option<Decimal> = None;
         let mut final_notional: Option<Decimal> = None;
-        let src_pct = params
-            .source_equity_usd
-            .and_then(|eq| source_trade_percent(event.notional_usd, eq));
+        let reference_usd = if params.sizing_mode == "position_value_ratio" {
+            params.source_open_positions_value_usd
+        } else {
+            params.source_equity_usd
+        };
+        let src_pct = reference_usd.and_then(|v| source_trade_percent(event.notional_usd, v));
 
         if !event.allowed_check {
             result = "rejected".into();
@@ -173,28 +201,37 @@ pub fn simulate_copy_preview(
                         max_position_usd: params.max_position_usd,
                         min_order_usd: params.min_order_usd,
                         strategy_remaining_usd: available_before,
-                        account_exposure_remaining_usd: params
-                            .account_max_exposure
-                            .min(params.max_exposure_usd),
                         available_balance_usd: Decimal::MAX,
+                        allow_subminimum_paper_trades: params.paper_trading
+                            && params.allow_subminimum_paper_trades,
                     };
                     match capped_copy_notional(&mode, event.notional_usd, &limits) {
                         Ok(notional) => {
                             final_notional = Some(notional);
+                            let submin = params.paper_trading && params.allow_subminimum_paper_trades;
+                            let exchange_floor = if submin {
+                                if params.min_order_usd > Decimal::ZERO {
+                                    params.min_order_usd
+                                } else {
+                                    Decimal::ZERO
+                                }
+                            } else {
+                                params.min_order_usd.max(EXCHANGE_MIN_NOTIONAL)
+                            };
                             if notional < raw {
-                                result =
-                                    if notional < params.min_order_usd.max(EXCHANGE_MIN_NOTIONAL) {
-                                        "rejected".into()
-                                    } else {
-                                        "limited".into()
-                                    };
+                                result = if notional < exchange_floor {
+                                    "rejected".into()
+                                } else {
+                                    "limited".into()
+                                };
                                 if result == "rejected" {
                                     reason = Some(RejectReason::StrategyBudget.as_str().into());
                                 } else {
                                     reason = Some("capped_by_budget_or_risk".into());
                                 }
                             }
-                            if notional < params.min_order_usd.max(EXCHANGE_MIN_NOTIONAL) {
+                            if notional < exchange_floor || (submin && notional <= Decimal::ZERO)
+                            {
                                 result = "rejected".into();
                                 reason = Some(RejectReason::BelowMinimum.as_str().into());
                                 final_notional = None;
@@ -235,6 +272,7 @@ pub fn simulate_copy_preview(
                 lot.map(|l| l.pending_exit_shares).unwrap_or(Decimal::ZERO),
                 event.price,
                 params.min_order_usd,
+                params.paper_trading && params.allow_subminimum_paper_trades,
             );
             if let Some(reject) = plan.reject {
                 if let Some(lot) = lots.get_mut(&event.token_id) {
@@ -332,8 +370,17 @@ mod tests {
             copy_sell: true,
             source_equity_usd: None,
             source_equity_status: None,
+            source_open_positions_value_usd: None,
             scaling_ratio_percent: None,
+            paper_trading: false,
+            allow_subminimum_paper_trades: false,
         }
+    }
+
+    #[test]
+    fn percent_to_proportion_allows_above_100_for_legacy_multiplier() {
+        assert_eq!(percent_to_proportion(d("150")).unwrap(), d("1.5"));
+        assert_eq!(percent_to_proportion(d("20")).unwrap(), d("0.2"));
     }
 
     #[test]
@@ -341,7 +388,8 @@ mod tests {
         assert_eq!(percent_to_proportion(d("10")).unwrap(), d("0.1"));
         assert_eq!(percent_to_proportion(d("100")).unwrap(), d("1"));
         assert!(percent_to_proportion(d("0")).is_none());
-        assert!(percent_to_proportion(d("101")).is_none());
+        assert_eq!(percent_to_proportion(d("101")).unwrap(), d("1.01"));
+        assert!(percent_to_proportion(d("10001")).is_none());
     }
 
     #[test]
@@ -421,7 +469,10 @@ mod tests {
             copy_sell: true,
             source_equity_usd: Some(d("20000")),
             source_equity_status: Some(EquityStatus::Partial),
+            source_open_positions_value_usd: None,
             scaling_ratio_percent: scaling_ratio(d("2000"), d("20000")),
+            paper_trading: false,
+            allow_subminimum_paper_trades: false,
         };
         let events = vec![PreviewEvent {
             id: Uuid::new_v4(),
@@ -441,5 +492,90 @@ mod tests {
         let rows = simulate_copy_preview(&events, &params);
         assert_eq!(rows[0].raw_copy_notional_usd, Some(d("400")));
         assert_eq!(rows[0].final_notional_usd, Some(d("400")));
+    }
+
+    #[test]
+    fn paper_preview_allows_sub_dollar_pvr() {
+        let mut params = CopyPreviewParams {
+            sizing_mode: "position_value_ratio".into(),
+            fixed_amount_usd: None,
+            proportion: None,
+            multiplier: None,
+            effective_allocation_cap_usd: d("2000"),
+            max_position_usd: d("5000"),
+            max_exposure_usd: d("5000"),
+            account_max_exposure: d("5000"),
+            max_order_usd: d("50"),
+            min_order_usd: Decimal::ZERO,
+            copy_buy: true,
+            copy_sell: true,
+            source_equity_usd: None,
+            source_equity_status: Some(EquityStatus::Unavailable),
+            source_open_positions_value_usd: Some(d("500000")),
+            scaling_ratio_percent: None,
+            paper_trading: true,
+            allow_subminimum_paper_trades: true,
+        };
+        let events = vec![PreviewEvent {
+            id: Uuid::new_v4(),
+            token_id: "tok".into(),
+            side: "buy".into(),
+            price: d("0.50"),
+            size_shares: d("100"),
+            notional_usd: d("50"),
+            event_ts: Utc::now(),
+            market_title: None,
+            market_icon: None,
+            outcome: None,
+            condition_id: None,
+            market_slug: None,
+            allowed_check: true,
+        }];
+        let rows = simulate_copy_preview(&events, &params);
+        let n = rows[0].final_notional_usd.unwrap();
+        assert!(n < Decimal::ONE);
+        assert_eq!(rows[0].result, "can_copy");
+    }
+
+    #[test]
+    fn position_value_preview_matches_shared_sizing() {
+        let params = CopyPreviewParams {
+            sizing_mode: "position_value_ratio".into(),
+            fixed_amount_usd: None,
+            proportion: None,
+            multiplier: None,
+            effective_allocation_cap_usd: d("2000"),
+            max_position_usd: d("5000"),
+            max_exposure_usd: d("5000"),
+            account_max_exposure: d("5000"),
+            max_order_usd: d("5000"),
+            min_order_usd: d("1"),
+            copy_buy: true,
+            copy_sell: true,
+            source_equity_usd: None,
+            source_equity_status: Some(EquityStatus::Unavailable),
+            source_open_positions_value_usd: Some(d("4000")),
+            scaling_ratio_percent: None,
+            paper_trading: false,
+            allow_subminimum_paper_trades: false,
+        };
+        let events = vec![PreviewEvent {
+            id: Uuid::new_v4(),
+            token_id: "tok".into(),
+            side: "buy".into(),
+            price: d("0.5"),
+            size_shares: d("400"),
+            notional_usd: d("200"),
+            event_ts: Utc::now(),
+            market_title: None,
+            market_icon: None,
+            outcome: None,
+            condition_id: None,
+            market_slug: None,
+            allowed_check: true,
+        }];
+        let rows = simulate_copy_preview(&events, &params);
+        assert_eq!(rows[0].raw_copy_notional_usd, Some(d("100")));
+        assert_eq!(rows[0].source_trade_percent, Some(d("5")));
     }
 }

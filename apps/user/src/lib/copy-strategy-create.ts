@@ -1,6 +1,7 @@
 import { percentToProportion } from "@/lib/copy-sizing";
+import { type UserSizingMode } from "@/lib/sizing-mode";
 
-export type SizingMode = "fixed_amount" | "proportional" | "multiplier" | "portfolio_ratio";
+export type { UserSizingMode as SizingMode };
 export type AllocationMode = "fixed_usd" | "percent_of_account";
 
 export type CopyStrategyCreateInput = {
@@ -8,19 +9,19 @@ export type CopyStrategyCreateInput = {
   sourceTraderId: string;
   allocationMode: AllocationMode;
   allocationPercent: string;
-  sizingMode: SizingMode;
+  sizingMode: UserSizingMode;
   strategyBudgetUsd: string;
   maxPositionUsd: string;
-  maxExposureUsd: string;
   maxOpenPositions: string;
   maxSlippageBps: string;
   minOrderUsd: string;
   cooldownSeconds: string;
   copyBuy: boolean;
   copySell: boolean;
+  allowSubminimumPaperTrades: boolean;
   copyPercent: string;
   fixedAmountUsd: string;
-  multiplier: string;
+  pvrTradeMultiplier: string;
   monitoringEnabled: boolean;
   accountOperatingMode: string | undefined;
 };
@@ -50,9 +51,10 @@ export function validateCopyStrategyCreateInput(input: CopyStrategyCreateInput):
   } else if (input.sizingMode === "fixed_amount") {
     const fixed = Number(input.fixedAmountUsd);
     if (!Number.isFinite(fixed) || fixed <= 0) return "Fixed amount must be greater than zero.";
-  } else if (input.sizingMode === "multiplier") {
-    const mult = Number(input.multiplier);
-    if (!Number.isFinite(mult) || mult <= 0) return "Multiplier must be greater than zero.";
+  } else if (input.sizingMode === "position_value_ratio") {
+    const mult = Number(input.pvrTradeMultiplier);
+    if (!Number.isFinite(mult) || mult <= 0) return "PVR trade multiplier must be greater than zero.";
+    if (mult > 10_000) return "PVR trade multiplier must be at most 10000.";
   }
   return null;
 }
@@ -78,13 +80,13 @@ export function buildCopyStrategyCreateBody(input: CopyStrategyCreateInput): Rec
     allocation_mode: input.allocationMode,
     strategy_budget_usd: budget,
     max_position_usd: num(input.maxPositionUsd),
-    max_exposure_usd: num(input.maxExposureUsd || input.strategyBudgetUsd),
     max_open_positions: intField(input.maxOpenPositions),
     max_slippage_bps: intField(input.maxSlippageBps),
     min_order_usd: num(input.minOrderUsd),
     cooldown_seconds: intField(input.cooldownSeconds),
     copy_buy: input.copyBuy,
     copy_sell: input.copySell,
+    allow_subminimum_paper_trades: input.allowSubminimumPaperTrades,
   };
   if (input.allocationMode === "percent_of_account") {
     body.allocation_percent = num(input.allocationPercent);
@@ -93,8 +95,11 @@ export function buildCopyStrategyCreateBody(input: CopyStrategyCreateInput): Rec
     body.copy_percent = num(input.copyPercent);
   } else if (input.sizingMode === "fixed_amount") {
     body.fixed_amount_usd = num(input.fixedAmountUsd);
-  } else if (input.sizingMode === "multiplier") {
-    body.multiplier = num(input.multiplier);
+  } else if (input.sizingMode === "position_value_ratio") {
+    const mult = num(input.pvrTradeMultiplier);
+    if (mult > 0 && mult !== 1) {
+      body.multiplier = mult;
+    }
   }
   return body;
 }

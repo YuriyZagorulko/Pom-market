@@ -4,7 +4,7 @@ mod test_support;
 
 use pommarket::config::Config;
 use pommarket::db::{begin_as, connect, migrate};
-use pommarket::strategy_analytics::compute_metrics;
+use pommarket::strategy_analytics::{compute_metrics, capital_funding_status, CapitalFundingStatus};
 use rust_decimal::Decimal;
 use test_support::assert_test_database_url;
 use uuid::Uuid;
@@ -156,4 +156,55 @@ async fn unrealized_uses_last_fill_mark() {
     assert_eq!(m.unrealized_pnl_usd, Decimal::ZERO);
     assert_eq!(m.positions_market_value_usd, Decimal::from(5));
     assert_eq!(m.fees_usd, Decimal::new(1, 2));
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL pointed at pommarket_test"]
+async fn overview_capital_status_from_ledger_not_configured() {
+    let url = std::env::var("MIGRATION_DATABASE_URL").expect("MIGRATION_DATABASE_URL");
+    assert_test_database_url(&url);
+    migrate(&url).await.unwrap();
+    let pool = connect(&url).await.unwrap();
+    let (user, account, _trader, strategy) = seed(&pool).await;
+    sqlx::query(
+        "INSERT INTO strategy_capital_accounts (strategy_id, user_id, trading_account_id, funded_capital_usd, available_cash_usd, bootstrap_quality, initialized_at)
+         VALUES ($1,$2,$3,0,0,'pending',now())",
+    )
+    .bind(strategy)
+    .bind(user)
+    .bind(account)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cfg = Config::from_env().expect("config");
+    let m = compute_metrics(&pool, user, strategy, &cfg).await.unwrap();
+    assert_eq!(m.configured_allocation_cap_usd, Decimal::from(1000));
+    assert_eq!(m.funded_capital_usd, Decimal::ZERO);
+    assert_eq!(m.capital_funding_status, CapitalFundingStatus::NotFunded);
+    assert_eq!(
+        capital_funding_status(m.configured_allocation_cap_usd, m.funded_capital_usd),
+        CapitalFundingStatus::NotFunded
+    );
+
+    sqlx::query(
+        "UPDATE strategy_capital_accounts SET funded_capital_usd=400, available_cash_usd=400, bootstrap_quality='migrated' WHERE strategy_id=$1",
+    )
+    .bind(strategy)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let m = compute_metrics(&pool, user, strategy, &cfg).await.unwrap();
+    assert_eq!(m.funded_capital_usd, Decimal::from(400));
+    assert_eq!(m.capital_funding_status, CapitalFundingStatus::PartiallyFunded);
+    assert_eq!(m.available_capital_usd, Decimal::from(400));
+
+    sqlx::query(
+        "UPDATE strategy_capital_accounts SET funded_capital_usd=1000, available_cash_usd=1000 WHERE strategy_id=$1",
+    )
+    .bind(strategy)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let m = compute_metrics(&pool, user, strategy, &cfg).await.unwrap();
+    assert_eq!(m.capital_funding_status, CapitalFundingStatus::Funded);
 }

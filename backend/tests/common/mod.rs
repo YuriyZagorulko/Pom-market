@@ -126,6 +126,7 @@ impl TestApi {
             confirm_live: false,
             default_fee_rate: Decimal::ZERO,
             default_fee_exponent: 1,
+            paper_allow_synthetic_fills: false,
         };
         let data = PublicClient::new(
             cfg.data_api_host.clone(),

@@ -98,7 +98,7 @@ fn estimate_sell_proceeds(book: &OrderBook, shares: Decimal) -> Result<Decimal, 
         slip,
         tick,
     );
-    let fill = walk_book(book, false, limit, shares, None)?;
+    let fill = walk_book(book, false, limit, shares, None, true)?;
     Ok(fill.notional)
 }
 

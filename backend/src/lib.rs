@@ -5,6 +5,7 @@ pub mod client_ip;
 pub mod config;
 pub mod copy_preview;
 pub mod copy_sizing;
+pub mod sizing_mode;
 pub mod db;
 pub mod email;
 pub mod engine;
@@ -17,6 +18,7 @@ pub mod source_equity;
 pub mod strategy_accounting;
 pub mod strategy_analytics;
 pub mod strategy_budget;
+pub mod strategy_readiness;
 pub mod trading_control;
 
 use chrono::Utc;

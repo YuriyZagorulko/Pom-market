@@ -14,6 +14,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      "@pom/format": path.resolve(__dirname, "../../packages/format/src/numeric-input.ts"),
     },
   },
 });

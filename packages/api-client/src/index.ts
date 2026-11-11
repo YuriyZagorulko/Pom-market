@@ -39,14 +39,41 @@ function errorMessageFromResponse(status: number, statusText: string, text: stri
   return statusText || `Request failed (${status})`;
 }
 
+const AUTH_NO_RETRY = ["/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/logout"];
+
 export class ApiClient {
+  private refreshInFlight: Promise<{ access_token: string; user: ApiUser }> | null = null;
+  private onRefreshed: ((accessToken: string, user: ApiUser) => void) | null = null;
+
   constructor(private token: string | null = null) {}
 
   setToken(token: string | null) {
     this.token = token;
   }
 
-  async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  setOnRefreshed(handler: ((accessToken: string, user: ApiUser) => void) | null) {
+    this.onRefreshed = handler;
+  }
+
+  private async refreshAccessToken(): Promise<{ access_token: string; user: ApiUser }> {
+    if (!this.refreshInFlight) {
+      this.refreshInFlight = this.request<{ access_token: string; user: ApiUser }>(
+        "/api/v1/auth/refresh",
+        { method: "POST" },
+        { allowUnauthorizedRetry: false },
+      ).finally(() => {
+        this.refreshInFlight = null;
+      });
+    }
+    return this.refreshInFlight;
+  }
+
+  async request<T>(
+    path: string,
+    init: RequestInit = {},
+    options: { allowUnauthorizedRetry?: boolean } = {},
+  ): Promise<T> {
+    const allowUnauthorizedRetry = options.allowUnauthorizedRetry !== false;
     const headers = new Headers(init.headers);
     if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     if (this.token) headers.set("Authorization", `Bearer ${this.token}`);
@@ -59,6 +86,21 @@ export class ApiClient {
       throw new ApiError(0, "Could not reach the API. Is the backend running on port 4321?");
     }
     const parsed = parseResponseJson(text);
+    if (
+      response.status === 401 &&
+      allowUnauthorizedRetry &&
+      this.token &&
+      !AUTH_NO_RETRY.some((p) => path === p || path.startsWith(`${p}?`))
+    ) {
+      try {
+        const refreshed = await this.refreshAccessToken();
+        this.token = refreshed.access_token;
+        this.onRefreshed?.(refreshed.access_token, refreshed.user);
+        return this.request<T>(path, init, { allowUnauthorizedRetry: false });
+      } catch {
+        // fall through: expired access and refresh failed
+      }
+    }
     if (!response.ok) {
       throw new ApiError(
         response.status,
@@ -78,7 +120,7 @@ export class ApiClient {
   }
 
   refresh() {
-    return this.request<{ access_token: string; user: ApiUser }>("/api/v1/auth/refresh", { method: "POST" });
+    return this.refreshAccessToken();
   }
 
   logout() {

@@ -13,19 +13,50 @@ type Session = {
 
 const Ctx = createContext<Session | null>(null);
 
+const SESSION_REFRESH_MS = 12 * 60 * 1000;
+
+function applySession(
+  client: ApiClient,
+  role: "user" | "admin",
+  result: { access_token: string; user: ApiUser },
+  setUser: (u: ApiUser | null) => void,
+) {
+  if (result.user.role === role) {
+    client.setToken(result.access_token);
+    setUser(result.user);
+  }
+}
+
 export function SessionProvider({ children, role }: { children: React.ReactNode; role: "user" | "admin" }) {
   const client = useMemo(() => new ApiClient(), []);
   const [user, setUser] = useState<ApiUser | null>(null);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
+    client.setOnRefreshed((accessToken, refreshedUser) => {
+      applySession(client, role, { access_token: accessToken, user: refreshedUser }, setUser);
+    });
+    return () => client.setOnRefreshed(null);
+  }, [client, role]);
+
+  useEffect(() => {
     client.refresh().then((result) => {
-      if (result.user.role === role) {
-        client.setToken(result.access_token);
-        setUser(result.user);
-      }
+      applySession(client, role, result, setUser);
     }).catch(() => undefined).finally(() => setReady(true));
   }, [client, role]);
+
+  useEffect(() => {
+    if (!user) return;
+    const timer = setInterval(() => {
+      client.refresh().then((result) => {
+        applySession(client, role, result, setUser);
+      }).catch(() => {
+        client.setToken(null);
+        setUser(null);
+      });
+    }, SESSION_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [client, role, user]);
 
   const value: Session = {
     user,

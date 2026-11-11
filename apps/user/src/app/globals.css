@@ -46,11 +46,16 @@ button.ghost { background: transparent; color: var(--ink); border: 1px solid var
 .timeline div { margin: 0 0 10px; }
 .wallet-activity { max-width: 920px; }
 .metric-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+.status-badge { display: inline-block; border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 600; letter-spacing: 0.02em; }
+.status-badge.strategy-enabled { background: #d8efe4; color: var(--good); }
+.status-badge.strategy-disabled { background: #efe7da; color: var(--muted); }
+.status-badge.capital-funded { background: #d8efe4; color: var(--good); }
+.status-badge.capital-not-funded { background: #f5dede; color: var(--bad); }
+.status-badge.capital-partial { background: #f5ead8; color: var(--warn); }
 .metric-card { display: grid; gap: 4px; padding: 12px; }
 .positive { color: var(--good); }
 .negative { color: var(--bad); }
 .data-table { font-size: 13px; }
-.strategy-detail .activity-card { padding: 8px 0; }
 .activity-feed { list-style: none; margin: 16px 0 0; padding: 0; display: grid; gap: 12px; }
 .activity-card { display: grid; gap: 12px; }
 .activity-card.side-buy { border-left: 3px solid var(--good); }

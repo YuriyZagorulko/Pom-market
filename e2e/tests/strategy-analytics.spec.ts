@@ -18,7 +18,18 @@ test("strategy analytics tabs and overview", async ({ page }) => {
   }
   await link.click();
   await expect(page.getByRole("button", { name: "Overview" })).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByText(/Partial equity/i).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("Disabled").or(page.getByText("Enabled")).first()).toBeVisible({ timeout: 15_000 });
+  await expect(
+    page.getByText(/Not funded|Partially funded|Funded/).first(),
+  ).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("Configured allocation", { exact: true })).toBeVisible();
+  await expect(page.getByText("Funded amount", { exact: true })).toBeVisible();
+  await expect(page.locator(".metric-grid").getByText("Strategy equity", { exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(
+    page.getByText(/Configured allocation \(not yet funded\)|Partial equity|Strategy equity \(available/i).first(),
+  ).toBeVisible({ timeout: 15_000 });
   for (const p of ["1D", "1W", "1M", "ALL"]) {
     await page.getByRole("button", { name: p, exact: true }).click();
   }

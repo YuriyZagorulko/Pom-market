@@ -7,20 +7,10 @@ services:
       context: .
       dockerfile: docker/backend.Dockerfile.dev
     image: pom-market-api-dev
-    command:
-      [
-        "cargo",
-        "watch",
-        "-q",
-        "-w",
-        "src",
-        "-w",
-        "migrations",
-        "-x",
-        "run --bin pom-api",
-      ]
+    command: ["/bin/sh", "/docker/dev-api-watch.sh"]
     user: root
     volumes:
+      - ./docker:/docker:ro
       - ./backend:/src
       - cargo-target-api:/src/target-api
       - cargo-registry:/usr/local/cargo/registry
@@ -32,18 +22,10 @@ services:
       context: .
       dockerfile: docker/backend.Dockerfile.dev
     image: pom-market-worker-dev
-    command:
-      [
-        "cargo",
-        "watch",
-        "-q",
-        "-w",
-        "src",
-        "-x",
-        "run --bin pom-worker",
-      ]
+    command: ["/bin/sh", "/docker/dev-worker-watch.sh"]
     user: root
     volumes:
+      - ./docker:/docker:ro
       - ./backend:/src
       - cargo-target-worker:/src/target-worker
       - cargo-registry:/usr/local/cargo/registry

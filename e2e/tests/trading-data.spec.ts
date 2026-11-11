@@ -99,8 +99,9 @@ test("wallet activity: filters, presets, URL reload", async ({ page }) => {
   }
 
   await page.goto("/trades?side=buy&limit=25");
-  await page.reload();
-  await expect(page).toHaveURL(/side=buy/);
+  await expect(page.getByRole("heading", { name: "Wallet activity" })).toBeVisible({ timeout: 15_000 });
+  await expect(page).toHaveURL(/side=buy/, { timeout: 15_000 });
+  await expect(page.getByLabel("Side")).toHaveValue("buy");
 });
 
 test("orders, executions, positions: account picker", async ({ page }) => {

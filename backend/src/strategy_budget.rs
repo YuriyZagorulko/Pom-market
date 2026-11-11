@@ -204,11 +204,11 @@ async fn utilization_in_tx(
     .await?;
 
     let updated_at: DateTime<Utc> = sqlx::query_scalar(
-        "SELECT GREATEST(
+        "SELECT COALESCE(GREATEST(
             COALESCE((SELECT MAX(updated_at) FROM positions WHERE strategy_id = $1), '-infinity'::timestamptz),
             COALESCE((SELECT MAX(o.updated_at) FROM orders o JOIN copy_decisions d ON d.id = o.decision_id WHERE d.strategy_id = $1), '-infinity'::timestamptz),
-            (SELECT updated_at FROM copy_strategies WHERE id = $1)
-         )",
+            COALESCE((SELECT updated_at FROM copy_strategies WHERE id = $1), '-infinity'::timestamptz)
+         ), now())",
     )
     .bind(strategy_id)
     .fetch_one(&mut **tx)

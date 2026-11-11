@@ -44,7 +44,7 @@ export default async function globalSetup() {
   }
 
   const created = await fetch(
-    `${process.env.E2E_API_BASE_URL ?? "http://127.0.0.1:4321"}/api/v1/admin/users`,
+    `${apiBase}/api/v1/admin/users`,
     {
       method: "POST",
       headers: {
@@ -71,6 +71,75 @@ export default async function globalSetup() {
     { forwardedFor: SETUP_XFF },
   );
   if (!setup.ok) throw new Error(`password setup failed: HTTP ${setup.status}`);
+
+  const userToken = await apiLogin(userEmail, userPassword, SETUP_XFF);
+  const stamp = Date.now();
+  const wallet = `0x${stamp.toString(16).padStart(40, "0").slice(-40)}`;
+  const signer = "0x9965507D1a55bcC2695C58ba16Fa3C528af0BbFc";
+
+  const acctRes = await fetch(`${apiBase}/api/v1/accounts`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${userToken}`,
+      "Content-Type": "application/json",
+      "X-Forwarded-For": SETUP_XFF,
+    },
+    body: JSON.stringify({
+      name: "E2E Analytics Paper",
+      signature_type: "eoa",
+      signer_address: signer,
+    }),
+  });
+  if (!acctRes.ok) throw new Error(`global-setup account create failed: HTTP ${acctRes.status}`);
+  const acct = (await acctRes.json()) as { id: string };
+
+  async function userApi(method: string, path: string, body?: unknown) {
+    return fetch(`${apiBase}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${userToken}`,
+        "Content-Type": "application/json",
+        "X-Forwarded-For": SETUP_XFF,
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  }
+
+  const modeRes = await userApi("POST", `/api/v1/accounts/${acct.id}/mode`, { mode: "paper_trading" });
+  if (!modeRes.ok) throw new Error(`global-setup paper mode failed: HTTP ${modeRes.status}`);
+
+  const fundRes = await userApi("POST", `/api/v1/accounts/${acct.id}/capital/paper-funding`, {
+    delta_usd: "2000",
+    reason: "e2e_global_setup",
+    idempotency_key: `e2e-global-fund-${stamp}`,
+  });
+  if (!fundRes.ok) throw new Error(`global-setup paper funding failed: HTTP ${fundRes.status}`);
+
+  const traderRes = await apiPostJson(
+    "/api/v1/source-traders",
+    { wallet_address: wallet, alias: "E2E Analytics Leader" },
+    { token: userToken, forwardedFor: SETUP_XFF },
+  );
+  if (!traderRes.ok) throw new Error(`global-setup source trader failed: HTTP ${traderRes.status}`);
+  const trader = (await traderRes.json()) as { id: string };
+
+  const stratRes = await apiPostJson(
+    "/api/v1/strategies",
+    {
+      trading_account_id: acct.id,
+      source_trader_id: trader.id,
+      sizing_mode: "proportional",
+      copy_percent: "10",
+      strategy_budget_usd: "500",
+      max_position_usd: "100",
+      max_exposure_usd: "2000",
+      max_open_positions: 5,
+      max_slippage_bps: 500,
+      min_order_usd: "1",
+    },
+    { token: userToken, forwardedFor: SETUP_XFF },
+  );
+  if (!stratRes.ok) throw new Error(`global-setup strategy create failed: HTTP ${stratRes.status}`);
 
   const out = path.join(e2eDir, ".env.user.local");
   fs.writeFileSync(

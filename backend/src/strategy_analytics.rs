@@ -37,6 +37,25 @@ pub const PENDING_CAPITAL_LABEL: &str = "Configured allocation (not yet funded)"
 pub const FULL_EQUITY_NOTE: &str =
     "Full strategy equity from the capital ledger: liquid cash (available + reserved) plus mark-to-model open positions.";
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapitalFundingStatus {
+    NotFunded,
+    PartiallyFunded,
+    Funded,
+}
+
+/// Ledger `funded_capital_usd` vs configured allocation cap — never treat configured cap as funded.
+pub fn capital_funding_status(configured_cap_usd: Decimal, ledger_funded_usd: Decimal) -> CapitalFundingStatus {
+    if ledger_funded_usd <= Decimal::ZERO {
+        CapitalFundingStatus::NotFunded
+    } else if configured_cap_usd > Decimal::ZERO && ledger_funded_usd < configured_cap_usd {
+        CapitalFundingStatus::PartiallyFunded
+    } else {
+        CapitalFundingStatus::Funded
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EquityModel {
     pub strategy_equity_usd: Decimal,
@@ -65,8 +84,15 @@ pub struct StrategyMetrics {
     pub equity: EquityModel,
     pub capital_bootstrap_quality: Option<String>,
     pub configured_allocation_cap_usd: Decimal,
+    pub funded_capital_usd: Decimal,
+    pub capital_funding_status: CapitalFundingStatus,
     pub mark_quality: &'static str,
     pub mark_quality_note: Option<String>,
+    /// Primary ROI/PnL view uses CLOB fills only; legacy position lots may pre-date labeling.
+    pub performance_fill_scope: &'static str,
+    pub clob_fill_count: i64,
+    pub legacy_unlabeled_fill_count: i64,
+    pub synthetic_experimental_fill_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +152,9 @@ pub struct ActivityRow {
     pub market_title: Option<String>,
     pub outcome: Option<String>,
     pub target_notional_usd: Option<Decimal>,
+    /// PVR trade multiplier when sizing audit recorded it (`NULL` / 1 = omit in UI).
+    pub pvr_trade_multiplier: Option<Decimal>,
+    pub sizing_mode: Option<String>,
     pub order_id: Option<Uuid>,
     pub order_status: Option<String>,
     pub submitted_at: Option<DateTime<Utc>>,
@@ -136,6 +165,8 @@ pub struct ActivityRow {
     pub fee_usd: Option<Decimal>,
     pub slippage_vs_source_bps: Option<i32>,
     pub slippage_vs_limit_bps: Option<i32>,
+    pub paper_execution_mode: Option<String>,
+    pub paper_execution_context: Option<serde_json::Value>,
     pub execution_status: &'static str,
 }
 
@@ -155,6 +186,12 @@ pub struct PerformanceMetrics {
     pub avg_holding_hours: Option<Decimal>,
     pub fees_usd: Decimal,
     pub slippage_bps_avg: Option<Decimal>,
+    pub slippage_bps_avg_clob: Option<Decimal>,
+    pub slippage_bps_avg_synthetic: Option<Decimal>,
+    pub clob_fill_count: i64,
+    pub synthetic_fill_count: i64,
+    pub legacy_unlabeled_fill_count: i64,
+    pub performance_fill_scope: &'static str,
     pub sample_size_note: Option<String>,
 }
 
@@ -185,7 +222,7 @@ async fn token_mark(
         "SELECT f.price, f.filled_at FROM fills f
          JOIN orders o ON o.id = f.order_id
          JOIN copy_decisions d ON d.id = o.decision_id
-         WHERE d.strategy_id = $1 AND o.token_id = $2
+         WHERE d.strategy_id = $1 AND o.token_id = $2 AND f.paper_execution_mode = 'clob'
          ORDER BY f.filled_at DESC LIMIT 1",
     )
     .bind(strategy_id)
@@ -296,7 +333,35 @@ pub async fn compute_metrics(
          FROM fills f
          JOIN orders o ON o.id = f.order_id
          JOIN copy_decisions d ON d.id = o.decision_id
-         WHERE d.strategy_id = $1",
+         WHERE d.strategy_id = $1 AND f.paper_execution_mode = 'clob'",
+    )
+    .bind(strategy_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let clob_fill_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND f.paper_execution_mode = 'clob'",
+    )
+    .bind(strategy_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let legacy_unlabeled_fill_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND f.paper_execution_mode IS NULL",
+    )
+    .bind(strategy_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let synthetic_experimental_fill_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND f.paper_execution_mode = 'synthetic_source_price'",
     )
     .bind(strategy_id)
     .fetch_one(&mut *tx)
@@ -345,11 +410,7 @@ pub async fn compute_metrics(
             .fetch_one(&mut *tx)
             .await?;
 
-    let trades: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM copy_decisions WHERE strategy_id = $1")
-            .bind(strategy_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let trades: i64 = clob_fill_count;
 
     let capital: Option<(Decimal, Decimal, Decimal, Decimal, String)> = sqlx::query_as(
         "SELECT available_cash_usd, reserved_cash_usd, invested_capital_usd, funded_capital_usd, bootstrap_quality
@@ -414,7 +475,8 @@ pub async fn compute_metrics(
                 EQUITY_MODEL_NOTE,
             )
         }
-    } else if util.deployed_capital_usd > Decimal::ZERO || util.reserved_capital_usd > Decimal::ZERO {
+    } else if util.deployed_capital_usd > Decimal::ZERO || util.reserved_capital_usd > Decimal::ZERO
+    {
         (
             Decimal::ZERO,
             util.reserved_capital_usd,
@@ -437,6 +499,10 @@ pub async fn compute_metrics(
     };
 
     let bootstrap_quality = capital.as_ref().map(|(_, _, _, _, q)| q.to_string());
+    let ledger_funded = capital
+        .as_ref()
+        .map(|(_, _, _, funded, _)| *funded)
+        .unwrap_or(Decimal::ZERO);
     let ledger_allocated = capital
         .as_ref()
         .filter(|(_, _, _, funded, q)| q != "pending" && *funded > Decimal::ZERO)
@@ -447,10 +513,13 @@ pub async fn compute_metrics(
     } else {
         allocated
     };
+    let funding_status = capital_funding_status(allocated, ledger_funded);
 
     Ok(StrategyMetrics {
         allocated_capital_usd: allocated_display,
         configured_allocation_cap_usd: allocated,
+        funded_capital_usd: ledger_funded,
+        capital_funding_status: funding_status,
         deployed_capital_usd: util.deployed_capital_usd,
         reserved_capital_usd: reserved_cap,
         available_capital_usd: available_cap,
@@ -497,6 +566,10 @@ pub async fn compute_metrics(
             },
         },
         capital_bootstrap_quality: bootstrap_quality,
+        performance_fill_scope: "clob_fills_only",
+        clob_fill_count,
+        legacy_unlabeled_fill_count,
+        synthetic_experimental_fill_count,
     })
 }
 
@@ -714,6 +787,37 @@ pub async fn list_positions(
     Ok((rows, total))
 }
 
+fn json_decimal(value: &serde_json::Value) -> Option<Decimal> {
+    match value {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+fn sizing_audit_raw_target(checks: &serde_json::Value) -> Option<Decimal> {
+    checks
+        .get("sizing_audit")
+        .and_then(|a| a.get("raw_target_notional_usd"))
+        .and_then(json_decimal)
+}
+
+fn sizing_audit_pvr_multiplier(checks: &serde_json::Value) -> Option<Decimal> {
+    checks
+        .get("sizing_audit")
+        .and_then(|a| a.get("pvr_trade_multiplier"))
+        .and_then(json_decimal)
+        .filter(|m| *m > Decimal::ZERO && *m != Decimal::ONE)
+}
+
+fn sizing_audit_mode(checks: &serde_json::Value) -> Option<String> {
+    checks
+        .get("sizing_audit")
+        .and_then(|a| a.get("sizing_mode"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 fn execution_status(decision_status: &str, order_status: Option<&str>) -> &'static str {
     if decision_status == "rejected" || decision_status == "skipped" {
         return "skipped";
@@ -779,9 +883,10 @@ pub async fn list_activity(
         "SELECT d.id AS decision_id, d.status AS decision_status, d.side, d.reason, d.source_event_id, d.decided_at, d.detected_at,
                 e.event_ts AS source_event_at, e.notional_usd AS source_notional_usd, e.price AS source_price, e.size_shares AS source_shares,
                 e.market_title, e.outcome,
-                d.target_notional_usd,
+                d.target_notional_usd, d.checks,
                 o.id AS order_id, o.status AS order_status, o.submitted_at,
-                f.id AS fill_id, f.filled_at, f.price AS fill_price, f.shares AS fill_shares, f.fee_usd, f.slippage_vs_source_bps, f.slippage_vs_limit_bps
+                f.id AS fill_id, f.filled_at, f.price AS fill_price, f.shares AS fill_shares, f.fee_usd, f.slippage_vs_source_bps, f.slippage_vs_limit_bps,
+                f.paper_execution_mode, f.paper_execution_context
          FROM copy_decisions d
          LEFT JOIN source_events e ON e.id = d.source_event_id
          LEFT JOIN orders o ON o.decision_id = d.id
@@ -821,7 +926,13 @@ pub async fn list_activity(
             let source_shares: Option<Decimal> = row.get("source_shares");
             let market_title: Option<String> = row.get("market_title");
             let outcome: Option<String> = row.get("outcome");
-            let target_notional_usd: Option<Decimal> = row.get("target_notional_usd");
+            let checks: serde_json::Value = row.get("checks");
+            let target_notional_usd: Option<Decimal> = row
+                .get::<Option<Decimal>, _>("target_notional_usd")
+                .or_else(|| sizing_audit_raw_target(&checks))
+                .filter(|d| *d > Decimal::ZERO);
+            let pvr_trade_multiplier = sizing_audit_pvr_multiplier(&checks);
+            let sizing_mode = sizing_audit_mode(&checks);
             let order_id: Option<Uuid> = row.get("order_id");
             let order_status: Option<String> = row.get("order_status");
             let submitted_at: Option<DateTime<Utc>> = row.get("submitted_at");
@@ -832,6 +943,9 @@ pub async fn list_activity(
             let fee_usd: Option<Decimal> = row.get("fee_usd");
             let slip_src: Option<i32> = row.get("slippage_vs_source_bps");
             let slip_lim: Option<i32> = row.get("slippage_vs_limit_bps");
+            let paper_execution_mode: Option<String> = row.get("paper_execution_mode");
+            let paper_execution_context: Option<serde_json::Value> =
+                row.get("paper_execution_context");
             let exec = execution_status(&decision_status, order_status.as_deref());
             let (reason_title, reason_detail) = if reason.is_empty() {
                 (None, None)
@@ -862,6 +976,8 @@ pub async fn list_activity(
                 market_title,
                 outcome,
                 target_notional_usd,
+                pvr_trade_multiplier,
+                sizing_mode,
                 order_id,
                 order_status,
                 submitted_at,
@@ -872,6 +988,8 @@ pub async fn list_activity(
                 fee_usd,
                 slippage_vs_source_bps: slip_src,
                 slippage_vs_limit_bps: slip_lim,
+                paper_execution_mode,
+                paper_execution_context,
                 execution_status: exec,
             }
         })
@@ -920,10 +1038,60 @@ pub async fn compute_performance(
          FROM fills f
          JOIN orders o ON o.id = f.order_id
          JOIN copy_decisions d ON d.id = o.decision_id
-         WHERE d.strategy_id = $1 AND f.slippage_vs_source_bps IS NOT NULL",
+         WHERE d.strategy_id = $1 AND f.slippage_vs_source_bps IS NOT NULL
+           AND f.paper_execution_mode = 'clob'",
     )
     .bind(strategy_id)
     .fetch_optional(&mut *tx)
+    .await?;
+    let slip_avg_clob: Option<Decimal> = sqlx::query_scalar(
+        "SELECT AVG(f.slippage_vs_source_bps::numeric)
+         FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND f.slippage_vs_source_bps IS NOT NULL
+           AND f.paper_execution_mode = 'clob'",
+    )
+    .bind(strategy_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let slip_avg_synthetic: Option<Decimal> = sqlx::query_scalar(
+        "SELECT AVG(f.slippage_vs_source_bps::numeric)
+         FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND f.slippage_vs_source_bps IS NOT NULL
+           AND f.paper_execution_mode = 'synthetic_source_price'",
+    )
+    .bind(strategy_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let clob_fill_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND f.paper_execution_mode = 'clob'",
+    )
+    .bind(strategy_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let synthetic_fill_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND f.paper_execution_mode = 'synthetic_source_price'",
+    )
+    .bind(strategy_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let legacy_unlabeled_fill_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND f.paper_execution_mode IS NULL",
+    )
+    .bind(strategy_id)
+    .fetch_one(&mut *tx)
     .await?;
 
     let series = equity_series(pool, user_id, strategy_id, None, None, None).await?;
@@ -976,6 +1144,12 @@ pub async fn compute_performance(
         avg_holding_hours: None,
         fees_usd: metrics.fees_usd,
         slippage_bps_avg: slip_avg,
+        slippage_bps_avg_clob: slip_avg_clob,
+        slippage_bps_avg_synthetic: slip_avg_synthetic,
+        clob_fill_count,
+        synthetic_fill_count,
+        legacy_unlabeled_fill_count,
+        performance_fill_scope: "clob_fills_only",
         sample_size_note: sample_note,
     })
 }
@@ -1190,5 +1364,27 @@ mod tests {
     #[test]
     fn partial_equity_label_is_explicit() {
         assert!(PARTIAL_EQUITY_LABEL.to_lowercase().contains("partial"));
+    }
+
+    #[test]
+    fn capital_funding_status_from_ledger_only() {
+        use rust_decimal::Decimal;
+        use super::{capital_funding_status, CapitalFundingStatus};
+        assert_eq!(
+            capital_funding_status(Decimal::from(2000), Decimal::ZERO),
+            CapitalFundingStatus::NotFunded
+        );
+        assert_eq!(
+            capital_funding_status(Decimal::from(2000), Decimal::from(500)),
+            CapitalFundingStatus::PartiallyFunded
+        );
+        assert_eq!(
+            capital_funding_status(Decimal::from(2000), Decimal::from(2000)),
+            CapitalFundingStatus::Funded
+        );
+        assert_eq!(
+            capital_funding_status(Decimal::from(2000), Decimal::from(2500)),
+            CapitalFundingStatus::Funded
+        );
     }
 }

@@ -7,6 +7,7 @@ import { DateRangePresets } from "@/components/date-range-presets";
 import { FilterChips } from "@/components/filter-chips";
 import { Desk } from "@/components/desk";
 import { PaginationBar } from "@/components/pagination-bar";
+import { formatNumericInputDisplay } from "@pom/format";
 import { SimpleFieldLabel } from "@/components/simple-field-label";
 import { useToast } from "@/components/toast";
 import { WalletMultiselect } from "@/components/wallet-multiselect";
@@ -138,19 +139,39 @@ export function WalletActivityFeed() {
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="wa-min-amt">Min total USDC</SimpleFieldLabel>
-          <input id="wa-min-amt" defaultValue={list.read("min_amount")} onBlur={(e) => list.setParams({ min_amount: e.target.value.trim() || null }, true)} />
+          <input
+            id="wa-min-amt"
+            inputMode="decimal"
+            defaultValue={formatNumericInputDisplay(list.read("min_amount"))}
+            onBlur={(e) => list.setParams({ min_amount: e.target.value.trim() || null }, true)}
+          />
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="wa-max-amt">Max total USDC</SimpleFieldLabel>
-          <input id="wa-max-amt" defaultValue={list.read("max_amount")} onBlur={(e) => list.setParams({ max_amount: e.target.value.trim() || null }, true)} />
+          <input
+            id="wa-max-amt"
+            inputMode="decimal"
+            defaultValue={formatNumericInputDisplay(list.read("max_amount"))}
+            onBlur={(e) => list.setParams({ max_amount: e.target.value.trim() || null }, true)}
+          />
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="wa-min-price">Min price</SimpleFieldLabel>
-          <input id="wa-min-price" defaultValue={list.read("min_price")} onBlur={(e) => list.setParams({ min_price: e.target.value.trim() || null }, true)} />
+          <input
+            id="wa-min-price"
+            inputMode="decimal"
+            defaultValue={formatNumericInputDisplay(list.read("min_price"))}
+            onBlur={(e) => list.setParams({ min_price: e.target.value.trim() || null }, true)}
+          />
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="wa-max-price">Max price</SimpleFieldLabel>
-          <input id="wa-max-price" defaultValue={list.read("max_price")} onBlur={(e) => list.setParams({ max_price: e.target.value.trim() || null }, true)} />
+          <input
+            id="wa-max-price"
+            inputMode="decimal"
+            defaultValue={formatNumericInputDisplay(list.read("max_price"))}
+            onBlur={(e) => list.setParams({ max_price: e.target.value.trim() || null }, true)}
+          />
         </div>
       </div>
 

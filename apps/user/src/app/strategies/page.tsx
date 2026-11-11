@@ -1,6 +1,8 @@
 "use client";
 
 import Link from "next/link";
+import { sizingModeLabel } from "@/lib/sizing-mode";
+import { formatNumericInputDisplay } from "@pom/format";
 import { Desk, useResource } from "@/components/desk";
 import { StrategiesListHeader } from "@/components/strategies-list-header";
 
@@ -47,8 +49,8 @@ function List() {
               <td>
                 {String(row.alias)} · {String(row.wallet_address)}
               </td>
-              <td>{String(row.sizing_mode)}</td>
-              <td>{String(row.strategy_budget_usd)}</td>
+              <td>{sizingModeLabel(String(row.sizing_mode))}</td>
+              <td>{formatNumericInputDisplay(String(row.strategy_budget_usd))}</td>
               <td>{row.enabled ? "yes" : "no"}</td>
             </tr>
           ))}

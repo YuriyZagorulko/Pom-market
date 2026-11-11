@@ -1,6 +1,9 @@
-/** Convert UI percent (1–100) to API proportion coefficient (0–1). */
+/** Max copy % in UI (100× notional); create wizard still validates 1–100 separately. */
+export const MAX_COPY_PERCENT = 10_000;
+
+/** Convert UI percent to API `proportion` coefficient (20 → 0.2, 150 → 1.5). */
 export function percentToProportion(percent: number): number | null {
-  if (!Number.isFinite(percent) || percent <= 0 || percent > 100) return null;
+  if (!Number.isFinite(percent) || percent <= 0 || percent > MAX_COPY_PERCENT) return null;
   return Math.round((percent / 100) * 1e8) / 1e8;
 }
 
