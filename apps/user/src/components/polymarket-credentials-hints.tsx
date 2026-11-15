@@ -38,6 +38,7 @@ export function PrivateKeyHelp({ signatureType }: { signatureType: SignatureType
       <p className="field-help-warn">
         Never share your private key with anyone. POM Market uses it to sign requests on your behalf.
       </p>
+      <p>Optional for new accounts: Paper trading does not require a key. It is required only for Live trading and signed CLOB checks.</p>
     </>
   );
 }

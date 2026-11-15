@@ -1,0 +1,146 @@
+# Coolify / remote staging (market.pomvix.com)
+# Self-contained stack: user UI public, API/worker/postgres internal only.
+#
+# Usage (on server, after .env is configured):
+#   docker compose -f docker-compose.coolify.yml up -d --build
+#
+# See docs/deployment/coolify.md
+
+name: pom-market
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pommarket
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: pommarket
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pommarket -d pommarket"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 30s
+    networks:
+      - internal
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: pom-market-api:coolify
+    command: ["pom-api"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    expose:
+      - "4321"
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      API_BIND: 0.0.0.0:4321
+      ENVIRONMENT: ${ENVIRONMENT:-staging}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      CONFIRM_LIVE_TRADING: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4321/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    networks:
+      - internal
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: pom-market-worker:coolify
+    command: ["pom-worker"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-staging}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      CONFIRM_LIVE_TRADING: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    networks:
+      - internal
+
+  user:
+    build:
+      context: .
+      dockerfile: docker/user.Dockerfile
+      args:
+        API_INTERNAL_URL: http://api:4321
+    image: pom-market-user:coolify
+    restart: unless-stopped
+    stop_grace_period: 20s
+    ports:
+      - "${USER_PORT:-4323}:4323"
+    environment:
+      NODE_ENV: production
+      API_INTERNAL_URL: http://api:4321
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://127.0.0.1:4323/health >/dev/null 2>&1 || exit 1",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal
+
+  # Optional admin UI — not exposed in default Coolify layout (enable with profile `admin`).
+  admin:
+    profiles: ["admin"]
+    build:
+      context: .
+      dockerfile: docker/admin.Dockerfile
+      args:
+        API_INTERNAL_URL: http://api:4321
+    image: pom-market-admin:coolify
+    restart: unless-stopped
+    expose:
+      - "4322"
+    environment:
+      NODE_ENV: production
+      API_INTERNAL_URL: http://api:4321
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal
+
+volumes:
+  postgres-data:
+
+networks:
+  internal:
+    driver: bridge

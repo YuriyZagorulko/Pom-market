@@ -6,6 +6,12 @@ use sqlx::PgPool;
 use tokio::time::sleep;
 
 use pommarket::config::Config;
+use pommarket::data_api_ingest::{
+    decide_pagination_stop, finish_stream_checkpoint, load_checkpoint_store, persist_ingest_diagnostics,
+    save_checkpoint_store, stream_checkpoint_mut, IngestPollDiagnostics, IngestStream,
+    PaginationStopReason, StreamTickCounters, WalletIngestDiagnostics, DATA_API_PAGE_SIZE,
+    DEFAULT_MAX_PAGES_PER_TICK,
+};
 use pommarket::db::{begin_as, connect, migrate};
 use pommarket::pipeline::{ingest, process_event, Books, PipelineConfig};
 use pommarket::polymarket::http::PublicClient;
@@ -30,7 +36,9 @@ impl Books for HttpBooks {
 async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     pommarket::init_tracing(&cfg.log_format);
-    migrate(&cfg.migration_database_url).await?;
+    if std::env::var("POM_SKIP_STARTUP_MIGRATION").unwrap_or_default() != "true" {
+        migrate(&cfg.migration_database_url).await?;
+    }
     let migration = connect(&cfg.migration_database_url).await?;
     let app_password = std::env::var("APP_DB_PASSWORD")
         .map_err(|_| anyhow::anyhow!("missing required environment variable APP_DB_PASSWORD"))?;
@@ -98,11 +106,15 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(0);
     loop {
         heartbeat(&pool).await;
-        if let Err(err) = poll_data_api(&pool, &client, &vault, &books, &pipeline, &cfg).await {
-            tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "data api poll failed");
-            set_collector(&pool, "data_api", "error").await;
-        } else {
-            set_collector(&pool, "data_api", "ok").await;
+        if let Err(err) = pommarket::source_trader_analytics::run_pending_syncs(&pool, &client).await {
+            tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "source trader analytics sync failed");
+        }
+        match poll_data_api(&pool, &client, &vault, &books, &pipeline, &cfg).await {
+            Ok(()) => set_collector(&pool, "data_api", "ok").await,
+            Err(err) => {
+                tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "data api poll failed");
+                set_collector(&pool, "data_api", "error").await;
+            }
         }
         if cfg.polygon_logs_enabled {
             if let Some(rpc) = &cfg.polygon_rpc_url {
@@ -129,12 +141,18 @@ async fn main() -> anyhow::Result<()> {
         if let Err(err) = pommarket::hard_close::process_pending_operations(
             &pool,
             &books,
+            &client,
             pipeline.default_fee_rate,
             pipeline.default_fee_exponent,
         )
         .await
         {
             tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "hard close tick failed");
+        }
+        if let Err(err) =
+            pommarket::paper_settlement::process_open_positions(&pool, &client, 40).await
+        {
+            tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "paper settlement tick failed");
         }
         if let Err(err) = pommarket::pipeline::reconcile_live_orders(
             &pool,
@@ -211,25 +229,202 @@ async fn poll_data_api(
     .fetch_all(&mut *tx)
     .await?;
     drop(tx);
+    let max_pages = std::env::var("WORKER_INGEST_MAX_PAGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_PAGES_PER_TICK);
+    let mut checkpoints = load_checkpoint_store(pool).await.unwrap_or_default();
+    let mut diagnostics = IngestPollDiagnostics::default();
+    let mut first_err: Option<anyhow::Error> = None;
     for wallet in wallets {
-        let mut cursor = None;
-        let mut seen_cursors = std::collections::HashSet::new();
-        for _ in 0..5 {
-            let (trades, next) = client
-                .activity_page(&wallet, cursor.as_deref())
-                .await
-                .map_err(anyhow::Error::msg)?;
-            for trade in trades {
-                handle_trade(pool, vault, books, pipeline, client, app_cfg, trade).await?;
+        match ingest_wallet_pages(
+            pool,
+            vault,
+            books,
+            pipeline,
+            client,
+            app_cfg,
+            &wallet,
+            max_pages,
+            &mut checkpoints,
+        )
+        .await
+        {
+            Ok(wallet_diag) => diagnostics.merge_wallet(&wallet, wallet_diag),
+            Err(err) => {
+                let redacted = pommarket::security::redact(&err.to_string());
+                let mut wallet_diag = WalletIngestDiagnostics::default();
+                wallet_diag.error = Some(redacted.clone());
+                diagnostics.merge_wallet(&wallet, wallet_diag);
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
             }
-            let Some(next) = next else { break };
-            if !seen_cursors.insert(next.clone()) {
-                break;
-            }
-            cursor = Some(next);
         }
     }
-    Ok(())
+    if let Err(err) = save_checkpoint_store(pool, &checkpoints).await {
+        tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "checkpoint save failed");
+    }
+    if first_err.is_some() {
+        diagnostics.mark_error(&pommarket::security::redact(
+            &first_err.as_ref().unwrap().to_string(),
+        ));
+    } else {
+        diagnostics.mark_success();
+    }
+    if let Err(err) = persist_ingest_diagnostics(pool, &diagnostics).await {
+        tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "ingest diagnostics persist failed");
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ingest_wallet_pages(
+    pool: &PgPool,
+    vault: &Vault,
+    books: &impl Books,
+    pipeline: &PipelineConfig,
+    client: &PublicClient,
+    app_cfg: &Config,
+    wallet: &str,
+    max_pages: usize,
+    checkpoints: &mut pommarket::data_api_ingest::IngestCheckpointStore,
+) -> anyhow::Result<WalletIngestDiagnostics> {
+    let mut wallet_diag = WalletIngestDiagnostics::default();
+    let mut first_err: Option<anyhow::Error> = None;
+    for stream in [IngestStream::Activity, IngestStream::Trades] {
+        match ingest_wallet_stream(
+            pool,
+            vault,
+            books,
+            pipeline,
+            client,
+            app_cfg,
+            wallet,
+            stream,
+            max_pages,
+            checkpoints,
+        )
+        .await
+        {
+            Ok(stream_diag) => match stream {
+                IngestStream::Activity => wallet_diag.activity = stream_diag,
+                IngestStream::Trades => wallet_diag.trades = stream_diag,
+            },
+            Err(err) => {
+                let msg = pommarket::security::redact(&err.to_string());
+                wallet_diag.error = Some(msg);
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(wallet_diag),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ingest_wallet_stream(
+    pool: &PgPool,
+    vault: &Vault,
+    books: &impl Books,
+    pipeline: &PipelineConfig,
+    client: &PublicClient,
+    app_cfg: &Config,
+    wallet: &str,
+    stream: IngestStream,
+    max_pages: usize,
+    checkpoints: &mut pommarket::data_api_ingest::IngestCheckpointStore,
+) -> anyhow::Result<StreamTickCounters> {
+    let cp = stream_checkpoint_mut(checkpoints, wallet, stream);
+    let mut counters = StreamTickCounters {
+        resume_cursor_before: cp.resume_cursor.clone(),
+        ..Default::default()
+    };
+    let mut cursor = cp.resume_cursor.clone();
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut stop_reason = PaginationStopReason::EndOfFeed;
+    let mut resume_after: Option<String> = None;
+
+    for page_index in 0..max_pages {
+        let (trades, next) = match stream {
+            IngestStream::Activity => client.activity_page(wallet, cursor.as_deref()).await,
+            IngestStream::Trades => client.trades_page(wallet, cursor.as_deref()).await,
+        }
+        .map_err(anyhow::Error::msg)?;
+
+        counters.pages_fetched += 1;
+        let page_len = trades.len();
+        counters.rows_fetched += page_len as u64;
+
+        let mut all_rows_were_duplicates = page_len > 0;
+        for trade in trades {
+            let watched = wallet_watched(pool, &trade.source_wallet).await?;
+            if !watched {
+                all_rows_were_duplicates = false;
+                continue;
+            }
+            let outcome = ingest(pool, &trade).await?;
+            if outcome.duplicate_fragment {
+                counters.duplicate_fragments += 1;
+            } else {
+                all_rows_were_duplicates = false;
+            }
+            if trade.side == "sell" {
+                counters.persisted_sell += 1;
+            } else {
+                counters.persisted_buy += 1;
+            }
+            if outcome.created || !outcome.duplicate_fragment {
+                process_event(
+                    pool,
+                    vault,
+                    books,
+                    pipeline,
+                    client,
+                    app_cfg,
+                    outcome.event_id,
+                )
+                .await?;
+            }
+        }
+
+        let has_next = next.as_ref().is_some_and(|s| !s.is_empty());
+        if let Some(stop) = decide_pagination_stop(
+            page_len,
+            DATA_API_PAGE_SIZE,
+            page_index,
+            max_pages,
+            all_rows_were_duplicates,
+            has_next,
+        ) {
+            stop_reason = stop;
+            resume_after = next;
+            break;
+        }
+
+        let Some(next_cursor) = next else {
+            stop_reason = PaginationStopReason::EndOfFeed;
+            break;
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            stop_reason = PaginationStopReason::RepeatedCursor;
+            break;
+        }
+        cursor = Some(next_cursor);
+    }
+
+    let cp = stream_checkpoint_mut(checkpoints, wallet, stream);
+    finish_stream_checkpoint(cp, stop_reason, resume_after);
+    counters.stop_reason = Some(format!("{stop_reason:?}"));
+    counters.resume_cursor_after = cp.resume_cursor.clone();
+    Ok(counters)
 }
 
 #[allow(clippy::too_many_arguments)]

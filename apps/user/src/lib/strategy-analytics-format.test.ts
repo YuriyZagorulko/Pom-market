@@ -3,9 +3,10 @@ import { pct, usd } from "./strategy-analytics-format";
 
 describe("strategy-analytics-format", () => {
   it("formats USD", () => {
-    expect(usd("12.5")).toMatch(/\$12\.50/);
+    expect(usd("12.5")).toBe("$12.5");
   });
   it("formats percent", () => {
-    expect(pct("3.456")).toBe("3.46%");
+    expect(pct("3.456")).toBe("3.456%");
+    expect(pct("100")).toBe("100%");
   });
 });

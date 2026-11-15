@@ -237,7 +237,7 @@ pub async fn hard_close_preview(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
-    let preview = preview_hard_close(&state.pool, user.id, id, &state.polymarket)
+    let preview = preview_hard_close(&state.pool, user.id, id, None, &state.polymarket)
         .await
         .map_err(|e| bad(e.to_string()))?;
     Ok(Json(preview))
@@ -262,12 +262,13 @@ pub async fn start_hard_close_route(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let op_id = start_hard_close(&state.pool, user.id, id, idempotency)
+    let op_id = start_hard_close(&state.pool, user.id, id, None, idempotency)
         .await
         .map_err(|e| bad(e.to_string()))?;
     let _ = process_pending_operations(
         &state.pool,
         &BooksAdapter(&state.polymarket),
+        &state.polymarket,
         state.cfg.fee_rate,
         state.cfg.fee_exponent,
     )
@@ -281,7 +282,7 @@ pub async fn get_hard_close(
     Path((id, op_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
-    let data = get_operation(&state.pool, user.id, id, op_id)
+    let data = get_operation(&state.pool, user.id, id, None, op_id)
         .await
         .map_err(|e| bad(e.to_string()))?;
     Ok(Json(data))
@@ -293,12 +294,13 @@ pub async fn retry_hard_close(
     Path((id, op_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
-    retry_operation(&state.pool, user.id, id, op_id)
+    retry_operation(&state.pool, user.id, id, None, op_id)
         .await
         .map_err(|e| bad(e.to_string()))?;
     let _ = process_pending_operations(
         &state.pool,
         &BooksAdapter(&state.polymarket),
+        &state.polymarket,
         state.cfg.fee_rate,
         state.cfg.fee_exponent,
     )
@@ -306,7 +308,7 @@ pub async fn retry_hard_close(
     Ok(Json(json!({"operation_id": op_id, "retrying": true})))
 }
 
-struct BooksAdapter<'a>(&'a crate::polymarket::http::PublicClient);
+pub(crate) struct BooksAdapter<'a>(pub(crate) &'a crate::polymarket::http::PublicClient);
 
 #[async_trait::async_trait]
 impl crate::pipeline::Books for BooksAdapter<'_> {

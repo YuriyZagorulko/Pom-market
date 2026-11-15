@@ -1,4 +1,3 @@
-import { percentToProportion } from "@/lib/copy-sizing";
 import { type UserSizingMode } from "@/lib/sizing-mode";
 
 export type { UserSizingMode as SizingMode };
@@ -19,9 +18,12 @@ export type CopyStrategyCreateInput = {
   copyBuy: boolean;
   copySell: boolean;
   allowSubminimumPaperTrades: boolean;
-  copyPercent: string;
+  /** Equal Copy trade multiplier coefficient (1 = 100%). */
+  equalCopyTradeMultiplier: string;
   fixedAmountUsd: string;
   pvrTradeMultiplier: string;
+  copySmallBuys1to1: boolean;
+  smallBuyThresholdUsd: string;
   monitoringEnabled: boolean;
   accountOperatingMode: string | undefined;
 };
@@ -32,8 +34,12 @@ export function validateCopyStrategyCreateInput(input: CopyStrategyCreateInput):
   if (!input.monitoringEnabled) {
     return "Turn on monitoring for the source wallet before creating a strategy.";
   }
-  if (input.accountOperatingMode && input.accountOperatingMode !== "paper_trading") {
-    return "For now, pick an account in Paper trading mode.";
+  if (
+    input.accountOperatingMode &&
+    input.accountOperatingMode !== "paper_trading" &&
+    input.accountOperatingMode !== "live_trading"
+  ) {
+    return "Pick a trading account that is not in Monitoring mode.";
   }
   if (input.allocationMode === "fixed_usd") {
     const budget = Number(input.strategyBudgetUsd);
@@ -45,9 +51,11 @@ export function validateCopyStrategyCreateInput(input: CopyStrategyCreateInput):
     }
   }
   if (input.sizingMode === "proportional") {
-    if (percentToProportion(Number(input.copyPercent)) == null) {
-      return "Copy percentage must be between 0 and 100.";
+    const mult = Number(input.equalCopyTradeMultiplier);
+    if (!Number.isFinite(mult) || mult <= 0) {
+      return "Trade multiplier must be greater than zero.";
     }
+    if (mult > 10_000) return "Trade multiplier must be at most 10000.";
   } else if (input.sizingMode === "fixed_amount") {
     const fixed = Number(input.fixedAmountUsd);
     if (!Number.isFinite(fixed) || fixed <= 0) return "Fixed amount must be greater than zero.";
@@ -55,6 +63,12 @@ export function validateCopyStrategyCreateInput(input: CopyStrategyCreateInput):
     const mult = Number(input.pvrTradeMultiplier);
     if (!Number.isFinite(mult) || mult <= 0) return "PVR trade multiplier must be greater than zero.";
     if (mult > 10_000) return "PVR trade multiplier must be at most 10000.";
+  }
+  if (input.copySmallBuys1to1) {
+    const thresh = Number(input.smallBuyThresholdUsd);
+    if (!Number.isFinite(thresh) || thresh <= 0) {
+      return "Small BUY threshold (USD) must be greater than zero when Small BUY Override is enabled.";
+    }
   }
   return null;
 }
@@ -92,7 +106,7 @@ export function buildCopyStrategyCreateBody(input: CopyStrategyCreateInput): Rec
     body.allocation_percent = num(input.allocationPercent);
   }
   if (input.sizingMode === "proportional") {
-    body.copy_percent = num(input.copyPercent);
+    body.proportion = num(input.equalCopyTradeMultiplier);
   } else if (input.sizingMode === "fixed_amount") {
     body.fixed_amount_usd = num(input.fixedAmountUsd);
   } else if (input.sizingMode === "position_value_ratio") {
@@ -100,6 +114,10 @@ export function buildCopyStrategyCreateBody(input: CopyStrategyCreateInput): Rec
     if (mult > 0 && mult !== 1) {
       body.multiplier = mult;
     }
+  }
+  if (input.copySmallBuys1to1) {
+    body.copy_small_buys_1to1 = true;
+    body.small_buy_threshold_usd = num(input.smallBuyThresholdUsd);
   }
   return body;
 }

@@ -1,0 +1,15 @@
+# Optional overlay for local production-stack smoke tests (loopback only).
+#   docker compose -f docker-compose.prod.yml -f docker-compose.prod-local-ports.yml up -d --build
+#
+# Do not use on Coolify — attach domains to exposed container ports instead.
+
+services:
+  api:
+    ports:
+      - "127.0.0.1:4321:4321"
+  admin:
+    ports:
+      - "127.0.0.1:4322:4322"
+  user:
+    ports:
+      - "127.0.0.1:4323:4323"

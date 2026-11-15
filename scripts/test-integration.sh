@@ -44,5 +44,7 @@ cargo test --manifest-path backend/Cargo.toml \
   --test strategy_analytics_financial \
   --test strategy_capital_accounting \
   --test strategy_capital_execution \
+  --test paper_settlement \
+  --test strategy_activity_list \
   -- --ignored --test-threads=1 --nocapture
 cargo test --manifest-path backend/Cargo.toml --test email_transport_safety -- --nocapture

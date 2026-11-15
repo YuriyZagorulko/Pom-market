@@ -22,7 +22,16 @@ function Form() {
   const [signatureType, setSignatureType] = useState<SignatureTypeValue>("eoa");
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const data = Object.fromEntries(new FormData(event.currentTarget).entries());
+    const data = Object.fromEntries(new FormData(event.currentTarget).entries()) as Record<
+      string,
+      FormDataEntryValue
+    >;
+    const pk = String(data.private_key ?? "").trim();
+    if (!pk) {
+      delete data.private_key;
+    } else {
+      data.private_key = pk;
+    }
     try {
       const created = await client.request<{ id: string }>("/api/v1/accounts", {
         method: "POST",
@@ -37,14 +46,14 @@ function Form() {
     <form className="panel account-credentials-form" onSubmit={onSubmit}>
       <h1>Add account</h1>
       <p className="muted">
-        The private key is encrypted before it is stored. A seed phrase is not accepted. Leave the key empty for
-        monitoring only.
+        Signer and funder addresses are required. Private key is optional — encrypted when provided and needed only for
+        Live trading and exchange balance checks. Paper trading works without it.
       </p>
       <PolymarketAccountCredentialsFields
         showName
         signatureType={signatureType}
         onSignatureTypeChange={setSignatureType}
-        privateKeyPlaceholder="Private key 0x… optional"
+        privateKeyPlaceholder="Private key 0x… (optional)"
       />
       {error && <div className="error">{error}</div>}
       <button type="submit">Save account</button>

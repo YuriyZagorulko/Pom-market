@@ -16,6 +16,14 @@ use rust_decimal::Decimal;
 use test_support::truncate_integration_tables;
 use uuid::Uuid;
 
+fn test_public_client() -> PublicClient {
+    PublicClient::new(
+        "https://data-api.polymarket.com".into(),
+        "https://clob.polymarket.com".into(),
+        "https://gamma-api.polymarket.com".into(),
+    )
+}
+
 struct DeepBook;
 #[async_trait]
 impl Books for DeepBook {
@@ -167,7 +175,7 @@ fn public_client() -> PublicClient {
 
 async fn run_hard_close_ticks(worker: &sqlx::PgPool, books: &dyn Books, ticks: u32) {
     for _ in 0..ticks {
-        process_pending_operations(worker, books, Decimal::ZERO, 1)
+        process_pending_operations(worker, books, &test_public_client(), Decimal::ZERO, 1)
             .await
             .unwrap();
     }
@@ -204,7 +212,7 @@ async fn hard_close_covers_manual_and_strategy_lots() {
     .await
     .unwrap();
 
-    let op = start_hard_close(&worker, user_id, account_id, Some("idem-1".into()))
+    let op = start_hard_close(&worker, user_id, account_id, None, Some("idem-1".into()))
         .await
         .unwrap();
     let items: i64 =
@@ -215,10 +223,10 @@ async fn hard_close_covers_manual_and_strategy_lots() {
             .unwrap();
     assert_eq!(items, 2);
 
-    process_pending_operations(&worker, &DeepBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
-    process_pending_operations(&worker, &DeepBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
 
@@ -271,7 +279,7 @@ async fn pending_sell_cancelled_before_hard_close() {
     .await
     .unwrap();
 
-    let _op = start_hard_close(&worker, user_id, account_id, None)
+    let _op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
     let pending: i64 = sqlx::query_scalar(
@@ -290,7 +298,7 @@ async fn pending_sell_cancelled_before_hard_close() {
             .unwrap();
     assert_eq!(exit, Decimal::ZERO);
 
-    process_pending_operations(&worker, &DeepBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let open: Decimal = sqlx::query_scalar("SELECT open_shares FROM positions WHERE id = $1")
@@ -322,10 +330,10 @@ async fn concurrent_second_hard_close_rejected() {
     .execute(&migration)
     .await
     .unwrap();
-    let _ = start_hard_close(&worker, user_id, account_id, Some("key-a".into()))
+    let _ = start_hard_close(&worker, user_id, account_id, None, Some("key-a".into()))
         .await
         .unwrap();
-    let err = start_hard_close(&worker, user_id, account_id, Some("key-b".into()))
+    let err = start_hard_close(&worker, user_id, account_id, None, Some("key-b".into()))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("already active"));
@@ -353,15 +361,15 @@ async fn idempotency_and_worker_resume_without_duplicate_fills() {
     .await
     .unwrap();
 
-    let op_a = start_hard_close(&worker, user_id, account_id, Some("same-key".into()))
+    let op_a = start_hard_close(&worker, user_id, account_id, None, Some("same-key".into()))
         .await
         .unwrap();
-    let op_b = start_hard_close(&worker, user_id, account_id, Some("same-key".into()))
+    let op_b = start_hard_close(&worker, user_id, account_id, None, Some("same-key".into()))
         .await
         .unwrap();
     assert_eq!(op_a, op_b);
 
-    process_pending_operations(&worker, &DeepBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let fills: i64 = sqlx::query_scalar(
@@ -373,7 +381,7 @@ async fn idempotency_and_worker_resume_without_duplicate_fills() {
     .unwrap();
     assert_eq!(fills, 1);
 
-    process_pending_operations(&worker, &DeepBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let fills2: i64 = sqlx::query_scalar(
@@ -408,10 +416,10 @@ async fn partial_liquidity_and_no_liquidity_items() {
     .await
     .unwrap();
 
-    let op = start_hard_close(&worker, user_id, account_id, None)
+    let op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
-    process_pending_operations(&worker, &ThinBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &ThinBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
 
@@ -463,10 +471,10 @@ async fn hard_close_no_liquidity_marks_item_failed() {
     .execute(&migration)
     .await
     .unwrap();
-    let op = start_hard_close(&worker, user_id, account_id, None)
+    let op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
-    process_pending_operations(&worker, &EmptyBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &EmptyBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let empty_status: String = sqlx::query_scalar(
@@ -501,7 +509,7 @@ async fn kill_switch_pauses_in_progress_hard_close() {
     .execute(&migration)
     .await
     .unwrap();
-    let op = start_hard_close(&worker, user_id, account_id, None)
+    let op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
     sqlx::query("UPDATE trading_accounts SET trading_control_state = 'kill_switch' WHERE id = $1")
@@ -513,7 +521,7 @@ async fn kill_switch_pauses_in_progress_hard_close() {
         .await
         .unwrap();
 
-    process_pending_operations(&worker, &DeepBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
 
@@ -597,7 +605,7 @@ async fn hard_close_same_token_multi_strategy_and_manual() {
     .await
     .unwrap();
 
-    let op = start_hard_close(&worker, user_id, account_id, None)
+    let op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -697,7 +705,7 @@ async fn hard_close_after_partially_filled_copy_sell() {
     };
     assert_eq!(reserved_before, Decimal::from(35));
 
-    let _op = start_hard_close(&worker, user_id, account_id, None)
+    let _op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
     let pending_sells: i64 = sqlx::query_scalar(
@@ -717,7 +725,7 @@ async fn hard_close_after_partially_filled_copy_sell() {
             .unwrap();
     assert_eq!(copy_fills, Decimal::from(25));
 
-    process_pending_operations(&worker, &DeepBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let open: Decimal = sqlx::query_scalar("SELECT open_shares FROM positions WHERE id = $1")
@@ -763,10 +771,10 @@ async fn hard_close_dust_below_min_order_size() {
     .execute(&migration)
     .await
     .unwrap();
-    let op = start_hard_close(&worker, user_id, account_id, None)
+    let op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
-    process_pending_operations(&worker, &MinSizeBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &MinSizeBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let left: Decimal = sqlx::query_scalar(
@@ -806,10 +814,10 @@ async fn hard_close_dust_below_min_order_size() {
             .unwrap();
     assert_eq!(acct, "hard_close_partial");
 
-    retry_operation(&worker, user_id, account_id, op)
+    retry_operation(&worker, user_id, account_id, None, op)
         .await
         .unwrap();
-    process_pending_operations(&worker, &MinSizeBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &MinSizeBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let fills: i64 = sqlx::query_scalar(
@@ -843,10 +851,10 @@ async fn hard_close_partial_leaves_dust_item_blocked() {
     .execute(&migration)
     .await
     .unwrap();
-    let op = start_hard_close(&worker, user_id, account_id, None)
+    let op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
-    process_pending_operations(&worker, &ThinBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &ThinBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let left: Decimal = sqlx::query_scalar(
@@ -857,7 +865,7 @@ async fn hard_close_partial_leaves_dust_item_blocked() {
     .await
     .unwrap();
     assert_eq!(left, Decimal::from(8));
-    process_pending_operations(&worker, &MinSizeBook, Decimal::ZERO, 1)
+    process_pending_operations(&worker, &MinSizeBook, &test_public_client(), Decimal::ZERO, 1)
         .await
         .unwrap();
     let left2: Decimal = sqlx::query_scalar(
@@ -939,7 +947,7 @@ async fn hard_close_preview_matches_start_items_and_is_read_only() {
         .fetch_one(&migration)
         .await
         .unwrap();
-    let preview = preview_hard_close(&app, user_id, account_id, &public_client())
+    let preview = preview_hard_close(&app, user_id, account_id, None, &public_client())
         .await
         .unwrap();
     assert_eq!(preview["read_only"], true);
@@ -976,7 +984,7 @@ async fn hard_close_preview_matches_start_items_and_is_read_only() {
         ops_before
     );
 
-    let op = start_hard_close(&worker, user_id, account_id, None)
+    let op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
     let items: Vec<(Uuid, Decimal)> = sqlx::query_as(
@@ -996,7 +1004,7 @@ async fn hard_close_preview_matches_start_items_and_is_read_only() {
             .expect("item for preview position");
         assert_eq!(item.1, sellable);
     }
-    run_hard_close_ticks(&worker, &DeepBook, 2).await;
+    run_hard_close_ticks(&worker, &DeepBook, 1).await;
     let progressed: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM hard_close_items WHERE operation_id = $1 AND status <> 'pending'",
     )
@@ -1004,8 +1012,197 @@ async fn hard_close_preview_matches_start_items_and_is_read_only() {
     .fetch_one(&migration)
     .await
     .unwrap();
-    assert!(
-        progressed >= 1,
-        "worker ticks should execute at least one eligible item"
+    assert_eq!(
+        progressed, 2,
+        "one worker tick should drain every pending hard-close item"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL pommarket_test"]
+async fn hard_close_strategy_batch_closes_many_positions_in_one_tick() {
+    test_support::assert_all_test_database_urls();
+    let migration_url = env::var("MIGRATION_DATABASE_URL").unwrap();
+    migrate(&migration_url).await.unwrap();
+    let migration = connect(&migration_url).await.unwrap();
+    truncate_integration_tables(&migration, &migration_url).await;
+    let worker = connect(&env::var("WORKER_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let (user_id, account_id) = seed_paper_account(&migration).await;
+    let strat = seed_copy_strategy(
+        &migration,
+        user_id,
+        account_id,
+        "0xbatch0000000000000000000000000001",
+        "Batch",
+    )
+    .await;
+    for i in 0..12 {
+        let tok = format!("tok-batch-{i}");
+        sqlx::query(
+            "INSERT INTO positions (user_id, trading_account_id, strategy_id, source_wallet, token_id, operating_mode, open_shares, avg_price, cost_basis_usd)
+             VALUES ($1,$2,$3,'0xtrader',$4,'paper_trading',10,0.5,5)",
+        )
+        .bind(user_id)
+        .bind(account_id)
+        .bind(strat)
+        .bind(tok)
+        .execute(&migration)
+        .await
+        .unwrap();
+    }
+    let op = start_hard_close(&worker, user_id, account_id, Some(strat), None)
+        .await
+        .unwrap();
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hard_close_items WHERE operation_id = $1")
+        .bind(op)
+        .fetch_one(&migration)
+        .await
+        .unwrap();
+    assert_eq!(items, 12);
+
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
+        .await
+        .unwrap();
+
+    let op_status: String =
+        sqlx::query_scalar("SELECT status FROM hard_close_operations WHERE id = $1")
+            .bind(op)
+            .fetch_one(&migration)
+            .await
+            .unwrap();
+    assert_eq!(op_status, "completed");
+
+    let open_left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM positions WHERE strategy_id = $1 AND open_shares > 0",
+    )
+    .bind(strat)
+    .fetch_one(&migration)
+    .await
+    .unwrap();
+    assert_eq!(open_left, 0);
+
+    let pending_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM hard_close_items WHERE operation_id = $1 AND status IN ('pending','in_progress','partial') AND remaining_shares > 0",
+    )
+    .bind(op)
+    .fetch_one(&migration)
+    .await
+    .unwrap();
+    assert_eq!(pending_items, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL pommarket_test"]
+async fn hard_close_strategy_cancels_pending_sells_and_closes_in_one_tick() {
+    test_support::assert_all_test_database_urls();
+    let migration_url = env::var("MIGRATION_DATABASE_URL").unwrap();
+    migrate(&migration_url).await.unwrap();
+    let migration = connect(&migration_url).await.unwrap();
+    truncate_integration_tables(&migration, &migration_url).await;
+    let worker = connect(&env::var("WORKER_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let (user_id, account_id) = seed_paper_account(&migration).await;
+    let strat = seed_copy_strategy(
+        &migration,
+        user_id,
+        account_id,
+        "0xsellblk000000000000000000000001",
+        "SellBlk",
+    )
+    .await;
+    let (trader_id, wallet): (Uuid, String) = sqlx::query_as(
+        "SELECT st.id, st.wallet_address FROM copy_strategies s
+         JOIN source_traders st ON st.id = s.source_trader_id WHERE s.id = $1",
+    )
+    .bind(strat)
+    .fetch_one(&migration)
+    .await
+    .unwrap();
+    let pos_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO positions (user_id, trading_account_id, strategy_id, source_wallet, token_id, operating_mode, open_shares, avg_price, cost_basis_usd, pending_exit_shares)
+         VALUES ($1,$2,$3,'0xtr','tok-strat-sell','paper_trading', 50, 0.5, 25, 0) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(account_id)
+    .bind(strat)
+    .fetch_one(&migration)
+    .await
+    .unwrap();
+    let event_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO source_events (dedup_key, source_wallet, token_id, side, price, size_shares, notional_usd, event_ts, origin, status, raw)
+         VALUES ($1, $2, 'tok-strat-sell', 'sell', 0.5, 40, 20, now(), 'test', 'processed', '{}'::jsonb)
+         RETURNING id",
+    )
+    .bind(format!("hc-sell-ev-{}", Uuid::new_v4()))
+    .bind(&wallet)
+    .fetch_one(&migration)
+    .await
+    .unwrap();
+    let decision_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO copy_decisions (user_id, trading_account_id, source_trader_id, source_event_id, strategy_id, status, reason, operating_mode, side, strategy_snapshot, checks, detected_at)
+         VALUES ($1,$2,$3,$4,$5,'approved','approved','paper_trading','sell','{}','{}', now()) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(account_id)
+    .bind(trader_id)
+    .bind(event_id)
+    .bind(strat)
+    .fetch_one(&migration)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO orders (user_id, trading_account_id, decision_id, source_event_id, client_order_id, operating_mode, order_type, side, token_id, limit_price, size_shares, status, origin)
+         VALUES ($1,$2,$3,$4,gen_random_uuid(),'paper_trading','GTC','sell','tok-strat-sell',0.5,40,'submitted','copy')",
+    )
+    .bind(user_id)
+    .bind(account_id)
+    .bind(decision_id)
+    .bind(event_id)
+    .execute(&migration)
+    .await
+    .unwrap();
+
+    let reserved_before = {
+        let mut tx = begin_as(&migration, None, "worker").await.unwrap();
+        pommarket::pipeline::reserved_sell_shares(&mut tx, account_id, "tok-strat-sell", "paper_trading")
+            .await
+            .unwrap()
+    };
+    assert_eq!(reserved_before, Decimal::from(40));
+
+    let op = start_hard_close(&worker, user_id, account_id, Some(strat), None)
+        .await
+        .unwrap();
+
+    let strat_sells: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM orders o
+         JOIN copy_decisions d ON d.id = o.decision_id
+         WHERE d.strategy_id = $1 AND o.side = 'sell' AND o.status IN ('submitted','pending')",
+    )
+    .bind(strat)
+    .fetch_one(&migration)
+    .await
+    .unwrap();
+    assert_eq!(strat_sells, 0, "strategy hard close must cancel pending copy sells");
+
+    process_pending_operations(&worker, &DeepBook, &test_public_client(), Decimal::ZERO, 1)
+        .await
+        .unwrap();
+
+    let open: Decimal = sqlx::query_scalar("SELECT open_shares FROM positions WHERE id = $1")
+        .bind(pos_id)
+        .fetch_one(&migration)
+        .await
+        .unwrap();
+    assert_eq!(open, Decimal::ZERO);
+    let op_status: String =
+        sqlx::query_scalar("SELECT status FROM hard_close_operations WHERE id = $1")
+            .bind(op)
+            .fetch_one(&migration)
+            .await
+            .unwrap();
+    assert_eq!(op_status, "completed");
 }

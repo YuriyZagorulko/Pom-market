@@ -10,6 +10,7 @@ export function PaginationBar({
   pageSizeOptions,
   onPage,
   onLimit,
+  showFirstLast = false,
 }: {
   total: number;
   limit: number;
@@ -18,6 +19,7 @@ export function PaginationBar({
   pageSizeOptions: number[];
   onPage: (page: number) => void;
   onLimit: (limit: number) => void;
+  showFirstLast?: boolean;
 }) {
   const pages = total === 0 ? 0 : Math.max(1, Math.ceil(total / limit));
   const canPrev = total > 0 && page > 1;
@@ -37,6 +39,11 @@ export function PaginationBar({
             </option>
           ))}
         </select>
+        {showFirstLast ? (
+          <button type="button" className="ghost" disabled={!canPrev} onClick={() => onPage(1)}>
+            First
+          </button>
+        ) : null}
         <button type="button" className="ghost" disabled={!canPrev} onClick={() => onPage(page - 1)}>
           Previous
         </button>
@@ -46,6 +53,11 @@ export function PaginationBar({
         <button type="button" className="ghost" disabled={!canNext} onClick={() => onPage(page + 1)}>
           Next
         </button>
+        {showFirstLast ? (
+          <button type="button" className="ghost" disabled={!canNext} onClick={() => onPage(pages)}>
+            Last
+          </button>
+        ) : null}
       </div>
     </div>
   );

@@ -10,7 +10,7 @@ import {
 
 describe("sizing-mode", () => {
   it("exposes exactly three user modes", () => {
-    expect(USER_SIZING_MODES).toEqual(["position_value_ratio", "fixed_amount", "proportional"]);
+    expect(USER_SIZING_MODES).toEqual(["position_value_ratio", "proportional", "fixed_amount"]);
     expect(SIZING_MODE_OPTIONS).toHaveLength(3);
   });
 

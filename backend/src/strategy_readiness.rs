@@ -52,14 +52,16 @@ pub async fn readiness_for_user(
         multiplier: Option<Decimal>,
         source_trader_id: Uuid,
         monitoring_enabled: bool,
-        operating_mode: String,
+        strategy_operating_mode: String,
+        account_operating_mode: String,
         account_status: String,
         emergency_stop: bool,
         trading_control_state: String,
     }
     let row = sqlx::query_as::<_, Row>(
         "SELECT s.enabled, s.sizing_mode, s.proportion, s.fixed_amount_usd, s.multiplier,
-                s.source_trader_id, t.monitoring_enabled, a.operating_mode, a.status AS account_status,
+                s.source_trader_id, t.monitoring_enabled, s.operating_mode AS strategy_operating_mode,
+                a.operating_mode AS account_operating_mode, a.status AS account_status,
                 a.emergency_stop, a.trading_control_state
          FROM copy_strategies s
          JOIN source_traders t ON t.id = s.source_trader_id
@@ -101,7 +103,7 @@ pub async fn readiness_for_user(
     }
 
     if row.account_status == "disconnected"
-        || row.operating_mode == "monitoring"
+        || row.account_operating_mode == "monitoring"
         || row.emergency_stop
         || kill
         || row.trading_control_state != "normal"
@@ -115,8 +117,8 @@ pub async fn readiness_for_user(
                 "Trading account control state: {}.",
                 row.trading_control_state
             )
-        } else if row.operating_mode != "paper_trading" {
-            "Trading account must be in paper_trading mode.".into()
+        } else if row.account_operating_mode == "monitoring" {
+            "Set the trading account to Paper trading or Live trading (not Monitoring).".into()
         } else {
             "Connect the trading account.".into()
         };
@@ -130,11 +132,11 @@ pub async fn readiness_for_user(
         ));
     }
 
-    if row.operating_mode != "paper_trading" {
+    if row.strategy_operating_mode == "live_trading" {
         return Ok(blocked(
             ReadinessCode::AccountNotPaperReady,
-            "Account not in PAPER mode",
-            "Set operating mode to Paper trading on the account page.",
+            "Live trading not available",
+            crate::strategy_operating_mode::LIVE_TRADING_NOT_READY_CODE,
             row.enabled,
             funded,
             None,

@@ -1,8 +1,8 @@
 /** Modes shown in create wizard and strategy settings (save). */
 export const USER_SIZING_MODES = [
   "position_value_ratio",
-  "fixed_amount",
   "proportional",
+  "fixed_amount",
 ] as const;
 
 export type UserSizingMode = (typeof USER_SIZING_MODES)[number];
@@ -26,7 +26,7 @@ export function sizingModeLabel(mode: string): string {
     case "fixed_amount":
       return "Fixed USD per trade";
     case "proportional":
-      return "Percent of source trade";
+      return "Equal Copy";
     case "portfolio_ratio":
       return "Portfolio-relative (legacy)";
     case "multiplier":
@@ -40,7 +40,7 @@ export type SizingModeOption = { value: string; label: string; hint: string };
 
 /** Options for strategy settings: three user modes plus legacy row when needed. */
 export function settingsSizingSelectOptions(currentMode: string): SizingModeOption[] {
-  const base = SIZING_MODE_OPTIONS.map((o) => ({
+  const base: SizingModeOption[] = SIZING_MODE_OPTIONS.map((o) => ({
     value: o.value,
     label: o.label,
     hint: o.hint,
@@ -63,13 +63,13 @@ export const SIZING_MODE_OPTIONS: { value: UserSizingMode; label: string; hint: 
       "target ≈ allocation × (source BUY ÷ leader open-position value) × trade multiplier. Uses open-position market value, not wallet equity.",
   },
   {
+    value: "proportional",
+    label: "Equal Copy",
+    hint: "Copy target = leader trade notional × trade multiplier (same for BUY and SELL before risk limits).",
+  },
+  {
     value: "fixed_amount",
     label: "Fixed USD per trade",
     hint: "Same USD on every copied BUY (then min/max order, exposure, and available capital apply).",
-  },
-  {
-    value: "proportional",
-    label: "Percent of source trade notional",
-    hint: "target = source trade notional × your percent ÷ 100 (e.g. $100 source × 20% → $20).",
   },
 ];

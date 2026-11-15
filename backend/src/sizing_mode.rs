@@ -19,6 +19,11 @@ pub fn is_user_sizing_mode(mode: &str) -> bool {
     USER_SIZING_MODES.contains(&mode)
 }
 
+/// Modes where Small BUY Override can be stored (PVR applies it; Equal Copy stores prefs only).
+pub fn supports_small_buy_override_storage(mode: &str) -> bool {
+    mode == "position_value_ratio" || mode == "proportional"
+}
+
 pub fn reject_retired_on_write(mode: &str) -> Option<&'static str> {
     if RETIRED_SIZING_MODES.contains(&mode) {
         Some("multiplier sizing was merged into proportional; set sizing_mode to proportional and use copy_percent or proportion")
@@ -41,5 +46,12 @@ mod tests {
         assert!(is_valid_sizing_mode("multiplier"));
         assert!(!is_user_sizing_mode("multiplier"));
         assert!(reject_retired_on_write("multiplier").is_some());
+    }
+
+    #[test]
+    fn small_buy_storage_modes() {
+        assert!(supports_small_buy_override_storage("position_value_ratio"));
+        assert!(supports_small_buy_override_storage("proportional"));
+        assert!(!supports_small_buy_override_storage("fixed_amount"));
     }
 }

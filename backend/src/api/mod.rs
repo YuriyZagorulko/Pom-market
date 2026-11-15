@@ -45,9 +45,11 @@ use crate::strategy_accounting::{
 use crate::strategy_budget::utilization_report_for_user;
 
 mod account_control;
+mod strategy_control;
 mod json_num;
 mod page;
 mod strategy_analytics;
+mod source_trader_analytics;
 use page::{ListQuery, Paged};
 type PageQuery = ListQuery;
 
@@ -116,6 +118,34 @@ impl IntoResponse for ApiError {
 
 fn bad(message: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, message.into())
+}
+
+fn optional_private_key<'a>(raw: &'a Option<String>) -> Option<&'a str> {
+    raw.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn strategy_capital_api_error(err: crate::strategy_accounting::StrategyCapitalError) -> ApiError {
+    use crate::strategy_accounting::StrategyCapitalError;
+    match err {
+        StrategyCapitalError::StrategyNotFound | StrategyCapitalError::CapitalAccountMissing => {
+            ApiError(StatusCode::NOT_FOUND, err.user_message())
+        }
+        StrategyCapitalError::StrategyBusy => {
+            ApiError(StatusCode::CONFLICT, err.user_message())
+        }
+        StrategyCapitalError::Business(msg) => bad(msg),
+        StrategyCapitalError::Db(e) => internal(e),
+    }
+}
+
+fn capital_transfer_api_error(message: String) -> ApiError {
+    if message == "strategy not found" {
+        ApiError(StatusCode::NOT_FOUND, message)
+    } else if message.contains("being deleted or updated") {
+        ApiError(StatusCode::CONFLICT, message)
+    } else {
+        bad(message)
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -245,6 +275,26 @@ pub fn router(state: AppState) -> Router {
             get(source_trader_equity),
         )
         .route(
+            "/api/v1/source-traders/{id}/analytics",
+            get(source_trader_analytics::dashboard),
+        )
+        .route(
+            "/api/v1/source-traders/{id}/analytics/trades",
+            get(source_trader_analytics::trades),
+        )
+        .route(
+            "/api/v1/source-traders/{id}/analytics/refresh",
+            post(source_trader_analytics::refresh),
+        )
+        .route(
+            "/api/v1/source-traders/{id}/analytics/calculate",
+            post(source_trader_analytics::calculate),
+        )
+        .route(
+            "/api/v1/source-traders/{id}/analytics/calculate-meta",
+            get(source_trader_analytics::calculate_cache_meta),
+        )
+        .route(
             "/api/v1/strategies",
             get(list_strategies).post(create_strategy),
         )
@@ -255,6 +305,10 @@ pub fn router(state: AppState) -> Router {
                 .delete(delete_strategy),
         )
         .route("/api/v1/strategies/{id}/enable", post(enable_strategy))
+        .route(
+            "/api/v1/strategies/{id}/operating-mode",
+            post(set_strategy_operating_mode),
+        )
         .route(
             "/api/v1/strategies/{id}/utilization",
             get(strategy_utilization),
@@ -291,7 +345,67 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/strategies/{id}/analytics/performance",
             get(strategy_analytics::performance),
         )
+        .route(
+            "/api/v1/strategies/{id}/analytics/performance/positions",
+            get(strategy_analytics::performance_positions),
+        )
+        .route(
+            "/api/v1/strategies/{id}/analytics/performance/key-events",
+            get(strategy_analytics::performance_key_events),
+        )
+        .route(
+            "/api/v1/strategies/{id}/analytics/performance/execution",
+            get(strategy_analytics::performance_execution),
+        )
+        .route(
+            "/api/v1/strategies/{id}/analytics/performance/positions/{token_id}/history",
+            get(strategy_analytics::performance_position_history),
+        )
         .route("/api/v1/strategies/{id}/readiness", get(strategy_readiness))
+        .route(
+            "/api/v1/strategies/{id}/delete-preview",
+            get(strategy_delete_preview),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control",
+            get(strategy_control::get_trading_control),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/kill-switch/activate",
+            post(strategy_control::activate_kill_switch),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/kill-switch/deactivate",
+            post(strategy_control::deactivate_kill_switch),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/soft-close/activate",
+            post(strategy_control::activate_soft_close),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/soft-close/deactivate",
+            post(strategy_control::deactivate_soft_close),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/resume",
+            post(strategy_control::resume_trading),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/hard-close/preview",
+            get(strategy_control::hard_close_preview),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/hard-close",
+            post(strategy_control::start_hard_close_route),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/hard-close/{op_id}",
+            get(strategy_control::get_hard_close),
+        )
+        .route(
+            "/api/v1/strategies/{id}/trading-control/hard-close/{op_id}/retry",
+            post(strategy_control::retry_hard_close),
+        )
         .route(
             "/api/v1/source-traders/{id}/copy-preview",
             post(copy_preview),
@@ -1244,7 +1358,7 @@ async fn create_account(
     if !is_eth_address(&funder) {
         return Err(bad("funder address is invalid"));
     }
-    if let Some(key) = &body.private_key {
+    if let Some(key) = optional_private_key(&body.private_key) {
         let derived = crate::polymarket::credentials::derived_signer_address(key).map_err(bad)?;
         crate::polymarket::credentials::verify_key_signer_configuration(
             &body.signature_type,
@@ -1278,7 +1392,7 @@ async fn create_account(
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
-    if let Some(key) = body.private_key.as_deref() {
+    if let Some(key) = optional_private_key(&body.private_key) {
         let key = crate::polymarket::credentials::validate_private_key_format(key).map_err(bad)?;
         store_key(&state.vault, &mut tx, user.id, id, &key)
             .await
@@ -1538,8 +1652,12 @@ async fn set_mode(
             ));
         }
         let has_key = credential_exists(&mut tx, id).await?;
-        if !has_key || account.status != "connected" || account.last_exchange_balance_usd.is_none()
-        {
+        if !has_key {
+            return Err(bad(
+                crate::strategy_operating_mode::ACCOUNT_CREDENTIALS_REQUIRED_CODE,
+            ));
+        }
+        if account.status != "connected" || account.last_exchange_balance_usd.is_none() {
             return Err(bad(
                 "connect the account and refresh its balance before live trading",
             ));
@@ -1751,6 +1869,7 @@ async fn create_trader(
     .await
     .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
+    let _ = crate::source_trader_analytics::ensure_sync_row(&state.pool, user.id, id).await;
     Ok((
         StatusCode::CREATED,
         Json(json!({"id": id, "profile": profile})),
@@ -1905,6 +2024,9 @@ struct StrategyBody {
     display_name: Option<String>,
     #[serde(default)]
     allow_subminimum_paper_trades: Option<bool>,
+    #[serde(default)]
+    copy_small_buys_1to1: Option<bool>,
+    small_buy_threshold_usd: Option<Decimal>,
 }
 
 async fn create_strategy(
@@ -1935,6 +2057,19 @@ async fn create_strategy(
     if !crate::sizing_mode::is_user_sizing_mode(&mode) {
         return Err(bad(
             "sizing_mode must be position_value_ratio, fixed_amount, or proportional",
+        ));
+    }
+    let copy_small_buys = body.copy_small_buys_1to1.unwrap_or(false);
+    let small_buy_threshold =
+        crate::copy_sizing::parse_small_buy_threshold(body.small_buy_threshold_usd).map_err(bad)?;
+    if copy_small_buys && small_buy_threshold.is_none() {
+        return Err(bad(
+            "small_buy_threshold_usd is required when copy_small_buys_1to1 is enabled",
+        ));
+    }
+    if copy_small_buys && !crate::sizing_mode::supports_small_buy_override_storage(&mode) {
+        return Err(bad(
+            "copy_small_buys_1to1 applies only to position_value_ratio or proportional",
         ));
     }
     let budget = body.strategy_budget_usd.unwrap_or(Decimal::from(2000));
@@ -1998,9 +2133,9 @@ async fn create_strategy(
             user_id, trading_account_id, source_trader_id, enabled, sizing_mode, allocation_mode, allocation_percent,
             fixed_amount_usd, proportion, multiplier,
             strategy_budget_usd, max_position_usd, max_exposure_usd, max_open_positions, max_slippage_bps, min_order_usd,
-            allow_subminimum_paper_trades,
-            copy_buy, copy_sell, cooldown_seconds, allowed_markets
-         ) VALUES ($1,$2,$3,false,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+            allow_subminimum_paper_trades, copy_small_buys_1to1, small_buy_threshold_usd,
+            copy_buy, copy_sell, cooldown_seconds, allowed_markets, operating_mode
+         ) VALUES ($1,$2,$3,false,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,'paper_trading')
          RETURNING id",
     )
     .bind(user.id)
@@ -2023,6 +2158,8 @@ async fn create_strategy(
     .bind(body.max_slippage_bps.unwrap_or(150))
     .bind(body.min_order_usd.unwrap_or(Decimal::ONE))
     .bind(body.allow_subminimum_paper_trades.unwrap_or(false))
+    .bind(copy_small_buys)
+    .bind(small_buy_threshold)
     .bind(body.copy_buy.unwrap_or(true))
     .bind(body.copy_sell.unwrap_or(true))
     .bind(body.cooldown_seconds.unwrap_or(0))
@@ -2055,7 +2192,9 @@ async fn list_strategies(
                 s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd,
                 s.max_position_usd, s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
                 s.allow_subminimum_paper_trades,
-                s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets
+                s.copy_small_buys_1to1, s.small_buy_threshold_usd,
+                s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets,
+                s.operating_mode
          FROM copy_strategies s
          JOIN source_traders t ON t.id = s.source_trader_id
          JOIN trading_accounts a ON a.id = s.trading_account_id
@@ -2083,7 +2222,14 @@ async fn get_strategy(
         .await
         .map_err(internal)?;
     let row = one_strategy(&mut tx, user.id, id).await?;
-    Ok(Json(row))
+    let mut value = serde_json::to_value(&row).map_err(internal)?;
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert(
+            "live_trading_available".into(),
+            json!(crate::strategy_operating_mode::LIVE_COPY_PRODUCT_READY),
+        );
+    }
+    Ok(Json(value))
 }
 
 async fn patch_strategy(
@@ -2185,6 +2331,44 @@ async fn patch_strategy(
             return Err(bad("display name must be at most 120 characters"));
         }
     }
+    let patch_threshold =
+        crate::copy_sizing::parse_small_buy_threshold(body.small_buy_threshold_usd).map_err(bad)?;
+    let current_small: (bool, Option<Decimal>) = sqlx::query_as(
+        "SELECT copy_small_buys_1to1, small_buy_threshold_usd FROM copy_strategies WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let next_small_enabled = body.copy_small_buys_1to1.unwrap_or(current_small.0);
+    if next_small_enabled {
+        let sizing_mode: String = if let Some(m) = &body.sizing_mode {
+            m.clone()
+        } else {
+            sqlx::query_scalar(
+                "SELECT sizing_mode FROM copy_strategies WHERE id = $1 AND user_id = $2",
+            )
+            .bind(id)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(internal)?
+        };
+        if body.copy_small_buys_1to1 == Some(true)
+            && !crate::sizing_mode::supports_small_buy_override_storage(&sizing_mode)
+        {
+            return Err(bad(
+                "copy_small_buys_1to1 applies only to position_value_ratio or proportional",
+            ));
+        }
+        let effective_thresh = patch_threshold.or(current_small.1);
+        if effective_thresh.filter(|t| *t > Decimal::ZERO).is_none() {
+            return Err(bad(
+                "small_buy_threshold_usd is required when copy_small_buys_1to1 is enabled",
+            ));
+        }
+    }
     sqlx::query(
         "UPDATE copy_strategies SET
             sizing_mode = COALESCE($3, sizing_mode),
@@ -2206,6 +2390,8 @@ async fn patch_strategy(
             enabled = COALESCE($18, enabled),
             display_name = CASE WHEN $19::text IS NULL THEN display_name ELSE NULLIF(trim($19), '') END,
             allow_subminimum_paper_trades = COALESCE($20, allow_subminimum_paper_trades),
+            copy_small_buys_1to1 = COALESCE($21, copy_small_buys_1to1),
+            small_buy_threshold_usd = COALESCE($22, small_buy_threshold_usd),
             updated_at = now()
          WHERE id = $1 AND user_id = $2",
     )
@@ -2229,6 +2415,8 @@ async fn patch_strategy(
     .bind(body.enabled)
     .bind(body.display_name.as_deref())
     .bind(body.allow_subminimum_paper_trades)
+    .bind(body.copy_small_buys_1to1)
+    .bind(patch_threshold)
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
@@ -2243,7 +2431,7 @@ async fn patch_strategy(
         Some(
             sync_strategy_capital_to_configured_cap(&mut tx, user.id, id, &format!("patch:{id}"))
                 .await
-                .map_err(bad)?,
+                .map_err(strategy_capital_api_error)?,
         )
     } else {
         None
@@ -2271,6 +2459,21 @@ async fn strategy_readiness(
             }
         })?;
     Ok(Json(serde_json::to_value(body).unwrap_or(json!({}))))
+}
+
+async fn strategy_delete_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    match crate::strategy_delete::delete_preview_for_user(&state.pool, user.id, id).await {
+        Ok(body) => Ok(Json(serde_json::to_value(body).unwrap_or(json!({})))),
+        Err(crate::strategy_delete::DeleteStrategyReject::NotFound) => {
+            Err(ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))
+        }
+        Err(e) => Err(bad(e.user_message())),
+    }
 }
 
 async fn strategy_utilization(
@@ -2375,6 +2578,9 @@ struct CopyPreviewBody {
     refresh_source_equity: Option<bool>,
     #[serde(default)]
     allow_subminimum_paper_trades: Option<bool>,
+    #[serde(default)]
+    copy_small_buys_1to1: Option<bool>,
+    small_buy_threshold_usd: Option<Decimal>,
 }
 
 async fn copy_preview(
@@ -2526,6 +2732,8 @@ async fn copy_preview(
         allow_subminimum_paper_trades: body
             .allow_subminimum_paper_trades
             .unwrap_or(false),
+        copy_small_buys_1to1: body.copy_small_buys_1to1.unwrap_or(false),
+        small_buy_threshold_usd: body.small_buy_threshold_usd,
     };
 
     let events: Vec<PreviewEvent> = rows
@@ -2729,7 +2937,7 @@ async fn capital_allocate(
         .await
         .map_err(internal)?;
     let row: (Uuid,) = sqlx::query_as(
-        "SELECT trading_account_id FROM copy_strategies WHERE id = $1 AND user_id = $2",
+        "SELECT trading_account_id FROM copy_strategies WHERE id = $1 AND user_id = $2 FOR UPDATE",
     )
     .bind(id)
     .bind(user.id)
@@ -2742,7 +2950,7 @@ async fn capital_allocate(
         .unwrap_or_else(|| format!("alloc:{}:{}", id, Utc::now().timestamp_millis()));
     allocate_to_strategy(&mut tx, user.id, row.0, id, body.amount_usd, &key)
         .await
-        .map_err(bad)?;
+        .map_err(capital_transfer_api_error)?;
     tx.commit().await.map_err(internal)?;
     Ok(Json(json!({"ok": true})))
 }
@@ -2758,7 +2966,7 @@ async fn capital_withdraw(
         .await
         .map_err(internal)?;
     let row: (Uuid,) = sqlx::query_as(
-        "SELECT trading_account_id FROM copy_strategies WHERE id = $1 AND user_id = $2",
+        "SELECT trading_account_id FROM copy_strategies WHERE id = $1 AND user_id = $2 FOR UPDATE",
     )
     .bind(id)
     .bind(user.id)
@@ -2771,7 +2979,7 @@ async fn capital_withdraw(
         .unwrap_or_else(|| format!("withdraw:{}:{}", id, Utc::now().timestamp_millis()));
     withdraw_from_strategy(&mut tx, user.id, row.0, id, body.amount_usd, &key)
         .await
-        .map_err(bad)?;
+        .map_err(capital_transfer_api_error)?;
     tx.commit().await.map_err(internal)?;
     Ok(Json(json!({"ok": true})))
 }
@@ -2823,6 +3031,7 @@ async fn account_allocation_summary(
     Ok(Json(json!({
         "account_equity_usd": detail.account_equity_usd,
         "paper_cash_usd": detail.paper_cash_usd,
+        "account_liquid_cash_usd": detail.account_liquid_cash_usd,
         "positions_market_value_usd": detail.positions_market_value_usd,
         "open_order_reserves_usd": detail.open_order_reserves_usd,
         "allocated_across_strategies_usd": detail.allocated_across_strategies_usd,
@@ -2858,6 +3067,58 @@ struct EnableBody {
     enabled: bool,
 }
 
+#[derive(Deserialize)]
+struct StrategyOperatingModeBody {
+    operating_mode: String,
+    confirm_live: Option<bool>,
+    confirmation: Option<String>,
+}
+
+async fn set_strategy_operating_mode(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<StrategyOperatingModeBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&state, &headers, Some("user"))?;
+    let mut tx = begin_as(&state.pool, Some(user.id), "user")
+        .await
+        .map_err(internal)?;
+    let result = crate::strategy_operating_mode::change_operating_mode(
+        &mut tx,
+        user.id,
+        id,
+        &body.operating_mode,
+        body.confirm_live.unwrap_or(false),
+        body.confirmation.as_deref().unwrap_or(""),
+        &state.cfg,
+    )
+    .await;
+    match result {
+        Ok(mode) => {
+            tx.commit().await.map_err(internal)?;
+            Ok(Json(json!({
+                "operating_mode": mode,
+                "live_trading_available": crate::strategy_operating_mode::LIVE_COPY_PRODUCT_READY,
+            })))
+        }
+        Err(err) => {
+            let msg = err.api_message();
+            let code = match err {
+                crate::strategy_operating_mode::ModeChangeReject::NotFound => StatusCode::NOT_FOUND,
+                crate::strategy_operating_mode::ModeChangeReject::LiveNotReady => {
+                    StatusCode::FORBIDDEN
+                }
+                crate::strategy_operating_mode::ModeChangeReject::CredentialsMissing => {
+                    StatusCode::BAD_REQUEST
+                }
+                _ => StatusCode::BAD_REQUEST,
+            };
+            Err(ApiError(code, msg))
+        }
+    }
+}
+
 async fn enable_strategy(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2872,7 +3133,8 @@ async fn enable_strategy(
         #[derive(sqlx::FromRow)]
         struct EnableCheck {
             monitoring_enabled: bool,
-            operating_mode: String,
+            strategy_operating_mode: String,
+            account_operating_mode: String,
             account_status: String,
             emergency_stop: bool,
             strategy_budget_usd: Decimal,
@@ -2883,7 +3145,8 @@ async fn enable_strategy(
             paper_cash_usd: Decimal,
         }
         let row = sqlx::query_as::<_, EnableCheck>(
-            "SELECT st.monitoring_enabled, a.operating_mode, a.status AS account_status, a.emergency_stop,
+            "SELECT st.monitoring_enabled, s.operating_mode AS strategy_operating_mode,
+                    a.operating_mode AS account_operating_mode, a.status AS account_status, a.emergency_stop,
                     s.strategy_budget_usd, s.min_order_usd, s.sizing_mode, s.proportion, s.fixed_amount_usd,
                     r.paper_cash_usd
              FROM copy_strategies s
@@ -2909,14 +3172,14 @@ async fn enable_strategy(
         if row.emergency_stop {
             return Err(bad("clear emergency stop on the trading account first"));
         }
-        if row.operating_mode == "monitoring" {
+        if row.account_operating_mode == "monitoring" {
             return Err(bad(
                 "set the trading account to paper_trading or live_trading",
             ));
         }
-        if row.operating_mode == "live_trading" {
+        if row.strategy_operating_mode == "live_trading" {
             return Err(bad(
-                "live copy trading is not enabled in this release; use paper_trading",
+                crate::strategy_operating_mode::LIVE_TRADING_NOT_READY_CODE,
             ));
         }
         if row.strategy_budget_usd < row.min_order_usd {
@@ -2933,7 +3196,7 @@ async fn enable_strategy(
             }
             _ => {}
         }
-        if row.operating_mode == "paper_trading" && row.paper_cash_usd < row.min_order_usd {
+        if row.strategy_operating_mode == "paper_trading" && row.paper_cash_usd < row.min_order_usd {
             return Err(bad("increase paper cash on the trading account"));
         }
     }
@@ -2941,7 +3204,7 @@ async fn enable_strategy(
         Some(
             sync_strategy_capital_to_configured_cap(&mut tx, user.id, id, &format!("enable:{id}"))
                 .await
-                .map_err(bad)?,
+                .map_err(strategy_capital_api_error)?,
         )
     } else {
         None
@@ -2989,7 +3252,7 @@ async fn capital_sync_configured(
         &format!("sync-configured:{id}:{stamp}"),
     )
     .await
-    .map_err(bad)?;
+    .map_err(strategy_capital_api_error)?;
     tx.commit().await.map_err(internal)?;
     Ok(Json(serde_json::to_value(outcome).unwrap_or(json!({}))))
 }
@@ -3003,14 +3266,29 @@ async fn delete_strategy(
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
-    sqlx::query("DELETE FROM copy_strategies WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(user.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-    tx.commit().await.map_err(internal)?;
-    Ok(Json(json!({"ok": true})))
+    let outcome = crate::strategy_delete::delete_strategy_for_user(&mut tx, user.id, id).await;
+    match outcome {
+        Ok(()) => {
+            let _ = sqlx::query(
+                "INSERT INTO audit_log (actor_user_id, action, target, metadata) VALUES ($1,$2,$3,$4)",
+            )
+            .bind(user.id)
+            .bind("strategy_deleted")
+            .bind(id.to_string())
+            .bind(json!({ "strategy_id": id }))
+            .execute(&mut *tx)
+            .await;
+            tx.commit().await.map_err(internal)?;
+            Ok(Json(json!({"ok": true})))
+        }
+        Err(crate::strategy_delete::DeleteStrategyReject::NotFound) => {
+            Err(ApiError(StatusCode::NOT_FOUND, "strategy not found".into()))
+        }
+        Err(e @ crate::strategy_delete::DeleteStrategyReject::InProgress) => {
+            Err(ApiError(StatusCode::CONFLICT, e.user_message()))
+        }
+        Err(err) => Err(bad(err.user_message())),
+    }
 }
 
 async fn list_activity(
@@ -3877,7 +4155,9 @@ async fn one_strategy(
                 s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd,
                 s.max_position_usd, s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
                 s.allow_subminimum_paper_trades,
-                s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets
+                s.copy_small_buys_1to1, s.small_buy_threshold_usd,
+                s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets,
+                s.operating_mode
          FROM copy_strategies s
          JOIN source_traders t ON t.id = s.source_trader_id
          JOIN trading_accounts a ON a.id = s.trading_account_id
@@ -4012,10 +4292,13 @@ struct StrategyView {
     max_slippage_bps: i32,
     min_order_usd: Decimal,
     allow_subminimum_paper_trades: bool,
+    copy_small_buys_1to1: bool,
+    small_buy_threshold_usd: Option<Decimal>,
     copy_buy: bool,
     copy_sell: bool,
     cooldown_seconds: i32,
     allowed_markets: Value,
+    operating_mode: String,
 }
 
 #[derive(sqlx::FromRow, Serialize)]

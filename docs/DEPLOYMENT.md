@@ -1,5 +1,11 @@
 # Deployment (clean server)
 
+For **Coolify production** (`pommarket.pomvix.com`, `pommarket-admin.pomvix.com`, `pommarket-api.pomvix.com`), use **`docker-compose.prod.yml`** and [COOLIFY_DEPLOYMENT.md](COOLIFY_DEPLOYMENT.md).
+
+For the older single-UI staging stack (`market.pomvix.com`), see `docker-compose.coolify.yml` and [deployment/coolify.md](deployment/coolify.md).
+
+Legacy two-file production on a plain VPS: `docker-compose.yml` + `docker-compose.prod-legacy-overlay.yml`.
+
 ## Prerequisites
 
 - Docker with Compose v2
@@ -47,7 +53,7 @@ Integration tests set `TRUSTED_PROXIES=127.0.0.0/8` only on the **test API** pro
 3. Run `./scripts/generate-secrets.sh` and paste outputs into `.env`.
 4. Set `ADMIN_ORIGIN`, `USER_ORIGIN`, `APP_BASE_URL`, `BREVO_*`, and one-time `BOOTSTRAP_ADMIN_*`.
 5. Install proposed `pg_hba.conf` (see `scripts/pg_hba.conf.proposed`) and restrict Postgres host publish — see PostgreSQL hardening runbook.
-6. `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build`
+6. `docker compose -f docker-compose.yml -f docker-compose.prod-legacy-overlay.yml up -d --build`
 7. Verify: `curl -fsS http://127.0.0.1:4321/health`
 8. Sign in to admin UI and change the bootstrap password if still using the one-time value.
 
@@ -66,9 +72,9 @@ Store `backups/*.dump` off-host. Globals: `pg_dumpall --globals-only` (see secur
 
 1. `bash scripts/backup.sh`
 2. `git pull` / deploy new images
-3. `docker compose -f docker-compose.yml -f docker-compose.prod.yml build`
+3. `docker compose -f docker-compose.yml -f docker-compose.prod-legacy-overlay.yml build`
 4. Stop API replicas; run **one** new API container until migrations finish
-5. `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d`
+5. `docker compose -f docker-compose.yml -f docker-compose.prod-legacy-overlay.yml up -d`
 6. Check `/health`, worker logs, and a paper trade on a test account
 
 Rollback application **without** DB restore: redeploy previous image tags; migrations are forward-only — only restore DB if a migration was incompatible.

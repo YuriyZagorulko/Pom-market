@@ -2,22 +2,31 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { FormEvent } from "react";
+import { FormEvent, useState } from "react";
 import { Desk, useResource } from "@/components/desk";
+import { SourceTraderAnalyticsPanel } from "@/components/source-trader-analytics-panel";
+import { SourceTraderCalculatePanel } from "@/components/source-trader-calculate-panel";
 import { SimpleFieldLabel } from "@/components/simple-field-label";
 import { useToast } from "@/components/toast";
 import { useSession } from "@/lib/session";
 
+type TraderTab = "statistics" | "calculate" | "settings";
+
 export default function TraderPage() {
   const params = useParams<{ id: string }>();
-  return <Desk><Detail id={params.id} /></Desk>;
+  return (
+    <Desk>
+      <Detail id={params.id} />
+    </Desk>
+  );
 }
 
 function Detail({ id }: { id: string }) {
+  const [tab, setTab] = useState<TraderTab>("statistics");
   const { client } = useSession();
   const toast = useToast();
   const trader = useResource<Record<string, unknown>>(`/api/v1/source-traders/${id}`, {
-    refreshMs: 10000,
+    refreshMs: 30000,
   });
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -37,6 +46,7 @@ function Detail({ id }: { id: string }) {
     }
   }
   async function remove() {
+    if (!confirm("Remove this source trader?")) return;
     try {
       await client.request(`/api/v1/source-traders/${id}`, { method: "DELETE" });
       toast.info("Source trader removed");
@@ -48,95 +58,71 @@ function Detail({ id }: { id: string }) {
   if (trader.loading) return <p>Loading…</p>;
   if (trader.error) return <p className="error">{trader.error}</p>;
   if (!trader.data) return <p className="error">Wallet not found.</p>;
-  const links: Array<Record<string, unknown>> = Array.isArray(trader.data.links) ? trader.data.links : [];
-  const monitoringEnabled = Boolean(trader.data.monitoring_enabled);
-  const profile = (trader.data.profile ?? {}) as Record<string, unknown>;
-  const profileError = typeof profile.error === "string" && profile.error ? profile.error : null;
-  const observedZero = Number(trader.data.observed_trade_count ?? 0) === 0;
+  const wallet = String(trader.data.wallet_address);
+  const alias = String(trader.data.alias);
   return (
-    <section style={{ display: "grid", gap: 16 }}>
-      <h1>{String(trader.data.alias)}</h1>
-      <div className="panel" style={{ display: "grid", gap: 12 }}>
-        <div className="muted">{String(trader.data.wallet_address)}</div>
-        <section>
-          <h3 style={{ margin: "0 0 6px" }}>Monitoring</h3>
-          <p style={{ margin: 0 }}>
-            Status: <strong>{monitoringEnabled ? "Enabled" : "Disabled"}</strong>
-          </p>
-          <p style={{ margin: "4px 0 0" }}>
-            Detected trades: <strong>{String(trader.data.observed_trade_count)}</strong>
-          </p>
-          <p style={{ margin: "4px 0 0" }} className="muted">
-            Last detected trade: {String(trader.data.last_trade_at ?? "none")}
-          </p>
-          {profileError ? (
-            <p className="warn" style={{ margin: "8px 0 0" }}>
-              Profile sync: {profileError}
+    <section style={{ display: "grid", gap: 16, maxWidth: 1100 }}>
+      <p style={{ margin: 0 }}>
+        <Link href="/traders">← Source traders</Link>
+      </p>
+      <h1 style={{ margin: 0 }}>{alias}</h1>
+
+      <nav className="filters" aria-label="Source trader sections">
+        {(
+          [
+            ["statistics", "Statistics"],
+            ["calculate", "Calculate"],
+            ["settings", "Settings"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            className={tab === key ? "" : "ghost"}
+            onClick={() => setTab(key)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {tab === "statistics" && (
+        <SourceTraderAnalyticsPanel traderId={id} wallet={wallet} alias={alias} />
+      )}
+
+      {tab === "calculate" && <SourceTraderCalculatePanel traderId={id} alias={alias} />}
+
+      {tab === "settings" && (
+        <div className="panel" style={{ display: "grid", gap: 16 }}>
+          <form className="form-stack" onSubmit={save}>
+            <div className="form-field">
+              <SimpleFieldLabel htmlFor="trader-alias">Display alias</SimpleFieldLabel>
+              <input id="trader-alias" name="alias" defaultValue={alias} />
+            </div>
+            <label>
+              <input
+                type="checkbox"
+                name="monitoring_enabled"
+                defaultChecked={Boolean(trader.data.monitoring_enabled)}
+              />{" "}
+              Monitoring enabled
+            </label>
+            <button type="submit">Save trader</button>
+          </form>
+          <div>
+            <p className="muted">
+              Copied: <strong>{String(trader.data.copied_trade_count)}</strong> · Rejected:{" "}
+              <strong>{String(trader.data.rejected_trade_count)}</strong>
             </p>
-          ) : observedZero && monitoringEnabled ? (
-            <p className="muted" style={{ margin: "8px 0 0" }}>
-              Initial trade sync may take a few minutes via the worker.
-            </p>
-          ) : null}
-        </section>
-        <section>
-          <h3 style={{ margin: "0 0 6px" }}>Copy strategy</h3>
-          {links.length === 0 ? (
-            <p className="muted" style={{ margin: 0 }}>
-              No copy strategy is linked. This wallet is being monitored, but its trades are
-              not being evaluated for copying.
-            </p>
-          ) : (
-            <ul style={{ margin: "0 0 8px", paddingLeft: 18 }}>
-              {links.map((link) => (
-                <li key={String(link.strategy_id)}>
-                  {String(link.account_name ?? link.account_id)} — strategy{" "}
-                  {Boolean(link.enabled) ? "enabled" : "disabled"}
-                </li>
-              ))}
-            </ul>
-          )}
-          <p style={{ margin: 0 }}>
-            Copied: <strong>{String(trader.data.copied_trade_count)}</strong>
-            {" · "}
-            Rejected: <strong>{String(trader.data.rejected_trade_count)}</strong>
-          </p>
-          {links.length === 0 && (
-            <p className="muted" style={{ margin: "6px 0 0" }}>
-              Copied and Rejected stay at zero until a copy strategy exists and is enabled.
-              This does not indicate a worker or API problem.
-            </p>
-          )}
-        </section>
-        <section>
-          <h3 style={{ margin: "0 0 6px" }}>Trading account</h3>
-          {links.length === 0 ? (
-            <p className="muted" style={{ margin: 0 }}>
-              No trading account linked to a copy strategy. Monitoring does not require a linked account.
-            </p>
-          ) : (
-            <p style={{ margin: 0 }}>
-              Linked for copying: {links.map((l) => String(l.account_name ?? l.account_id)).join(", ")}
-            </p>
-          )}
-        </section>
-        <button className="ghost" onClick={remove}>Remove wallet</button>
-      </div>
-      <form className="panel form-stack" onSubmit={save}>
-        <div className="form-field">
-          <SimpleFieldLabel htmlFor="trader-alias">Display alias</SimpleFieldLabel>
-          <input id="trader-alias" name="alias" defaultValue={String(trader.data.alias)} />
+            <Link className="button" href={`/traders/${id}/strategy/new`}>
+              Create copy strategy
+            </Link>
+          </div>
+          <button className="ghost" type="button" onClick={() => void remove()}>
+            Remove wallet
+          </button>
         </div>
-        <label>
-          <input type="checkbox" name="monitoring_enabled" defaultChecked={monitoringEnabled} /> Monitoring enabled
-        </label>
-        <button type="submit">Save trader</button>
-      </form>
-      <div className="panel">
-        <h2>Copy onto an account</h2>
-        <p className="muted">Set budget, copy %, risk limits, and preview recent source trades.</p>
-        <Link className="button" href={`/traders/${id}/strategy/new`}>Create copy strategy</Link>
-      </div>
+      )}
     </section>
   );
 }

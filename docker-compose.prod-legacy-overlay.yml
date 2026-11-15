@@ -1,0 +1,33 @@
+# Legacy overlay for the original two-file local production layout:
+#   docker compose -f docker-compose.yml -f docker-compose.prod-legacy-overlay.yml up -d --build
+#
+# Prefer docker-compose.prod.yml (self-contained) for Coolify.
+
+services:
+  postgres:
+    restart: unless-stopped
+    ports: !reset []
+
+  api:
+    restart: unless-stopped
+    ports: !reset []
+    environment:
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+
+  worker:
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+      CONFIRM_LIVE_TRADING: "false"
+
+  admin:
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+
+  user:
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production

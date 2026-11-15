@@ -1,33 +1,190 @@
-# Production overlay. Use with the base compose file:
-#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# Production stack for Coolify / VPS (self-contained — not an overlay).
 #
-# See docs/DEPLOYMENT.md for secrets, migrations, backup, and rollback.
+# Local smoke (optional host ports — bind to loopback only):
+#   cp .env.production.example .env && ./scripts/generate-secrets.sh
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Coolify: point the Compose resource at this file and attach public domains to
+# user (4323), admin (4322), and optionally api (4321). Postgres/worker stay internal.
+#
+# See docs/deployment/COOLIFY.md
+
+name: pom-market
 
 services:
   postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
-    ports: !reset []
+    environment:
+      POSTGRES_USER: pommarket
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: pommarket
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pommarket -d pommarket"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 30s
+    networks:
+      - internal
+
+  # Runs once per `compose up` / Coolify deploy (restart: no). API/worker skip duplicate migration when flagged.
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: pom-market-api:prod
+    command: ["pom-api", "--migrate-only"]
+    restart: "no"
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
 
   api:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: pom-market-api:prod
+    command: ["pom-api"]
     restart: unless-stopped
-    ports: !reset []
+    stop_grace_period: 30s
+    expose:
+      - "4321"
+    env_file:
+      - path: .env
+        required: true
     environment:
-      ENVIRONMENT: production
-      LOG_FORMAT: json
+      API_BIND: 0.0.0.0:4321
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      CONFIRM_LIVE_TRADING: "false"
+      POM_SKIP_STARTUP_MIGRATION: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4321/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 90s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    networks:
+      - internal
 
   worker:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: pom-market-worker:prod
+    command: ["pom-worker"]
     restart: unless-stopped
+    stop_grace_period: 45s
+    env_file:
+      - path: .env
+        required: true
     environment:
-      ENVIRONMENT: production
-      LOG_FORMAT: json
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
       CONFIRM_LIVE_TRADING: "false"
+      POM_SKIP_STARTUP_MIGRATION: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://api:4321/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    networks:
+      - internal
 
   admin:
+    build:
+      context: .
+      dockerfile: docker/admin.Dockerfile
+      args:
+        API_INTERNAL_URL: http://api:4321
+    image: pom-market-admin:prod
     restart: unless-stopped
+    stop_grace_period: 20s
+    expose:
+      - "4322"
     environment:
       NODE_ENV: production
+      API_INTERNAL_URL: http://api:4321
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://127.0.0.1:4322/ >/dev/null 2>&1 || exit 1",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal
 
   user:
+    build:
+      context: .
+      dockerfile: docker/user.Dockerfile
+      args:
+        API_INTERNAL_URL: http://api:4321
+    image: pom-market-user:prod
     restart: unless-stopped
+    stop_grace_period: 20s
+    expose:
+      - "4323"
     environment:
       NODE_ENV: production
+      API_INTERNAL_URL: http://api:4321
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://127.0.0.1:4323/health >/dev/null 2>&1 || exit 1",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - internal
+
+volumes:
+  postgres-data:
+
+networks:
+  internal:
+    driver: bridge

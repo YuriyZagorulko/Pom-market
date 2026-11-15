@@ -13,7 +13,7 @@ import {
 import { SIZING_MODE_OPTIONS } from "@/lib/sizing-mode";
 import { SimpleFieldLabel } from "@/components/simple-field-label";
 import { useToast } from "@/components/toast";
-import { BUDGET_PRESETS, COPY_PERCENT_PRESETS } from "@/lib/copy-sizing";
+import { BUDGET_PRESETS } from "@/lib/copy-sizing";
 import { useSession } from "@/lib/session";
 
 type PreviewRow = {
@@ -50,11 +50,12 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
   const [allocationMode, setAllocationMode] = useState<AllocationMode>("fixed_usd");
   const [allocationPercent, setAllocationPercent] = useState("25");
   const [sizingMode, setSizingMode] = useState<SizingMode>("position_value_ratio");
-  const [budget, setBudget] = useState("2000");
-  const [customBudget, setCustomBudget] = useState(false);
-  const [copyPercent, setCopyPercent] = useState("10");
+  const [budget, setBudget] = useState("");
+  const [equalCopyTradeMultiplier, setEqualCopyTradeMultiplier] = useState("1");
   const [fixedAmountUsd, setFixedAmountUsd] = useState("25");
   const [pvrTradeMultiplier, setPvrTradeMultiplier] = useState("1");
+  const [copySmallBuys1to1, setCopySmallBuys1to1] = useState(false);
+  const [smallBuyThresholdUsd, setSmallBuyThresholdUsd] = useState("5");
   const [maxTrade, setMaxTrade] = useState("200");
   const [maxOpenPositions, setMaxOpenPositions] = useState("10");
   const [maxSlippageBps, setMaxSlippageBps] = useState("150");
@@ -79,7 +80,10 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
       ? traderOne.data
       : traderList.find((t) => String(t.id) === effectiveTraderId);
   const paperAccounts = useMemo(
-    () => (accounts.data ?? []).filter((a) => a.operating_mode === "paper_trading"),
+    () =>
+      (accounts.data ?? []).filter(
+        (a) => a.operating_mode === "paper_trading" || a.operating_mode === "live_trading",
+      ),
     [accounts.data],
   );
   const selectedAccount = (accounts.data ?? []).find((a) => a.id === accountId);
@@ -109,9 +113,11 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
     copyBuy,
     copySell,
     allowSubminimumPaperTrades,
-    copyPercent,
+    equalCopyTradeMultiplier,
     fixedAmountUsd,
     pvrTradeMultiplier,
+    copySmallBuys1to1,
+    smallBuyThresholdUsd,
     monitoringEnabled: monitoring,
     accountOperatingMode: selectedAccount?.operating_mode,
   };
@@ -290,34 +296,51 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
         </select>
         {allocationMode === "fixed_usd" ? (
           <>
+            <nav className="form-field" style={{ display: "grid", gap: 6 }}>
+              <SimpleFieldLabel htmlFor="strategy-allocated-usd">
+                Allocated capital (USD)
+              </SimpleFieldLabel>
+              <input
+                id="strategy-allocated-usd"
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                value={budget}
+                onChange={(e) => setBudget(e.target.value)}
+                placeholder="e.g. 500"
+              />
+            </nav>
             <div className="filters" style={{ flexWrap: "wrap" }}>
+              <span className="muted" style={{ fontSize: 12, alignSelf: "center" }}>
+                Quick fill:
+              </span>
               {BUDGET_PRESETS.map((p) => (
                 <button
                   key={p}
                   type="button"
-                  className={budget === String(p) && !customBudget ? "" : "ghost"}
-                  onClick={() => {
-                    setBudget(String(p));
-                    setCustomBudget(false);
-                  }}
+                  className="ghost"
+                  onClick={() => setBudget(String(p))}
                 >
                   ${p.toLocaleString()}
                 </button>
               ))}
-              <button type="button" className={customBudget ? "" : "ghost"} onClick={() => setCustomBudget(true)}>
-                Custom
-              </button>
             </div>
-            {(customBudget || !(BUDGET_PRESETS as readonly number[]).includes(Number(budget))) && (
-              <input value={budget} onChange={(e) => setBudget(e.target.value)} placeholder="Allocated USD" />
-            )}
           </>
         ) : (
-          <input
-            value={allocationPercent}
-            onChange={(e) => setAllocationPercent(e.target.value)}
-            placeholder="Percent of account equity (e.g. 25)"
-          />
+          <div className="form-field" style={{ display: "grid", gap: 6 }}>
+            <SimpleFieldLabel htmlFor="strategy-allocation-percent">
+              Percent of account equity
+            </SimpleFieldLabel>
+            <input
+              id="strategy-allocation-percent"
+              type="text"
+              inputMode="decimal"
+              autoComplete="off"
+              value={allocationPercent}
+              onChange={(e) => setAllocationPercent(e.target.value)}
+              placeholder="e.g. 25"
+            />
+          </div>
         )}
         {allocationSummary.data && (
           <p className="muted" style={{ margin: 0 }}>
@@ -380,24 +403,69 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
                 exposure.
               </p>
             </div>
+            <div className="form-field" style={{ display: "grid", gap: 8 }}>
+              <label style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                <input
+                  type="checkbox"
+                  checked={copySmallBuys1to1}
+                  onChange={(e) => setCopySmallBuys1to1(e.target.checked)}
+                />
+                <span>Enable Small BUY Override</span>
+              </label>
+              {copySmallBuys1to1 && (
+                <div>
+                  <SimpleFieldLabel htmlFor="wiz-small-buy-thresh">Small BUY threshold (USD)</SimpleFieldLabel>
+                  <input
+                    id="wiz-small-buy-thresh"
+                    value={smallBuyThresholdUsd}
+                    onChange={(e) => setSmallBuyThresholdUsd(e.target.value)}
+                    placeholder="5.00"
+                  />
+                </div>
+              )}
+              <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+                BUY trades below this threshold use source trade notional × trade multiplier instead of normal sizing.
+              </p>
+            </div>
           </>
         )}
 
         {sizingMode === "proportional" && (
           <>
-            <div className="filters" style={{ flexWrap: "wrap" }}>
-              {COPY_PERCENT_PRESETS.map((p) => (
-                <button
-                  key={p}
-                  type="button"
-                  className={copyPercent === String(p) ? "" : "ghost"}
-                  onClick={() => setCopyPercent(String(p))}
-                >
-                  {p}%
-                </button>
-              ))}
+            <SimpleFieldLabel htmlFor="wiz-equal-mult">Trade multiplier</SimpleFieldLabel>
+            <input
+              id="wiz-equal-mult"
+              value={equalCopyTradeMultiplier}
+              onChange={(e) => setEqualCopyTradeMultiplier(e.target.value)}
+              placeholder="1"
+            />
+            <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+              1 = 100%, 0.5 = 50%, 2 = 200% of the leader&apos;s trade size (BUY and SELL).
+            </p>
+            <div className="form-field" style={{ display: "grid", gap: 8 }}>
+              <label style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                <input
+                  type="checkbox"
+                  checked={copySmallBuys1to1}
+                  onChange={(e) => setCopySmallBuys1to1(e.target.checked)}
+                />
+                <span>Enable Small BUY Override</span>
+              </label>
+              {copySmallBuys1to1 && (
+                <div>
+                  <SimpleFieldLabel htmlFor="wiz-small-buy-thresh-ec">Small BUY threshold (USD)</SimpleFieldLabel>
+                  <input
+                    id="wiz-small-buy-thresh-ec"
+                    value={smallBuyThresholdUsd}
+                    onChange={(e) => setSmallBuyThresholdUsd(e.target.value)}
+                    placeholder="5.00"
+                  />
+                </div>
+              )}
+              <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+                BUY trades below this threshold use source trade notional × trade multiplier instead of normal sizing.
+              </p>
             </div>
-            <input value={copyPercent} onChange={(e) => setCopyPercent(e.target.value)} placeholder="Custom %" />
           </>
         )}
         {sizingMode === "fixed_amount" && (

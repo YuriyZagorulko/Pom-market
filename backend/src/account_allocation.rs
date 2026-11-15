@@ -41,11 +41,14 @@ pub struct StrategyAllocation {
 /// PAPER account equity breakdown for allocation UI and validation.
 #[derive(Clone, Debug, Serialize)]
 pub struct PaperAccountEquity {
+    /// Total account funding (`account_risk_limits.paper_cash_usd`); unchanged by trading.
     pub paper_cash_usd: Decimal,
+    /// Cash available for new allocations and strategy reserves (`unallocated + strategy liquid`).
+    pub account_liquid_cash_usd: Decimal,
     /// Mark-to-model: `open_shares * avg_price` (paper has no live marks; not cost_basis label in API).
     pub positions_market_value_usd: Decimal,
     pub open_order_reserves_usd: Decimal,
-    /// `paper_cash + positions_market_value` (reserves are already reflected in reduced cash when orders open).
+    /// `account_liquid_cash_usd + positions_market_value` for allocation sizing.
     pub account_equity_usd: Decimal,
     pub allocated_across_strategies_usd: Decimal,
     pub unallocated_usd: Decimal,
@@ -76,23 +79,36 @@ pub async fn paper_account_equity_detail(
     .bind(trading_account_id)
     .fetch_one(&mut **tx)
     .await?;
-    let equity = (cash + positions_market).round_dp(2);
+    let strategy_liquid: Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(available_cash_usd + reserved_cash_usd), 0)
+         FROM strategy_capital_accounts WHERE trading_account_id = $1",
+    )
+    .bind(trading_account_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let bootstrapped =
+        crate::strategy_accounting::account_has_bootstrapped_capital(tx, trading_account_id).await?;
+    let unallocated_raw = if bootstrapped {
+        crate::strategy_accounting::unallocated_cash_in_tx(tx, trading_account_id).await?
+    } else {
+        cash.max(Decimal::ZERO)
+    };
+    let account_liquid = (unallocated_raw + strategy_liquid).round_dp(2);
+    let equity = (account_liquid + positions_market).round_dp(2);
     let allocated = sum_peer_allocations_usd(tx, trading_account_id, None, equity).await?;
-    let unallocated =
-        if crate::strategy_accounting::account_has_bootstrapped_capital(tx, trading_account_id)
-            .await?
-        {
-            crate::strategy_accounting::unallocated_cash_in_tx(tx, trading_account_id).await?
-        } else {
-            (equity - allocated).max(Decimal::ZERO).round_dp(2)
-        };
+    let unallocated = if bootstrapped {
+        unallocated_raw.round_dp(2)
+    } else {
+        (equity - allocated).max(Decimal::ZERO).round_dp(2)
+    };
     Ok(PaperAccountEquity {
         paper_cash_usd: cash,
+        account_liquid_cash_usd: account_liquid,
         positions_market_value_usd: positions_market.round_dp(2),
         open_order_reserves_usd: reserves.round_dp(2),
         account_equity_usd: equity,
         allocated_across_strategies_usd: allocated,
-        unallocated_usd: unallocated.round_dp(2),
+        unallocated_usd: unallocated,
     })
 }
 

@@ -77,6 +77,19 @@ impl TradingControlState {
     }
 }
 
+/// Account and strategy restrictions combine: either one blocking ⇒ block (stricter wins).
+pub fn pipeline_blocked_combined(
+    account_state: &str,
+    strategy_state: &str,
+    side_buy: bool,
+    global_kill: bool,
+    operating_mode: &str,
+) -> Option<&'static str> {
+    pipeline_blocked(account_state, side_buy, global_kill, operating_mode).or_else(|| {
+        pipeline_blocked(strategy_state, side_buy, false, operating_mode)
+    })
+}
+
 pub fn pipeline_blocked(
     state: &str,
     side_buy: bool,
@@ -175,5 +188,21 @@ mod tests {
         let b = pipeline_blocked(STATE_NORMAL, true, false, "paper_trading");
         assert!(a.is_some());
         assert!(b.is_none());
+    }
+
+    #[test]
+    fn account_soft_close_blocks_strategy_normal_buys() {
+        assert_eq!(
+            pipeline_blocked_combined(STATE_SOFT_CLOSE, STATE_NORMAL, true, false, "paper_trading"),
+            Some("soft_close_no_buy")
+        );
+    }
+
+    #[test]
+    fn strategy_kill_blocks_while_account_normal() {
+        assert_eq!(
+            pipeline_blocked_combined(STATE_NORMAL, STATE_KILL_SWITCH, false, false, "paper_trading"),
+            Some("emergency_stop")
+        );
     }
 }

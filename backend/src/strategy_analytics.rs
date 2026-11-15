@@ -16,7 +16,7 @@
 
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -33,6 +33,11 @@ pub const FULL_EQUITY_LABEL: &str =
 pub const EQUITY_MODEL_NOTE: &str =
     "Legacy partial view before strategy capital is funded on the ledger.";
 pub const PENDING_CAPITAL_NOTE: &str = "Configured allocation is not funded in the strategy ledger yet. Paper copy trades stay blocked until cash moves from the trading account (enable the strategy or allocate capital).";
+
+/// Realized P&L in metrics uses cumulative `positions.realized_pnl_usd` (per strategy).
+/// Per-close cycle history: `position_close_events` or sum of `closed_positions` (cycle amounts).
+pub const REALIZED_PNL_SEMANTICS_NOTE: &str =
+    "Realized P&L sums cumulative amounts on open position rows; closed-cycle history is in position_close_events.";
 pub const PENDING_CAPITAL_LABEL: &str = "Configured allocation (not yet funded)";
 pub const FULL_EQUITY_NOTE: &str =
     "Full strategy equity from the capital ledger: liquid cash (available + reserved) plus mark-to-model open positions.";
@@ -134,6 +139,17 @@ pub struct PositionRow {
     pub position_fees_usd: Option<Decimal>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityFillLeg {
+    pub fill_id: Uuid,
+    pub filled_at: DateTime<Utc>,
+    pub price: Decimal,
+    pub shares: Decimal,
+    pub notional_usd: Decimal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_usd: Option<Decimal>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ActivityRow {
     pub decision_id: Uuid,
@@ -155,6 +171,12 @@ pub struct ActivityRow {
     /// PVR trade multiplier when sizing audit recorded it (`NULL` / 1 = omit in UI).
     pub pvr_trade_multiplier: Option<Decimal>,
     pub sizing_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_target_notional_usd: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capped_target_notional_usd: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sizing_explanation: Option<String>,
     pub order_id: Option<Uuid>,
     pub order_status: Option<String>,
     pub submitted_at: Option<DateTime<Utc>>,
@@ -162,12 +184,56 @@ pub struct ActivityRow {
     pub filled_at: Option<DateTime<Utc>>,
     pub fill_price: Option<Decimal>,
     pub fill_shares: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_notional_usd: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_legs: Option<Vec<ActivityFillLeg>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_target_shares: Option<Decimal>,
     pub fee_usd: Option<Decimal>,
     pub slippage_vs_source_bps: Option<i32>,
     pub slippage_vs_limit_bps: Option<i32>,
     pub paper_execution_mode: Option<String>,
     pub paper_execution_context: Option<serde_json::Value>,
-    pub execution_status: &'static str,
+    pub execution_status: String,
+    /// `decision` (copy pipeline) or `settlement` (capital ledger).
+    #[serde(default = "default_activity_kind")]
+    pub activity_kind: String,
+    /// High-level row type for filters: `buy`, `sell`, `settlement` (and `fill` when filled).
+    #[serde(default = "default_feed_type")]
+    pub feed_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_entry_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_payout_usd: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_open_shares: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_closed_shares: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_avg_entry_price: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_avg_exit_price: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_cost_basis_usd: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_proceeds_usd: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_fees_usd: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_realized_pnl_usd: Option<Decimal>,
+}
+
+fn default_activity_kind() -> String {
+    "decision".into()
+}
+
+fn default_feed_type() -> String {
+    "buy".into()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,8 +268,15 @@ pub struct EquityPoint {
     pub realized_pnl_usd: Decimal,
     pub unrealized_pnl_usd: Decimal,
     pub deployed_capital_usd: Decimal,
+    pub reserved_capital_usd: Decimal,
+    pub available_capital_usd: Decimal,
+    pub allocated_capital_usd: Decimal,
     pub total_pnl_usd: Decimal,
     pub data_quality: String,
+}
+
+pub fn position_row_total_pnl(row: &PositionRow) -> Decimal {
+    (row.realized_pnl_usd + row.unrealized_pnl_usd).round_dp(8)
 }
 
 struct TokenMark {
@@ -273,7 +346,7 @@ pub fn resolve_period(
     }
     let label = period.unwrap_or("1M").to_string();
     let start = match label.to_ascii_uppercase().as_str() {
-        "1D" => now - Duration::days(1),
+        "TODAY" | "1D" => now - Duration::days(1),
         "1W" => now - Duration::weeks(1),
         "1M" => now - Duration::days(30),
         "3M" => now - Duration::days(90),
@@ -298,10 +371,9 @@ pub async fn assert_strategy_owner(
 ) -> anyhow::Result<(String, bool, String, String, Uuid)> {
     let mut tx = begin_as(pool, Some(user_id), "user").await?;
     let row: Option<(String, bool, String, String, Uuid)> = sqlx::query_as(
-        "SELECT t.alias, s.enabled, a.operating_mode, s.sizing_mode, s.trading_account_id
+        "SELECT t.alias, s.enabled, s.operating_mode, s.sizing_mode, s.trading_account_id
          FROM copy_strategies s
          JOIN source_traders t ON t.id = s.source_trader_id
-         JOIN trading_accounts a ON a.id = s.trading_account_id
          WHERE s.id = $1 AND s.user_id = $2",
     )
     .bind(strategy_id)
@@ -818,27 +890,295 @@ fn sizing_audit_mode(checks: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn execution_status(decision_status: &str, order_status: Option<&str>) -> &'static str {
+fn sizing_audit_json(checks: &serde_json::Value) -> Option<&serde_json::Value> {
+    checks.get("sizing_audit")
+}
+
+fn sizing_audit_decimal(audit: &serde_json::Value, key: &str) -> Option<Decimal> {
+    audit.get(key).and_then(json_decimal)
+}
+
+fn execution_status(decision_status: &str, order_status: Option<&str>) -> String {
     if decision_status == "rejected" || decision_status == "skipped" {
-        return "skipped";
+        return "skipped".into();
     }
     match order_status {
-        Some("filled") => "executed",
-        Some("partially_filled") => "partial",
-        Some("failed") | Some("rejected") | Some("cancelled") => "failed",
-        Some(_) => "pending",
-        None if decision_status == "approved" => "no_order",
-        _ => "skipped",
+        Some("filled") => "executed".into(),
+        Some("partially_filled") => "partial".into(),
+        Some("failed") | Some("rejected") | Some("cancelled") => "failed".into(),
+        Some(_) => "pending".into(),
+        None if decision_status == "approved" => "no_order".into(),
+        _ => "skipped".into(),
     }
 }
 
+
 pub struct ActivityListParams<'a> {
+    pub activity_type: Option<&'a str>,
     pub side: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub search: Option<&'a str>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
     pub limit: i64,
     pub offset: i64,
 }
+
+fn effective_activity_type<'a>(
+    activity_type: Option<&'a str>,
+    side: Option<&'a str>,
+) -> Option<String> {
+    activity_type
+        .or(side)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+}
+
+const ACTIVITY_FEED_SQL: &str = r#"
+WITH decision_feed AS (
+    SELECT
+        d.id AS activity_id,
+        'decision'::text AS activity_kind,
+        d.decided_at AS occurred_at,
+        lower(d.side) AS feed_type,
+        (f.fill_id IS NOT NULL) AS has_fill,
+        CASE
+            WHEN d.status IN ('rejected', 'skipped') THEN 'skipped'
+            WHEN o.status = 'filled' THEN 'executed'
+            WHEN o.status = 'partially_filled' THEN 'partial'
+            WHEN o.status IN ('failed', 'rejected', 'cancelled') THEN 'failed'
+            WHEN o.status IS NOT NULL THEN 'pending'
+            WHEN d.status = 'approved' THEN 'no_order'
+            ELSE 'skipped'
+        END AS exec_status,
+        d.id AS decision_id,
+        d.status AS decision_status,
+        d.side,
+        d.reason,
+        d.source_event_id,
+        d.decided_at,
+        d.detected_at,
+        e.event_ts AS source_event_at,
+        CASE
+            WHEN e.usdc_size IS NOT NULL AND e.usdc_size > 0 THEN e.usdc_size
+            ELSE e.notional_usd
+        END AS source_notional_usd,
+        e.price AS source_price,
+        CASE
+            WHEN e.usdc_size IS NOT NULL AND e.usdc_size > 0 AND e.price > 0
+            THEN e.usdc_size / e.price
+            ELSE e.size_shares
+        END AS source_shares,
+        e.market_title,
+        e.event_title,
+        e.outcome,
+        d.target_notional_usd,
+        d.checks,
+        o.id AS order_id,
+        o.status AS order_status,
+        o.submitted_at,
+        o.size_shares AS order_target_shares,
+        f.fill_id,
+        f.filled_at,
+        f.fill_price,
+        f.fill_shares,
+        f.fill_notional_usd,
+        f.fill_legs,
+        f.fee_usd,
+        f.slippage_vs_source_bps,
+        f.slippage_vs_limit_bps,
+        f.paper_execution_mode,
+        f.paper_execution_context,
+        NULL::text AS ledger_entry_type,
+        NULL::numeric AS settlement_payout_usd,
+        o.position_open_shares_after AS position_open_shares,
+        NULL::text AS close_reason,
+        NULL::numeric AS close_closed_shares,
+        NULL::numeric AS close_avg_entry_price,
+        NULL::numeric AS close_avg_exit_price,
+        NULL::numeric AS close_cost_basis_usd,
+        NULL::numeric AS close_proceeds_usd,
+        NULL::numeric AS close_fees_usd,
+        NULL::numeric AS close_realized_pnl_usd
+    FROM copy_decisions d
+    JOIN copy_strategies cs ON cs.id = d.strategy_id
+    LEFT JOIN source_events e ON e.id = d.source_event_id
+    LEFT JOIN orders o ON o.decision_id = d.id
+    LEFT JOIN LATERAL (
+        SELECT
+            (ARRAY_AGG(ff.id ORDER BY ff.filled_at DESC))[1] AS fill_id,
+            MAX(ff.filled_at) AS filled_at,
+            SUM(ff.shares) AS fill_shares,
+            SUM(ff.notional_usd) AS fill_notional_usd,
+            CASE
+                WHEN COALESCE(SUM(ff.shares), 0) > 0
+                THEN SUM(ff.price * ff.shares) / SUM(ff.shares)
+                ELSE NULL
+            END AS fill_price,
+            SUM(ff.fee_usd) AS fee_usd,
+            (ARRAY_AGG(ff.slippage_vs_source_bps ORDER BY ff.filled_at DESC))[1] AS slippage_vs_source_bps,
+            (ARRAY_AGG(ff.slippage_vs_limit_bps ORDER BY ff.filled_at DESC))[1] AS slippage_vs_limit_bps,
+            (ARRAY_AGG(ff.paper_execution_mode ORDER BY ff.filled_at DESC))[1] AS paper_execution_mode,
+            (ARRAY_AGG(ff.paper_execution_context ORDER BY ff.filled_at DESC))[1] AS paper_execution_context,
+            COALESCE(
+                json_agg(
+                    json_build_object(
+                        'fill_id', ff.id,
+                        'filled_at', ff.filled_at,
+                        'price', ff.price,
+                        'shares', ff.shares,
+                        'notional_usd', ff.notional_usd,
+                        'fee_usd', ff.fee_usd
+                    )
+                    ORDER BY ff.filled_at ASC
+                ) FILTER (WHERE ff.id IS NOT NULL),
+                '[]'::json
+            ) AS fill_legs
+        FROM fills ff
+        WHERE ff.order_id = o.id
+    ) f ON o.id IS NOT NULL
+    WHERE d.strategy_id = $1
+),
+capital_feed AS (
+    SELECT
+        cle.id AS activity_id,
+        'capital'::text AS activity_kind,
+        cle.created_at AS occurred_at,
+        cle.entry_type AS feed_type,
+        false AS has_fill,
+        'executed'::text AS exec_status,
+        cle.id AS decision_id,
+        'posted'::text AS decision_status,
+        'capital'::text AS side,
+        ''::text AS reason,
+        '00000000-0000-0000-0000-000000000000'::uuid AS source_event_id,
+        cle.created_at AS decided_at,
+        cle.created_at AS detected_at,
+        NULL::timestamptz AS source_event_at,
+        NULL::numeric AS source_notional_usd,
+        NULL::numeric AS source_price,
+        NULL::numeric AS source_shares,
+        NULL::text AS market_title,
+        cle.entry_type AS event_title,
+        NULL::text AS outcome,
+        NULL::numeric AS target_notional_usd,
+        '{}'::jsonb AS checks,
+        cle.order_id,
+        NULL::text AS order_status,
+        NULL::timestamptz AS submitted_at,
+        NULL::numeric AS order_target_shares,
+        cle.fill_id,
+        cle.created_at AS filled_at,
+        NULL::numeric AS fill_price,
+        NULL::numeric AS fill_shares,
+        cle.amount_usd AS fill_notional_usd,
+        '[]'::json AS fill_legs,
+        NULL::numeric AS fee_usd,
+        NULL::int AS slippage_vs_source_bps,
+        NULL::int AS slippage_vs_limit_bps,
+        NULL::text AS paper_execution_mode,
+        NULL::jsonb AS paper_execution_context,
+        cle.entry_type AS ledger_entry_type,
+        cle.amount_usd AS settlement_payout_usd,
+        NULL::numeric AS position_open_shares,
+        NULL::text AS close_reason,
+        NULL::numeric AS close_closed_shares,
+        NULL::numeric AS close_avg_entry_price,
+        NULL::numeric AS close_avg_exit_price,
+        NULL::numeric AS close_cost_basis_usd,
+        NULL::numeric AS close_proceeds_usd,
+        NULL::numeric AS close_fees_usd,
+        NULL::numeric AS close_realized_pnl_usd
+    FROM capital_ledger_entries cle
+    WHERE cle.strategy_id = $1
+      AND cle.entry_type IN (
+          'account_paper_funding',
+          'strategy_allocation',
+          'strategy_withdrawal',
+          'reconciliation_adjustment',
+          'order_reserve',
+          'reserve_release'
+      )
+),
+close_feed AS (
+    SELECT
+        pce.id AS activity_id,
+        'closed'::text AS activity_kind,
+        pce.closed_at AS occurred_at,
+        'closed'::text AS feed_type,
+        false AS has_fill,
+        'closed'::text AS exec_status,
+        pce.id AS decision_id,
+        'closed'::text AS decision_status,
+        'closed'::text AS side,
+        ''::text AS reason,
+        '00000000-0000-0000-0000-000000000000'::uuid AS source_event_id,
+        pce.closed_at AS decided_at,
+        pce.closed_at AS detected_at,
+        NULL::timestamptz AS source_event_at,
+        NULL::numeric AS source_notional_usd,
+        NULL::numeric AS source_price,
+        NULL::numeric AS source_shares,
+        pce.market_title,
+        NULL::text AS event_title,
+        pce.outcome,
+        NULL::numeric AS target_notional_usd,
+        '{}'::jsonb AS checks,
+        NULL::uuid AS order_id,
+        NULL::text AS order_status,
+        NULL::timestamptz AS submitted_at,
+        NULL::numeric AS order_target_shares,
+        NULL::uuid AS fill_id,
+        pce.closed_at AS filled_at,
+        pce.avg_exit_price AS fill_price,
+        pce.closed_shares AS fill_shares,
+        pce.total_proceeds_usd AS fill_notional_usd,
+        '[]'::json AS fill_legs,
+        pce.total_fees_usd AS fee_usd,
+        NULL::int AS slippage_vs_source_bps,
+        NULL::int AS slippage_vs_limit_bps,
+        NULL::text AS paper_execution_mode,
+        NULL::jsonb AS paper_execution_context,
+        NULL::text AS ledger_entry_type,
+        NULL::numeric AS settlement_payout_usd,
+        NULL::numeric AS position_open_shares,
+        pce.close_reason,
+        pce.closed_shares AS close_closed_shares,
+        pce.avg_entry_price AS close_avg_entry_price,
+        pce.avg_exit_price AS close_avg_exit_price,
+        pce.total_cost_basis_usd AS close_cost_basis_usd,
+        pce.total_proceeds_usd AS close_proceeds_usd,
+        pce.total_fees_usd AS close_fees_usd,
+        pce.realized_pnl_usd AS close_realized_pnl_usd
+    FROM position_close_events pce
+    WHERE pce.strategy_id = $1
+),
+combined AS (
+    SELECT * FROM decision_feed
+    UNION ALL
+    SELECT * FROM capital_feed
+    UNION ALL
+    SELECT * FROM close_feed
+)
+SELECT * FROM combined c
+WHERE ($2::timestamptz IS NULL OR c.occurred_at >= $2)
+  AND ($3::timestamptz IS NULL OR c.occurred_at < $3)
+  AND ($4::text IS NULL OR c.exec_status = $4)
+  AND (
+    $5::text IS NULL OR
+    ($5 = 'fill' AND c.activity_kind = 'decision' AND c.has_fill) OR
+    ($5 = 'settlement' AND c.activity_kind = 'closed' AND c.close_reason LIKE 'resolution_%') OR
+    ($5 IN ('buy', 'sell') AND c.activity_kind = 'decision' AND c.feed_type = $5) OR
+    ($5 = 'closed' AND c.activity_kind = 'closed') OR
+    ($5 = 'capital' AND c.activity_kind = 'capital')
+  )
+  AND (
+    $6::text IS NULL OR
+    c.market_title ILIKE '%' || $6 || '%' OR
+    c.event_title ILIKE '%' || $6 || '%' OR
+    c.outcome ILIKE '%' || $6 || '%'
+  )
+"#;
 
 pub async fn list_activity(
     pool: &PgPool,
@@ -846,13 +1186,7 @@ pub async fn list_activity(
     strategy_id: Uuid,
     params: ActivityListParams<'_>,
 ) -> anyhow::Result<(Vec<ActivityRow>, i64)> {
-    let ActivityListParams {
-        side,
-        from,
-        to,
-        limit,
-        offset,
-    } = params;
+    let effective_type = effective_activity_type(params.activity_type, params.side);
     let mut tx = begin_as(pool, Some(user_id), "user").await?;
     let owned: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM copy_strategies WHERE id = $1 AND user_id = $2)",
@@ -865,54 +1199,42 @@ pub async fn list_activity(
         anyhow::bail!("strategy not found");
     }
 
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM copy_decisions d
-         WHERE d.strategy_id = $1
-           AND ($2::text IS NULL OR lower(d.side) = lower($2))
-           AND ($3::timestamptz IS NULL OR d.decided_at >= $3)
-           AND ($4::timestamptz IS NULL OR d.decided_at < $4)",
-    )
-    .bind(strategy_id)
-    .bind(side)
-    .bind(from)
-    .bind(to)
-    .fetch_one(&mut *tx)
-    .await?;
+    let count_sql = format!(
+        "WITH filtered AS ({ACTIVITY_FEED_SQL}) SELECT COUNT(*)::bigint FROM filtered"
+    );
+    let total: i64 = sqlx::query_scalar(&count_sql)
+        .bind(strategy_id)
+        .bind(params.from)
+        .bind(params.to)
+        .bind(params.status)
+        .bind(effective_type.as_deref())
+        .bind(params.search)
+        .fetch_one(&mut *tx)
+        .await?;
 
-    let raw_rows = sqlx::query(
-        "SELECT d.id AS decision_id, d.status AS decision_status, d.side, d.reason, d.source_event_id, d.decided_at, d.detected_at,
-                e.event_ts AS source_event_at, e.notional_usd AS source_notional_usd, e.price AS source_price, e.size_shares AS source_shares,
-                e.market_title, e.outcome,
-                d.target_notional_usd, d.checks,
-                o.id AS order_id, o.status AS order_status, o.submitted_at,
-                f.id AS fill_id, f.filled_at, f.price AS fill_price, f.shares AS fill_shares, f.fee_usd, f.slippage_vs_source_bps, f.slippage_vs_limit_bps,
-                f.paper_execution_mode, f.paper_execution_context
-         FROM copy_decisions d
-         LEFT JOIN source_events e ON e.id = d.source_event_id
-         LEFT JOIN orders o ON o.decision_id = d.id
-         LEFT JOIN LATERAL (
-            SELECT * FROM fills ff WHERE ff.order_id = o.id ORDER BY ff.filled_at DESC LIMIT 1
-         ) f ON true
-         WHERE d.strategy_id = $1
-           AND ($2::text IS NULL OR lower(d.side) = lower($2))
-           AND ($3::timestamptz IS NULL OR d.decided_at >= $3)
-           AND ($4::timestamptz IS NULL OR d.decided_at < $4)
-         ORDER BY d.decided_at DESC, d.id DESC
-         LIMIT $5 OFFSET $6",
-    )
-    .bind(strategy_id)
-    .bind(side)
-    .bind(from)
-    .bind(to)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&mut *tx)
-    .await?;
+    let page_sql = format!(
+        "{ACTIVITY_FEED_SQL}
+         ORDER BY c.occurred_at DESC, c.activity_id DESC
+         LIMIT $7 OFFSET $8"
+    );
+    let raw_rows = sqlx::query(&page_sql)
+        .bind(strategy_id)
+        .bind(params.from)
+        .bind(params.to)
+        .bind(params.status)
+        .bind(effective_type.as_deref())
+        .bind(params.search)
+        .bind(params.limit)
+        .bind(params.offset)
+        .fetch_all(&mut *tx)
+        .await?;
 
     let rows = raw_rows
         .into_iter()
         .map(|row| {
             use sqlx::Row;
+            let activity_kind: String = row.get("activity_kind");
+            let feed_type: String = row.get("feed_type");
             let decision_id: Uuid = row.get("decision_id");
             let decision_status: String = row.get("decision_status");
             let side: String = row.get("side");
@@ -921,18 +1243,29 @@ pub async fn list_activity(
             let decided_at: DateTime<Utc> = row.get("decided_at");
             let detected_at: DateTime<Utc> = row.get("detected_at");
             let source_event_at: Option<DateTime<Utc>> = row.get("source_event_at");
-            let source_notional_usd: Option<Decimal> = row.get("source_notional_usd");
+            let checks: serde_json::Value = row.get("checks");
+            let audit = sizing_audit_json(&checks);
+            let mut source_notional_usd: Option<Decimal> = row.get("source_notional_usd");
+            if let Some(a) = audit {
+                if let Some(d) = sizing_audit_decimal(a, "source_notional_usd") {
+                    source_notional_usd = Some(d);
+                }
+            }
             let source_price: Option<Decimal> = row.get("source_price");
             let source_shares: Option<Decimal> = row.get("source_shares");
             let market_title: Option<String> = row.get("market_title");
+            let event_title: Option<String> = row.get("event_title");
             let outcome: Option<String> = row.get("outcome");
-            let checks: serde_json::Value = row.get("checks");
             let target_notional_usd: Option<Decimal> = row
                 .get::<Option<Decimal>, _>("target_notional_usd")
                 .or_else(|| sizing_audit_raw_target(&checks))
                 .filter(|d| *d > Decimal::ZERO);
             let pvr_trade_multiplier = sizing_audit_pvr_multiplier(&checks);
             let sizing_mode = sizing_audit_mode(&checks);
+            let raw_target_notional_usd = audit.and_then(|a| sizing_audit_decimal(a, "raw_target_notional_usd"));
+            let capped_target_notional_usd =
+                audit.and_then(|a| sizing_audit_decimal(a, "capped_target_notional_usd"));
+            let sizing_explanation = audit.and_then(crate::copy_sizing::explain_sizing_audit);
             let order_id: Option<Uuid> = row.get("order_id");
             let order_status: Option<String> = row.get("order_status");
             let submitted_at: Option<DateTime<Utc>> = row.get("submitted_at");
@@ -940,13 +1273,37 @@ pub async fn list_activity(
             let filled_at: Option<DateTime<Utc>> = row.get("filled_at");
             let fill_price: Option<Decimal> = row.get("fill_price");
             let fill_shares: Option<Decimal> = row.get("fill_shares");
+            let fill_notional_usd: Option<Decimal> = row.get("fill_notional_usd");
+            let order_target_shares: Option<Decimal> = row.get("order_target_shares");
+            let fill_legs: Option<Vec<ActivityFillLeg>> = row
+                .try_get::<Option<serde_json::Value>, _>("fill_legs")
+                .ok()
+                .flatten()
+                .and_then(|v| {
+                    if v.is_null() {
+                        None
+                    } else {
+                        serde_json::from_value(v).ok()
+                    }
+                });
             let fee_usd: Option<Decimal> = row.get("fee_usd");
             let slip_src: Option<i32> = row.get("slippage_vs_source_bps");
             let slip_lim: Option<i32> = row.get("slippage_vs_limit_bps");
             let paper_execution_mode: Option<String> = row.get("paper_execution_mode");
             let paper_execution_context: Option<serde_json::Value> =
                 row.get("paper_execution_context");
-            let exec = execution_status(&decision_status, order_status.as_deref());
+            let ledger_entry_type: Option<String> = row.get("ledger_entry_type");
+            let settlement_payout_usd: Option<Decimal> = row.get("settlement_payout_usd");
+            let position_open_shares: Option<Decimal> = row.get("position_open_shares");
+            let close_reason: Option<String> = row.get("close_reason");
+            let close_closed_shares: Option<Decimal> = row.get("close_closed_shares");
+            let close_avg_entry_price: Option<Decimal> = row.get("close_avg_entry_price");
+            let close_avg_exit_price: Option<Decimal> = row.get("close_avg_exit_price");
+            let close_cost_basis_usd: Option<Decimal> = row.get("close_cost_basis_usd");
+            let close_proceeds_usd: Option<Decimal> = row.get("close_proceeds_usd");
+            let close_fees_usd: Option<Decimal> = row.get("close_fees_usd");
+            let close_realized_pnl_usd: Option<Decimal> = row.get("close_realized_pnl_usd");
+            let exec: String = row.get("exec_status");
             let (reason_title, reason_detail) = if reason.is_empty() {
                 (None, None)
             } else {
@@ -978,6 +1335,9 @@ pub async fn list_activity(
                 target_notional_usd,
                 pvr_trade_multiplier,
                 sizing_mode,
+                raw_target_notional_usd,
+                capped_target_notional_usd,
+                sizing_explanation,
                 order_id,
                 order_status,
                 submitted_at,
@@ -985,12 +1345,29 @@ pub async fn list_activity(
                 filled_at,
                 fill_price,
                 fill_shares,
+                fill_notional_usd,
+                fill_legs,
+                order_target_shares,
                 fee_usd,
                 slippage_vs_source_bps: slip_src,
                 slippage_vs_limit_bps: slip_lim,
                 paper_execution_mode,
                 paper_execution_context,
                 execution_status: exec,
+                activity_kind,
+                feed_type,
+                ledger_entry_type,
+                event_title,
+                settlement_payout_usd,
+                position_open_shares,
+                close_reason,
+                close_closed_shares,
+                close_avg_entry_price,
+                close_avg_exit_price,
+                close_cost_basis_usd,
+                close_proceeds_usd,
+                close_fees_usd,
+                close_realized_pnl_usd,
             }
         })
         .collect();
@@ -1033,6 +1410,7 @@ pub async fn compute_performance(
     .fetch_one(&mut *tx)
     .await?;
 
+    // AVG with no matching rows still returns one NULL row — use Option<Decimal> + fetch_one, not fetch_optional.
     let slip_avg: Option<Decimal> = sqlx::query_scalar(
         "SELECT AVG(f.slippage_vs_source_bps::numeric)
          FROM fills f
@@ -1042,7 +1420,7 @@ pub async fn compute_performance(
            AND f.paper_execution_mode = 'clob'",
     )
     .bind(strategy_id)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
     let slip_avg_clob: Option<Decimal> = sqlx::query_scalar(
         "SELECT AVG(f.slippage_vs_source_bps::numeric)
@@ -1053,7 +1431,7 @@ pub async fn compute_performance(
            AND f.paper_execution_mode = 'clob'",
     )
     .bind(strategy_id)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
     let slip_avg_synthetic: Option<Decimal> = sqlx::query_scalar(
         "SELECT AVG(f.slippage_vs_source_bps::numeric)
@@ -1064,7 +1442,7 @@ pub async fn compute_performance(
            AND f.paper_execution_mode = 'synthetic_source_price'",
     )
     .bind(strategy_id)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
     let clob_fill_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM fills f
@@ -1202,10 +1580,15 @@ pub async fn equity_series(
         Decimal,
         Decimal,
         Decimal,
+        Decimal,
+        Decimal,
+        Decimal,
         String,
     )> = sqlx::query_as(
         "SELECT bucket_at, equity_metric_usd, realized_pnl_usd, unrealized_pnl_usd,
-                deployed_capital_usd,
+                deployed_capital_usd, reserved_capital_usd,
+                GREATEST(allocated_capital_usd - deployed_capital_usd - reserved_capital_usd, 0),
+                allocated_capital_usd,
                 realized_pnl_usd + unrealized_pnl_usd,
                 data_quality
          FROM strategy_analytics_snapshots
@@ -1222,12 +1605,26 @@ pub async fn equity_series(
     Ok(rows
         .into_iter()
         .map(
-            |(at, equity, realized, unreal, deployed, total_pnl, data_quality)| EquityPoint {
+            |(
+                at,
+                equity,
+                realized,
+                unreal,
+                deployed,
+                reserved,
+                available,
+                allocated,
+                total_pnl,
+                data_quality,
+            )| EquityPoint {
                 at,
                 equity_metric_usd: equity,
                 realized_pnl_usd: realized,
                 unrealized_pnl_usd: unreal,
                 deployed_capital_usd: deployed,
+                reserved_capital_usd: reserved,
+                available_capital_usd: available,
+                allocated_capital_usd: allocated,
                 total_pnl_usd: total_pnl,
                 data_quality,
             },
@@ -1312,7 +1709,10 @@ pub async fn build_overview(
         user_id,
         strategy_id,
         ActivityListParams {
+            activity_type: None,
             side: None,
+            status: None,
+            search: None,
             from: None,
             to: None,
             limit: 8,

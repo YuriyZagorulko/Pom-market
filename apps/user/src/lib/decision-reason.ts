@@ -33,12 +33,17 @@ const REASONS: Record<string, { title: string; detail: string }> = {
   below_minimum: {
     title: "Below minimum copy size",
     detail:
-      "The trade could not be sized above zero after PVR/caps, or LIVE rules require at least $1 / market min shares. PAPER does not use the Polymarket $1 floor when strategy min order is $0.",
+      "Target notional is below strategy min order, Polymarket $1 (when enforced), or market min shares after sizing. Check the sizing line for raw target vs caps.",
   },
   slippage_exceeded: {
     title: "Slippage / market gap",
     detail:
       "The best available CLOB price is too far from the leader trade or your limit. Paper copy was not executed.",
+  },
+  fee_unknown: {
+    title: "Unable to determine market trading fee",
+    detail:
+      "Polymarket fee parameters could not be loaded for this market. Copy was skipped until fee status is known (we do not assume zero fee).",
   },
 };
 

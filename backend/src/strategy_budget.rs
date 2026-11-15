@@ -161,8 +161,22 @@ async fn utilization_in_tx(
 ) -> anyhow::Result<BudgetUtilization> {
     let bootstrapped = crate::strategy_accounting::is_capital_bootstrapped(tx, strategy_id).await?;
     let deployed: Decimal = if bootstrapped {
-        let cap = crate::strategy_accounting::lock_strategy_capital(tx, strategy_id).await?;
-        cap.invested_capital_usd
+        let invested: Option<Decimal> = sqlx::query_scalar(
+            "SELECT invested_capital_usd FROM strategy_capital_accounts WHERE strategy_id = $1",
+        )
+        .bind(strategy_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        match invested {
+            Some(v) => v,
+            None => sqlx::query_scalar(
+                "SELECT COALESCE(SUM(cost_basis_usd), 0) FROM positions
+                 WHERE strategy_id = $1 AND open_shares > 0",
+            )
+            .bind(strategy_id)
+            .fetch_one(&mut **tx)
+            .await?,
+        }
     } else {
         sqlx::query_scalar(
             "SELECT COALESCE(SUM(cost_basis_usd), 0) FROM positions

@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::{parse_activity_payload, parse_order_book, RawTrade};
+use super::{parse_activity_cashflows, parse_activity_payload, parse_order_book, RawTrade};
 use crate::engine::OrderBook;
 use crate::security::redact;
 
@@ -100,11 +100,60 @@ impl PublicClient {
         parse_market_fee(&market)
     }
 
+    /// Leader CLOB trades (`/v2/trades`). Unlike `/v2/activity`, this includes SELL for
+    /// high-volume wallets where activity pagination is BUY-heavy.
+    pub async fn trades_page(
+        &self,
+        wallet: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<RawTrade>, Option<String>), String> {
+        let base = self.data_api.trim_end_matches('/');
+        let url = format!("{base}/v2/trades");
+        let mut request = self
+            .http
+            .get(url)
+            .query(&[("user", wallet), ("limit", "100")]);
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        let response = self.send_with_retry(request).await?;
+        if !response.status().is_success() {
+            return Err(format!("data api trades HTTP {}", response.status()));
+        }
+        let body: Value = response.json().await.map_err(|e| redact(&e.to_string()))?;
+        let trades = parse_activity_payload(&body, "data_api");
+        let next = body
+            .pointer("/pagination/next_cursor")
+            .or_else(|| body.get("next_cursor"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Ok((trades, next))
+    }
+
     pub async fn activity_page(
         &self,
         wallet: &str,
         cursor: Option<&str>,
     ) -> Result<(Vec<RawTrade>, Option<String>), String> {
+        let (body, next) = self.fetch_activity_body(wallet, cursor).await?;
+        Ok((parse_activity_payload(&body, "data_api"), next))
+    }
+
+    pub async fn activity_cashflows_page(
+        &self,
+        wallet: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<super::RawCashflow>, Option<String>), String> {
+        let (body, next) = self.fetch_activity_body(wallet, cursor).await?;
+        Ok((parse_activity_cashflows(&body, "data_api_activity"), next))
+    }
+
+    async fn fetch_activity_body(
+        &self,
+        wallet: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Value, Option<String>), String> {
         let base = self.data_api.trim_end_matches('/');
         let url = format!("{base}/v2/activity");
         let mut request = self
@@ -116,20 +165,19 @@ impl PublicClient {
         }
         let response = self.send_with_retry(request).await?;
         if response.status().as_u16() == 410 || response.status().as_u16() == 404 {
-            return self.activity_fallback(wallet).await;
+            return Ok((serde_json::json!({"data": []}), None));
         }
         if !response.status().is_success() {
             return Err(format!("data api HTTP {}", response.status()));
         }
         let body: Value = response.json().await.map_err(|e| redact(&e.to_string()))?;
-        let trades = parse_activity_payload(&body, "data_api");
         let next = body
             .pointer("/pagination/next_cursor")
             .or_else(|| body.get("next_cursor"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        Ok((trades, next))
+        Ok((body, next))
     }
 
     async fn activity_fallback(
@@ -345,10 +393,200 @@ impl PublicClient {
             .fold(Decimal::ZERO, |a, b| a + b);
         Ok(sum.round_dp(8))
     }
+
+    /// CLOB market metadata including resolution (`tokens[].winner`, `closed`).
+    /// `GET /v2/user-stats?user=`
+    pub async fn user_stats(&self, wallet: &str) -> Result<Value, String> {
+        let url = format!(
+            "{}/v2/user-stats",
+            self.data_api.trim_end_matches('/')
+        );
+        let response = self
+            .send_with_retry(self.http.get(url).query(&[("user", wallet)]))
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("data api user-stats HTTP {}", response.status()));
+        }
+        response.json().await.map_err(|e| redact(&e.to_string()))
+    }
+
+    /// `GET /v2/user-pnl?user=&interval=`
+    pub async fn user_pnl_series(
+        &self,
+        wallet: &str,
+        interval: &str,
+    ) -> Result<Value, String> {
+        let url = format!("{}/v2/user-pnl", self.data_api.trim_end_matches('/'));
+        let response = self
+            .send_with_retry(
+                self.http
+                    .get(url)
+                    .query(&[("user", wallet), ("interval", interval)]),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("data api user-pnl HTTP {}", response.status()));
+        }
+        response.json().await.map_err(|e| redact(&e.to_string()))
+    }
+
+    /// `GET /v2/user-volume?user=`
+    pub async fn user_volume(&self, wallet: &str) -> Result<Value, String> {
+        let url = format!(
+            "{}/v2/user-volume",
+            self.data_api.trim_end_matches('/')
+        );
+        let response = self
+            .send_with_retry(self.http.get(url).query(&[("user", wallet)]))
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("data api user-volume HTTP {}", response.status()));
+        }
+        response.json().await.map_err(|e| redact(&e.to_string()))
+    }
+
+    /// Open positions with mark and PnL fields (`/v2/positions`).
+    pub async fn positions_v2(&self, wallet: &str) -> Result<Vec<Value>, String> {
+        let url = format!("{}/v2/positions", self.data_api.trim_end_matches('/'));
+        let response = self
+            .send_with_retry(self.http.get(url).query(&[("user", wallet)]))
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("data api positions HTTP {}", response.status()));
+        }
+        let body: Value = response.json().await.map_err(|e| redact(&e.to_string()))?;
+        Ok(body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub async fn market_by_condition_id(&self, condition_id: &str) -> Result<Value, String> {
+        let cid = condition_id.trim();
+        if cid.is_empty() {
+            return Err("condition_id missing".into());
+        }
+        let url = format!("{}/markets/{}", self.clob.trim_end_matches('/'), cid);
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| redact(&e.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err("market HTTP 404 Not Found".into());
+        }
+        if !response.status().is_success() {
+            return Err(format!("market HTTP {}", response.status()));
+        }
+        response.json().await.map_err(|e| redact(&e.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarketResolutionKind {
+    Active,
+    ClosedPending,
+    Win,
+    Loss,
+    RefundHalf,
+}
+
+#[derive(Clone, Debug)]
+pub struct MarketResolution {
+    pub kind: MarketResolutionKind,
+    pub payout_per_share: Decimal,
+    pub winning_outcome: Option<String>,
+}
+
+/// Resolve payout for a held outcome token from CLOB market JSON.
+pub fn resolution_for_token(market: &Value, token_id: &str, held_outcome: Option<&str>) -> MarketResolution {
+    let closed = market.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let tokens = market
+        .get("tokens")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if tokens.is_empty() {
+        return MarketResolution {
+            kind: if closed {
+                MarketResolutionKind::ClosedPending
+            } else {
+                MarketResolutionKind::Active
+            },
+            payout_per_share: Decimal::ZERO,
+            winning_outcome: None,
+        };
+    }
+    let ours = tokens.iter().find(|t| {
+        t.get("token_id")
+            .and_then(|v| v.as_str())
+            .map(|id| id == token_id)
+            .unwrap_or(false)
+    });
+    let winner_set = tokens.iter().any(|t| t.get("winner").and_then(|v| v.as_bool()) == Some(true));
+    if !closed {
+        return MarketResolution {
+            kind: MarketResolutionKind::Active,
+            payout_per_share: Decimal::ZERO,
+            winning_outcome: None,
+        };
+    }
+    if !winner_set {
+        let half = tokens.iter().all(|t| {
+            t.get("price")
+                .and_then(json_decimal)
+                .map(|p| (p - Decimal::new(5, 1)).abs() <= Decimal::new(1, 2))
+                .unwrap_or(false)
+        });
+        if half {
+            return MarketResolution {
+                kind: MarketResolutionKind::RefundHalf,
+                payout_per_share: Decimal::new(5, 1),
+                winning_outcome: None,
+            };
+        }
+        return MarketResolution {
+            kind: MarketResolutionKind::ClosedPending,
+            payout_per_share: Decimal::ZERO,
+            winning_outcome: None,
+        };
+    }
+    let win_token = tokens.iter().find(|t| t.get("winner").and_then(|v| v.as_bool()) == Some(true));
+    let winning_outcome = win_token
+        .and_then(|t| t.get("outcome").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    let we_won = ours
+        .and_then(|t| t.get("winner").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let _ = held_outcome;
+    if we_won {
+        return MarketResolution {
+            kind: MarketResolutionKind::Win,
+            payout_per_share: Decimal::ONE,
+            winning_outcome,
+        };
+    }
+    MarketResolution {
+        kind: MarketResolutionKind::Loss,
+        payout_per_share: Decimal::ZERO,
+        winning_outcome,
+    }
 }
 
 pub fn parse_market_fee(market: &Value) -> Option<crate::engine::FeeSchedule> {
     let enabled = market.get("feesEnabled").and_then(|v| v.as_bool());
+    if enabled == Some(false) {
+        return Some(crate::engine::FeeSchedule {
+            fees_enabled: false,
+            rate: Decimal::ZERO,
+            exponent: 1,
+            taker_only: true,
+            rebate_rate: None,
+            source: "gamma.feesDisabled".into(),
+        });
+    }
     let schedule = market.get("feeSchedule")?;
     let rate = schedule.get("rate").and_then(json_decimal)?;
     let exponent = schedule
@@ -406,5 +644,14 @@ mod tests {
         assert_eq!(parsed.rate, Decimal::new(7, 2));
         assert!(parsed.taker_only);
         assert!(parse_market_fee(&json!({"feesEnabled": true})).is_none());
+    }
+
+    #[test]
+    fn fees_disabled_is_known_zero_schedule() {
+        let market = json!({"feesEnabled": false, "feeSchedule": null});
+        let parsed = parse_market_fee(&market).unwrap();
+        assert!(!parsed.fees_enabled);
+        assert_eq!(parsed.rate, Decimal::ZERO);
+        assert_eq!(parsed.source, "gamma.feesDisabled");
     }
 }

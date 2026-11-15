@@ -92,8 +92,12 @@ fn trade_from_value(row: &Value, origin: &str) -> Option<RawTrade> {
             event_ts.timestamp_millis()
         )
     };
-    let fragment_key = format!("{dedup}|{origin}|{price}|{size}");
-    let notional = (price * size).round_dp(8);
+    // Origin omitted so data_api + rtds duplicates share one fragment (no double-counted size).
+    let fragment_key = format!("{dedup}|{price}|{size}");
+    let usdc = first_decimal(row, &["usdc_size", "usdcSize"]);
+    let notional = usdc
+        .filter(|u| *u > Decimal::ZERO)
+        .unwrap_or_else(|| (price * size).round_dp(8));
     Some(RawTrade {
         dedup_key: dedup,
         fragment_key,
@@ -111,11 +115,110 @@ fn trade_from_value(row: &Value, origin: &str) -> Option<RawTrade> {
             .map(|t| t.to_ascii_lowercase())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "trade".to_string()),
-        usdc_size: first_decimal(row, &["usdc_size", "usdcSize"]),
+        usdc_size: usdc,
         side: side.to_string(),
         price,
         size_shares: size,
         notional_usd: notional,
+        event_ts,
+        origin: origin.to_string(),
+        raw: row.clone(),
+    })
+}
+
+/// REDEEM / resolution rows from `/v2/activity` (not merged into trade fills).
+#[derive(Clone, Debug)]
+pub struct RawCashflow {
+    pub dedup_key: String,
+    pub event_type: String,
+    pub resolution_class: String,
+    pub source_wallet: String,
+    pub tx_hash: Option<String>,
+    pub condition_id: Option<String>,
+    pub token_id: String,
+    pub size_shares: Decimal,
+    /// `None` when payout is unknown (do not simulate a credit).
+    pub payout_usd: Option<Decimal>,
+    pub event_ts: DateTime<Utc>,
+    pub origin: String,
+    pub raw: Value,
+}
+
+pub fn parse_activity_cashflows(payload: &Value, origin: &str) -> Vec<RawCashflow> {
+    let rows = match payload {
+        Value::Array(items) => items.clone(),
+        Value::Object(map) => map
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    rows.iter()
+        .filter_map(|row| cashflow_from_value(row, origin))
+        .collect()
+}
+
+fn cashflow_from_value(row: &Value, origin: &str) -> Option<RawCashflow> {
+    let kind = first_str(row, &["type", "activity_type", "event_type"]).unwrap_or_default();
+    if kind.to_ascii_lowercase() != "redeem" {
+        return None;
+    }
+    let wallet = first_str(
+        row,
+        &["proxy_wallet", "proxyWallet", "user", "maker", "wallet"],
+    )?;
+    let token_id = first_str(
+        row,
+        &["token_id", "tokenId", "asset", "asset_id", "assetId"],
+    )?;
+    let size = first_decimal(row, &["size", "shares", "size_shares"])?;
+    if size <= Decimal::ZERO {
+        return None;
+    }
+    let event_ts = first_timestamp(row, &["timestamp", "match_time", "matchTime", "created_at"])?;
+    let tx = first_str(
+        row,
+        &["transaction_hash", "transactionHash", "tx_hash", "txHash"],
+    )
+    .filter(|s| !s.is_empty());
+    let payout_field = row
+        .get("usdc_size")
+        .or_else(|| row.get("usdcSize"));
+    let payout_usd = payout_field.and_then(value_decimal);
+    let resolution_class = if payout_field.is_none() {
+        "unresolved".to_string()
+    } else if payout_usd.unwrap_or(Decimal::ZERO) > Decimal::ZERO {
+        "winning".to_string()
+    } else {
+        "losing".to_string()
+    };
+    let payout_key = payout_usd
+        .map(|p| p.normalize().to_string())
+        .unwrap_or_else(|| "na".to_string());
+    let wallet_n = normalize_address(&wallet);
+    let dedup = if let Some(tx) = &tx {
+        format!(
+            "redeem|{tx}|{wallet_n}|{token_id}|{}|{payout_key}",
+            size.normalize()
+        )
+    } else {
+        format!(
+            "redeem|notx|{wallet_n}|{token_id}|{}|{payout_key}|{}",
+            size.normalize(),
+            event_ts.timestamp_millis()
+        )
+    };
+    Some(RawCashflow {
+        dedup_key: dedup,
+        event_type: "redeem".to_string(),
+        resolution_class,
+        source_wallet: wallet_n,
+        tx_hash: tx,
+        condition_id: first_str(row, &["condition_id", "conditionId"]),
+        token_id,
+        size_shares: size,
+        payout_usd,
         event_ts,
         origin: origin.to_string(),
         raw: row.clone(),
@@ -267,7 +370,7 @@ mod tests {
         let trades = parse_activity_payload(&payload, "data_api");
         assert_eq!(trades.len(), 2);
         assert_eq!(trades[0].dedup_key, trades[1].dedup_key);
-        assert_ne!(trades[0].fragment_key, trades[1].fragment_key);
+        assert_ne!(trades[0].size_shares, trades[1].size_shares);
         assert_eq!(trades[0].side, "buy");
     }
 
@@ -300,7 +403,7 @@ mod tests {
             .contains("0x1bd772b6550efe975d53f9c85d1c56644833aa0debbb52ebbc08ab3e77163b13"));
         let again = parse_activity_payload(&payload, "rtds");
         assert_eq!(trades[0].dedup_key, again[0].dedup_key);
-        assert_ne!(trades[0].fragment_key, again[0].fragment_key);
+        assert_eq!(trades[0].fragment_key, again[0].fragment_key);
     }
 
     #[test]
@@ -329,6 +432,7 @@ mod tests {
             Some("https://polymarket-upload.s3.us-east-2.amazonaws.com/test.png")
         );
         assert_eq!(trades[0].usdc_size.unwrap().normalize().to_string(), "10");
+        assert_eq!(trades[0].notional_usd.normalize().to_string(), "10");
         assert!(trades[0].event_title.is_none());
     }
 

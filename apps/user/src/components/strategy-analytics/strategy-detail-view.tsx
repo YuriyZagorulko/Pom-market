@@ -1,13 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useState } from "react";
+import { useRouter } from "next/navigation";
+import { FormEvent, useEffect, useState } from "react";
 import { NumericInput } from "@/components/numeric-input";
 import { useResource } from "@/components/desk";
 import { SimpleFieldLabel } from "@/components/simple-field-label";
 import { useToast } from "@/components/toast";
 import { CopyDecisionActivityCard, type CopyDecisionActivityRow } from "@/components/copy-decision-activity-card";
-import { proportionToPercent } from "@/lib/copy-sizing";
+import { StrategyActivityPanel } from "@/components/strategy-activity-panel";
+import { formatNumericInputDisplay } from "@pom/format";
 import { pnlClass, pct, usd } from "@/lib/strategy-analytics-format";
 import { useSession } from "@/lib/session";
 import type { CapitalFundingStatus } from "@/lib/strategy-capital-status";
@@ -16,13 +18,31 @@ import {
   type CapitalSyncOutcome,
 } from "@/lib/strategy-capital-sync";
 import { EquityChart, type EquityPoint } from "./equity-chart";
+import { StrategyPerformancePanel } from "./strategy-performance-panel";
 import { StrategyCapitalOverview, StrategyStatusBadges } from "./strategy-overview-status";
+import { StrategyDangerZone } from "@/components/strategy-danger-zone";
+import { StrategyTradingModePanel } from "@/components/strategy-trading-mode-panel";
+import {
+  DeleteStrategyModal,
+  type DeleteStrategyPreview,
+} from "@/components/delete-strategy-modal";
+import {
+  DELETE_STRATEGY_TIMEOUT_MS,
+  requestWithTimeout,
+} from "@/lib/request-with-timeout";
 import {
   isLegacySizingMode,
   settingsSizingSelectOptions,
   SIZING_MODE_OPTIONS,
   sizingModeLabel,
 } from "@/lib/sizing-mode";
+import {
+  formatSmallBuyThresholdFromApi,
+  showSmallBuyOverrideSettings,
+  SMALL_BUY_OVERRIDE_DESCRIPTION,
+  smallBuyFieldsForPatch,
+  validateSmallBuyBeforeSave,
+} from "@/lib/strategy-settings-small-buy";
 
 type Tab = "overview" | "positions" | "activity" | "performance" | "settings";
 
@@ -70,14 +90,47 @@ type PositionRow = {
 
 type ActivityRow = CopyDecisionActivityRow;
 
+function isEvmWalletAddress(value: string): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test(value);
+}
+
 export function StrategyDetailView({ id }: { id: string }) {
   const [tab, setTab] = useState<Tab>("overview");
   const [period, setPeriod] = useState("1M");
   const [posFilter, setPosFilter] = useState<"open" | "closed" | "all">("open");
-  const [expanded, setExpanded] = useState<string | null>(null);
   const [fundingCapital, setFundingCapital] = useState(false);
+  const [walletResolve, setWalletResolve] = useState<"idle" | "pending" | "not_found">("idle");
   const { client } = useSession();
   const toast = useToast();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (!isEvmWalletAddress(id)) {
+      setWalletResolve("idle");
+      return;
+    }
+    let cancelled = false;
+    setWalletResolve("pending");
+    client
+      .request<Array<Record<string, unknown>>>("/api/v1/strategies")
+      .then((rows) => {
+        if (cancelled) return;
+        const match = rows.find(
+          (r) => String(r.wallet_address).toLowerCase() === id.toLowerCase(),
+        );
+        if (match?.id) {
+          router.replace(`/strategies/${String(match.id)}`);
+        } else {
+          setWalletResolve("not_found");
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setWalletResolve("not_found");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, client, router]);
 
   function refreshCapitalViews() {
     overview.reload();
@@ -102,14 +155,6 @@ export function StrategyDetailView({ id }: { id: string }) {
   const positions = useResource<{ items: PositionRow[]; total: number }>(
     `/api/v1/strategies/${id}/analytics/positions?status=${posFilter}&limit=50`,
     { enabled: tab === "positions" },
-  );
-  const activity = useResource<{ items: ActivityRow[] }>(
-    `/api/v1/strategies/${id}/analytics/activity?limit=50`,
-    { enabled: tab === "activity" },
-  );
-  const performance = useResource<Record<string, string | number | null>>(
-    `/api/v1/strategies/${id}/analytics/performance`,
-    { enabled: tab === "performance" },
   );
 
   async function fundFromAccount() {
@@ -241,6 +286,7 @@ export function StrategyDetailView({ id }: { id: string }) {
               </div>
               <EquityChart
                 points={equity.data?.points ?? []}
+                period={period}
                 loading={!equity.data && !equity.error}
                 error={equity.error}
                 emptyNote={equity.data?.empty_note}
@@ -271,30 +317,52 @@ export function StrategyDetailView({ id }: { id: string }) {
         </>
       )}
 
-      {tab === "activity" && (
-        <ActivityTable
-          rows={activity.data?.items ?? []}
-          loading={!activity.data && !activity.error}
-          error={activity.error}
-          expanded={expanded}
-          onToggle={(id) => setExpanded((cur) => (cur === id ? null : id))}
-        />
-      )}
+      {tab === "activity" && <StrategyActivityPanel strategyId={id} />}
 
-      {tab === "performance" && (
-        <PerformancePanel data={performance.data ?? undefined} error={performance.error} loading={!performance.data && !performance.error} />
-      )}
+      {tab === "performance" && <StrategyPerformancePanel strategyId={id} />}
 
       {tab === "settings" && (
-        <StrategySettingsForm
-          id={id}
-          data={meta.data}
-          onSaved={() => {
-            meta.reload();
-            overview.reload();
-            readiness.reload();
-          }}
-        />
+        <div style={{ display: "grid", gap: 24 }}>
+          <StrategyDangerZone
+            strategyId={id}
+            client={client}
+            onChange={() => {
+              meta.reload();
+              overview.reload();
+              readiness.reload();
+            }}
+          />
+          {isEvmWalletAddress(id) && walletResolve === "pending" && (
+            <p className="muted panel" style={{ margin: 0 }}>
+              Resolving strategy for source wallet <code>{id}</code>…
+            </p>
+          )}
+          {isEvmWalletAddress(id) && walletResolve === "not_found" && (
+            <p className="warn panel" style={{ margin: 0 }}>
+              No strategy found for source wallet <code>{id}</code>. Open <Link href="/strategies">Strategies</Link>{" "}
+              and use the account link (strategy UUID), not the trader wallet address.
+            </p>
+          )}
+          {meta.error && (
+            <p className="warn panel" style={{ margin: 0 }}>
+              Could not load strategy settings: {meta.error}
+            </p>
+          )}
+          {meta.loading && !meta.data && <p className="muted panel">Loading strategy settings…</p>}
+          {meta.data && (
+            <StrategySettingsForm
+              key={`${id}|${enabled}|${String(meta.data.sizing_mode)}|${String(meta.data.copy_small_buys_1to1)}|${String(meta.data.small_buy_threshold_usd ?? "")}`}
+              id={id}
+              data={meta.data}
+              strategyEnabled={enabled}
+              onSaved={() => {
+                meta.reload();
+                overview.reload();
+                readiness.reload();
+              }}
+            />
+          )}
+        </div>
       )}
     </section>
   );
@@ -412,114 +480,92 @@ function PositionsTable({ rows, loading, error }: { rows: PositionRow[]; loading
   );
 }
 
-function ActivityTable({
-  rows,
-  loading,
-  error,
-  expanded,
-  onToggle,
-}: {
-  rows: ActivityRow[];
-  loading?: boolean;
-  error?: string;
-  expanded: string | null;
-  onToggle: (id: string) => void;
-}) {
-  if (loading) return <p className="muted">Loading activity…</p>;
-  if (error) return <p className="error">{error}</p>;
-  if (!rows.length) return <p className="muted">No copy decisions yet.</p>;
-  return (
-    <ul className="activity-feed">
-      {rows.map((r) => (
-        <CopyDecisionActivityCard
-          key={r.decision_id}
-          row={r}
-          open={expanded === r.decision_id}
-          onToggle={() => onToggle(r.decision_id)}
-        />
-      ))}
-    </ul>
-  );
-}
-
-function PerformancePanel({
-  data,
-  loading,
-  error,
-}: {
-  data?: Record<string, string | number | null>;
-  loading?: boolean;
-  error?: string;
-}) {
-  if (loading) return <p className="muted">Loading performance…</p>;
-  if (error) return <p className="error">{error}</p>;
-  if (!data) return null;
-  return (
-    <div className="panel metric-grid">
-      <MetricCard label="Total return" value={usd(String(data.total_return_usd ?? 0))} />
-      <MetricCard label="ROI" value={data.roi_percent != null ? pct(String(data.roi_percent)) : "—"} />
-      <MetricCard label="Win rate" value={data.win_rate_percent != null ? pct(String(data.win_rate_percent)) : "—"} />
-      <MetricCard label="Profit factor" value={data.profit_factor != null ? String(data.profit_factor) : "—"} />
-      <MetricCard label="Max drawdown" value={data.max_drawdown_percent != null ? pct(String(data.max_drawdown_percent)) : "—"} />
-      <MetricCard label="Fees" value={usd(String(data.fees_usd ?? 0))} />
-      <MetricCard
-        label="Avg slippage (CLOB fills)"
-        value={data.slippage_bps_avg_clob != null ? `${data.slippage_bps_avg_clob} bps` : "—"}
-      />
-      <MetricCard
-        label="Avg slippage (synthetic)"
-        value={data.slippage_bps_avg_synthetic != null ? `${data.slippage_bps_avg_synthetic} bps` : "—"}
-      />
-      <MetricCard label="CLOB fills (P&L scope)" value={String(data.clob_fill_count ?? 0)} />
-      <MetricCard label="Paper-only fills" value={String(data.synthetic_fill_count ?? 0)} />
-      <MetricCard label="Legacy unlabeled" value={String(data.legacy_unlabeled_fill_count ?? 0)} />
-      <p className="muted" style={{ gridColumn: "1 / -1", margin: 0, fontSize: 13 }}>
-        ROI, fees, and slippage averages above use CLOB fills only (
-        {String(data.performance_fill_scope ?? "clob_fills_only")}). Open positions may still
-        include lots from legacy unlabeled fills created before execution labeling.
-      </p>
-      {data.sample_size_note && (
-        <p className="warn" style={{ gridColumn: "1 / -1", margin: 0 }}>
-          {String(data.sample_size_note)}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function StrategySettingsForm({
+export function StrategySettingsForm({
   id,
   data,
+  strategyEnabled,
   onSaved,
 }: {
   id: string;
   data: Record<string, unknown>;
+  strategyEnabled: boolean;
   onSaved: () => void;
 }) {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
   const { client } = useSession();
   const toast = useToast();
+  const router = useRouter();
   const [formKey, setFormKey] = useState(0);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | undefined>();
+  const [deletePreview, setDeletePreview] = useState<DeleteStrategyPreview | undefined>();
+  const [deletePreviewLoading, setDeletePreviewLoading] = useState(false);
+
+  useEffect(() => {
+    if (!deleteOpen) {
+      setDeletePreview(undefined);
+      setDeletePreviewLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setDeletePreviewLoading(true);
+    setDeleteError(undefined);
+    void client
+      .request<DeleteStrategyPreview>(`/api/v1/strategies/${id}/delete-preview`)
+      .then((preview) => {
+        if (!cancelled) setDeletePreview(preview);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setDeleteError(e instanceof Error ? e.message : "Could not check delete eligibility");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDeletePreviewLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, deleteOpen, id, strategyEnabled]);
   const initialMode = String(data.sizing_mode ?? "position_value_ratio");
   const [sizingMode, setSizingMode] = useState(initialMode);
-  const proportion = Number(data.proportion ?? 0);
-  const legacyMultiplier = initialMode === "multiplier" ? Number(data.multiplier ?? 0) : 0;
-  const copyPercent =
-    sizingMode === "proportional"
-      ? initialMode === "multiplier" && legacyMultiplier > 0
-        ? String(Math.round(legacyMultiplier * 10000) / 100)
-        : proportionToPercent(proportion)
-      : "";
+  const [copySmallBuys1to1, setCopySmallBuys1to1] = useState(Boolean(data.copy_small_buys_1to1));
+  const [smallBuyThresholdUsd, setSmallBuyThresholdUsd] = useState(() =>
+    formatSmallBuyThresholdFromApi(data.small_buy_threshold_usd),
+  );
+
+  useEffect(() => {
+    setSizingMode(String(data.sizing_mode ?? "position_value_ratio"));
+  }, [data.sizing_mode]);
+
+  const equalCopyTradeMultiplierDefault = (() => {
+    const prop = data.proportion != null && String(data.proportion) !== "" ? String(data.proportion) : "";
+    if (prop) return formatNumericInputDisplay(prop);
+    if (initialMode === "multiplier" && data.multiplier != null) {
+      return formatNumericInputDisplay(String(data.multiplier));
+    }
+    return "1";
+  })();
   const allowedDefault =
     Array.isArray(data.allowed_markets) ? JSON.stringify(data.allowed_markets, null, 2) : "[]";
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const smallBuyErr = validateSmallBuyBeforeSave(sizingMode, copySmallBuys1to1, smallBuyThresholdUsd);
+    if (smallBuyErr) {
+      toast.error(smallBuyErr);
+      return;
+    }
     const form = Object.fromEntries(new FormData(event.currentTarget).entries());
     const body: Record<string, unknown> = {
       ...form,
       copy_buy: form.copy_buy === "on",
       copy_sell: form.copy_sell === "on",
       allow_subminimum_paper_trades: form.allow_subminimum_paper_trades === "on",
+      ...smallBuyFieldsForPatch(sizingMode, copySmallBuys1to1, smallBuyThresholdUsd),
     };
     delete body.enabled;
     if (body.allocation_mode !== "percent_of_account") {
@@ -553,23 +599,67 @@ function StrategySettingsForm({
     }
   }
 
-  async function remove() {
-    if (!confirm("Delete this strategy?")) return;
+  async function confirmDelete() {
+    if (strategyEnabled) {
+      setDeleteError(
+        "Disable the strategy using the toggle in the page header before deleting.",
+      );
+      return;
+    }
+    if (deletePreview && !deletePreview.can_delete) {
+      setDeleteError(deletePreview.blockers.join("\n"));
+      return;
+    }
+    setDeleteBusy(true);
+    setDeleteError(undefined);
     try {
-      await client.request(`/api/v1/strategies/${id}`, { method: "DELETE" });
+      await requestWithTimeout(
+        client,
+        `/api/v1/strategies/${id}`,
+        { method: "DELETE" },
+        DELETE_STRATEGY_TIMEOUT_MS,
+        `Delete is taking longer than ${Math.round(DELETE_STRATEGY_TIMEOUT_MS / 1000)}s. The strategy may still be deleting — refresh the strategies list before retrying.`,
+      );
       toast.info("Strategy deleted");
-      location.href = "/strategies";
+      setDeleteOpen(false);
+      router.push("/strategies");
+      router.refresh();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Delete failed");
+      setDeleteError(e instanceof Error ? e.message : "Delete failed");
+    } finally {
+      setDeleteBusy(false);
     }
   }
 
+  const strategyLabel = String(data.display_name ?? data.alias ?? id).trim() || id;
+
   return (
-    <form key={formKey} className="panel form-stack" onSubmit={save}>
+    <>
+    <DeleteStrategyModal
+      open={deleteOpen}
+      strategyName={strategyLabel}
+      busy={deleteBusy}
+      preview={deletePreview}
+      previewLoading={deletePreviewLoading}
+      error={deleteError}
+      onConfirm={() => void confirmDelete()}
+      onCancel={() => {
+        setDeleteOpen(false);
+        setDeleteError(undefined);
+      }}
+    />
+    <form key={formKey} className="panel form-stack settings-form" onSubmit={save}>
       <h2 style={{ margin: 0 }}>Settings</h2>
       <p className="muted" style={{ margin: 0, fontSize: 13 }}>
         Enable / disable is controlled from the header. Changes here apply to new decisions only.
       </p>
+      <StrategyTradingModePanel
+        strategyId={id}
+        strategyEnabled={strategyEnabled}
+        operatingMode={String(data.operating_mode ?? "paper_trading")}
+        liveTradingAvailable={Boolean(data.live_trading_available)}
+        onChanged={onSaved}
+      />
       <fieldset style={{ border: 0, padding: 0, margin: 0, display: "grid", gap: 12 }}>
         <legend className="muted" style={{ fontSize: 12 }}>
           Identity
@@ -647,16 +737,63 @@ function StrategySettingsForm({
         )}
         {sizingMode === "proportional" && (
           <div className="form-field">
-            <SimpleFieldLabel htmlFor="copy_percent">Copy % of source trade notional</SimpleFieldLabel>
-            <NumericInput id="copy_percent" name="copy_percent" defaultValue={copyPercent || ""} />
+            <SimpleFieldLabel htmlFor="proportion">Trade multiplier</SimpleFieldLabel>
+            <NumericInput
+              id="proportion"
+              name="proportion"
+              data-testid="equal-copy-trade-multiplier"
+              defaultValue={equalCopyTradeMultiplierDefault}
+            />
+            <p className="muted" style={{ margin: "4px 0 0", fontSize: 12 }}>
+              1 = 100%, 0.5 = 50%, 0.25 = 25%, 2 = 200% of the leader&apos;s trade size (BUY and SELL).
+            </p>
+          </div>
+        )}
+        {showSmallBuyOverrideSettings(sizingMode) && (
+          <div className="form-field" style={{ display: "grid", gap: 8 }}>
+            <label style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+              <input
+                type="checkbox"
+                data-testid="copy-small-buys-1to1"
+                aria-label="Enable Small BUY Override"
+                checked={copySmallBuys1to1}
+                onChange={(e) => setCopySmallBuys1to1(e.target.checked)}
+              />
+              <span>
+                Enable Small BUY Override
+                <span className="muted" style={{ display: "block", fontSize: 12, marginTop: 4 }}>
+                  {SMALL_BUY_OVERRIDE_DESCRIPTION}
+                </span>
+              </span>
+            </label>
+            {copySmallBuys1to1 && (
+              <div>
+                <SimpleFieldLabel htmlFor="small_buy_threshold_usd">Small BUY threshold (USD)</SimpleFieldLabel>
+                <input
+                  id="small_buy_threshold_usd"
+                  data-testid="small-buy-threshold-usd"
+                  inputMode="decimal"
+                  autoComplete="off"
+                  value={smallBuyThresholdUsd}
+                  onChange={(e) => setSmallBuyThresholdUsd(e.target.value)}
+                  placeholder="5.00"
+                />
+                {sizingMode === "position_value_ratio" && (
+                  <p className="muted" style={{ margin: "4px 0 0", fontSize: 12 }}>
+                    Example: threshold $5, multiplier 0.5, leader BUY $4 → target $2.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         )}
         {sizingMode === "position_value_ratio" && (
           <div className="form-field">
-            <SimpleFieldLabel htmlFor="multiplier">Множитель сделки (PVR)</SimpleFieldLabel>
+            <SimpleFieldLabel htmlFor="multiplier">Trade multiplier</SimpleFieldLabel>
             <NumericInput
               id="multiplier"
               name="multiplier"
+              data-testid="pvr-trade-multiplier"
               defaultValue={
                 data.multiplier != null && String(data.multiplier) !== ""
                   ? String(data.multiplier)
@@ -664,8 +801,7 @@ function StrategySettingsForm({
               }
             />
             <p className="muted" style={{ margin: "4px 0 0", fontSize: 12 }}>
-              После PVR: ×0.5 уменьшает копию, ×2 / ×10 увеличивают. `1` — без изменения. Дальше действуют min order, max
-              order и exposure.
+              1 = 100%, 0.5 = 50%, 0.25 = 25%, 2 = 200% of the leader&apos;s trade size. Applied after the PVR ratio.
             </p>
           </div>
         )}
@@ -733,10 +869,19 @@ function StrategySettingsForm({
         <button type="button" className="ghost" onClick={() => setFormKey((k) => k + 1)}>
           Cancel
         </button>
-        <button type="button" className="ghost" onClick={() => void remove()}>
-          Delete
+        <button
+          type="button"
+          className="modal-confirm-destructive"
+          style={{ marginLeft: "auto" }}
+          onClick={() => {
+            setDeleteError(undefined);
+            setDeleteOpen(true);
+          }}
+        >
+          Delete strategy…
         </button>
       </div>
     </form>
+    </>
   );
 }

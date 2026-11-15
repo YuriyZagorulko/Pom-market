@@ -156,12 +156,109 @@ impl Config {
     pub fn cors_origins(&self) -> Vec<String> {
         let extra = env::var("CORS_ORIGINS").unwrap_or_default();
         let mut origins = vec![self.admin_origin.clone(), self.user_origin.clone()];
+        if let Ok(api) = env::var("PUBLIC_API_ORIGIN") {
+            let api = api.trim();
+            if !api.is_empty() && !origins.iter().any(|o| o == api) {
+                origins.push(api.to_string());
+            }
+        }
         for part in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if !origins.iter().any(|o| o == part) {
                 origins.push(part.to_string());
             }
         }
         origins
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::Config;
+
+    fn cors_fixture(admin: &str, user: &str) -> Config {
+        Config {
+            env: "test".into(),
+            api_bind: "127.0.0.1:4321".into(),
+            migration_database_url: String::new(),
+            app_database_url: String::new(),
+            worker_database_url: String::new(),
+            admin_origin: admin.into(),
+            user_origin: user.into(),
+            jwt_secret: String::new(),
+            encryption_master_key: String::new(),
+            encryption_key_id: "k1".into(),
+            previous_encryption_key: None,
+            previous_encryption_key_id: None,
+            access_ttl_seconds: 900,
+            refresh_ttl_seconds: 1209600,
+            invite_ttl_hours: 72,
+            password_reset_ttl_minutes: 30,
+            bootstrap_admin_email: None,
+            bootstrap_admin_password: None,
+            bootstrap_admin_name: "Administrator".into(),
+            clob_host: String::new(),
+            data_api_host: String::new(),
+            gamma_host: String::new(),
+            rtds_url: String::new(),
+            polygon_rpc_url: None,
+            polygon_logs_enabled: false,
+            chain_id: 137,
+            ctf_exchange: String::new(),
+            neg_risk_exchange: String::new(),
+            worker_poll_seconds: 8,
+            reconciliation_seconds: 30,
+            confirm_live_trading: false,
+            fee_rate: rust_decimal::Decimal::ZERO,
+            fee_exponent: 2,
+            log_format: "text".into(),
+            brevo_api_key: None,
+            brevo_api_base: None,
+            brevo_sender_email: String::new(),
+            brevo_sender_name: String::new(),
+            app_base_url: user.into(),
+            trusted_proxies: String::new(),
+            trusted_proxies_parsed: crate::client_ip::TrustedProxies::from_parsed(
+                crate::client_ip::TrustedProxies::parse_config(""),
+            ),
+            source_equity_max_age_seconds: 3600,
+            source_equity_min_usd: rust_decimal::Decimal::ZERO,
+            paper_allow_synthetic_fills: false,
+        }
+    }
+
+    #[test]
+    fn production_cors_includes_public_api_origin() {
+        let prev = std::env::var("PUBLIC_API_ORIGIN").ok();
+        let prev_cors = std::env::var("CORS_ORIGINS").ok();
+        std::env::set_var(
+            "PUBLIC_API_ORIGIN",
+            "https://pommarket-api.pomvix.com",
+        );
+        std::env::remove_var("CORS_ORIGINS");
+
+        let cfg = cors_fixture(
+            "https://pommarket-admin.pomvix.com",
+            "https://pommarket.pomvix.com",
+        );
+        let origins = cfg.cors_origins();
+        assert!(origins
+            .iter()
+            .any(|o| o == "https://pommarket.pomvix.com"));
+        assert!(origins
+            .iter()
+            .any(|o| o == "https://pommarket-admin.pomvix.com"));
+        assert!(origins
+            .iter()
+            .any(|o| o == "https://pommarket-api.pomvix.com"));
+
+        match prev {
+            Some(v) => std::env::set_var("PUBLIC_API_ORIGIN", v),
+            None => std::env::remove_var("PUBLIC_API_ORIGIN"),
+        }
+        match prev_cors {
+            Some(v) => std::env::set_var("CORS_ORIGINS", v),
+            None => std::env::remove_var("CORS_ORIGINS"),
+        }
     }
 }
 

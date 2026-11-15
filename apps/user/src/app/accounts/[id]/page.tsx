@@ -18,6 +18,7 @@ import {
 import type { SignatureTypeValue } from "@/lib/polymarket-account-hints";
 import { NumericInput } from "@/components/numeric-input";
 import { useSession } from "@/lib/session";
+import { formatTradingModeApiError } from "@/lib/strategy-operating-mode";
 
 export default function AccountPage() {
   const params = useParams<{ id: string }>();
@@ -64,7 +65,8 @@ function Detail({ id }: { id: string }) {
       toast.success("Operating mode updated");
       reload();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not update mode");
+      const raw = err instanceof Error ? err.message : "Could not update mode";
+      toast.error(formatTradingModeApiError(raw));
     }
   }
 
@@ -224,6 +226,12 @@ function Detail({ id }: { id: string }) {
 
       <form className="panel form-stack" onSubmit={mode}>
         <h2 style={{ margin: 0 }}>Operating mode</h2>
+        {!data.credentials_stored ? (
+          <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+            Paper and monitoring work without a private key. Live trading requires credentials — add them in the
+            Polymarket credentials section above.
+          </p>
+        ) : null}
         <div className="form-field">
           <SimpleFieldLabel htmlFor="operating-mode">Mode</SimpleFieldLabel>
           <select id="operating-mode" name="mode" defaultValue={String(account.operating_mode)}>
@@ -251,7 +259,8 @@ function Detail({ id }: { id: string }) {
       <form className="panel form-stack" onSubmit={risk}>
         <h2 style={{ margin: 0 }}>Account risk</h2>
         <p className="muted" style={{ margin: 0 }}>
-          Limits patch here; paper cash changes apply as a funding delta (ledger), not a direct balance override.
+          Limits patch here. Total paper funding uses a ledger delta on save (not trading). Strategy buy/sell does
+          not change this field — use strategy analytics for available, reserved, and equity.
         </p>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="max_order_usd">Max order (USD)</SimpleFieldLabel>
@@ -266,7 +275,7 @@ function Detail({ id }: { id: string }) {
           <NumericInput id="max_slippage_bps" name="max_slippage_bps" defaultValue={riskDefaults.max_slippage_bps} inputMode="numeric" />
         </div>
         <div className="form-field">
-          <SimpleFieldLabel htmlFor="paper_cash_usd">Paper cash balance (USD)</SimpleFieldLabel>
+          <SimpleFieldLabel htmlFor="paper_cash_usd">Total paper funding (USD)</SimpleFieldLabel>
           <NumericInput id="paper_cash_usd" name="paper_cash_usd" defaultValue={riskDefaults.paper_cash_usd} />
         </div>
         <button type="submit">Save risk</button>

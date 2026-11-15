@@ -32,7 +32,7 @@ describe("source-trade-format", () => {
   it("formats shares and USDC without inventing zeros", () => {
     expect(formatShares(7)).toBe("7");
     expect(formatShares(null)).toBeNull();
-    expect(formatUsdc("12.5")).toBe("$12.50");
+    expect(formatUsdc("12.5")).toBe("$12.5");
     expect(formatUsdc(undefined)).toBeNull();
   });
 
@@ -61,7 +61,7 @@ describe("source-trade-format", () => {
         notional_usd: 5,
         event_ts: "",
       }),
-    ).toBe("$5.00");
+    ).toBe("$5");
   });
 
   it("labels activity types", () => {

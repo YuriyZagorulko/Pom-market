@@ -33,6 +33,9 @@ pub struct SizingInput {
     pub source_open_positions_value_usd: Option<Decimal>,
     /// PAPER strategy opt-in: skip Polymarket exchange $1 floor in sizing caps (LIVE always strict).
     pub allow_subminimum_paper_trades: bool,
+    /// PVR-only: small BUY override when source notional is strictly below threshold.
+    pub copy_small_buys_1to1: bool,
+    pub small_buy_threshold_usd: Option<Decimal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,8 +167,38 @@ pub fn decision_reason_explain(code: &str) -> Option<(&'static str, &'static str
             "No position to sell",
             "The strategy has no open shares matching this exit.",
         ),
+        "fee_unknown" => (
+            "Unable to determine market trading fee",
+            "Polymarket fee parameters could not be loaded for this market. Copy was skipped until fee status is known (we do not assume zero fee).",
+        ),
         _ => return None,
     })
+}
+
+fn small_buy_1to1_applies(input: &SizingInput) -> bool {
+    input.mode == SizingMode::PositionValueRatio
+        && input.copy_small_buys_1to1
+        && input
+            .small_buy_threshold_usd
+            .filter(|t| *t > Decimal::ZERO)
+            .is_some_and(|t| input.source_notional < t)
+}
+
+fn position_value_ratio_raw(input: &SizingInput) -> Result<Decimal, RejectReason> {
+    let positions = input
+        .source_open_positions_value_usd
+        .filter(|v| *v > Decimal::ZERO)
+        .ok_or(RejectReason::SourcePositionValueUnavailable)?;
+    let alloc = input
+        .strategy_allocated_capital_usd
+        .filter(|v| *v > Decimal::ZERO)
+        .ok_or(RejectReason::MissingSizing)?;
+    let base = input.source_notional * alloc / positions;
+    let coeff = input
+        .multiplier
+        .filter(|m| *m > Decimal::ZERO)
+        .unwrap_or(Decimal::ONE);
+    Ok((base * coeff).round_dp(8))
 }
 
 pub fn target_notional(input: &SizingInput) -> Result<Decimal, RejectReason> {
@@ -192,23 +225,18 @@ pub fn target_notional(input: &SizingInput) -> Result<Decimal, RejectReason> {
             (input.source_notional * alloc / equity).round_dp(8)
         }
         SizingMode::PositionValueRatio => {
-            let positions = input
-                .source_open_positions_value_usd
-                .filter(|v| *v > Decimal::ZERO)
-                .ok_or(RejectReason::SourcePositionValueUnavailable)?;
-            let alloc = input
-                .strategy_allocated_capital_usd
-                .filter(|v| *v > Decimal::ZERO)
-                .ok_or(RejectReason::MissingSizing)?;
             if input.source_notional <= Decimal::ZERO {
                 return Err(RejectReason::BelowMinimum);
             }
-            let base = input.source_notional * alloc / positions;
-            let coeff = input
-                .multiplier
-                .filter(|m| *m > Decimal::ZERO)
-                .unwrap_or(Decimal::ONE);
-            (base * coeff).round_dp(8)
+            if small_buy_1to1_applies(input) {
+                let coeff = input
+                    .multiplier
+                    .filter(|m| *m > Decimal::ZERO)
+                    .unwrap_or(Decimal::ONE);
+                (input.source_notional * coeff).round_dp(8)
+            } else {
+                position_value_ratio_raw(input)?
+            }
         }
     };
     if raw <= Decimal::ZERO {
@@ -1068,6 +1096,73 @@ pub fn plan_exit(
     }
 }
 
+/// Equal Copy SELL: `leader_sell_notional × trade_multiplier`, capped by max order and open shares.
+pub fn plan_equal_copy_exit(
+    open_shares: Decimal,
+    pending_exit_shares: Decimal,
+    target_notional: Decimal,
+    reference_price: Decimal,
+    min_notional: Decimal,
+    allow_subminimum_paper_trades: bool,
+) -> ExitPlan {
+    if open_shares <= Decimal::ZERO {
+        return ExitPlan {
+            shares: Decimal::ZERO,
+            pending_exit_shares,
+            reject: Some(RejectReason::NoPosition),
+        };
+    }
+    if target_notional <= Decimal::ZERO || reference_price <= Decimal::ZERO {
+        return ExitPlan {
+            shares: Decimal::ZERO,
+            pending_exit_shares,
+            reject: Some(RejectReason::BelowMinimum),
+        };
+    }
+    let floor = if allow_subminimum_paper_trades {
+        min_notional.max(Decimal::ZERO)
+    } else {
+        min_notional.max(EXCHANGE_MIN_NOTIONAL)
+    };
+    if floor > Decimal::ZERO && target_notional < floor {
+        return ExitPlan {
+            shares: Decimal::ZERO,
+            pending_exit_shares,
+            reject: Some(RejectReason::BelowMinimum),
+        };
+    }
+    let want_shares = truncate_lot(target_notional / reference_price);
+    let sellable = (open_shares - pending_exit_shares).max(Decimal::ZERO);
+    let shares = want_shares.min(sellable);
+    if shares <= Decimal::ZERO {
+        return ExitPlan {
+            shares: Decimal::ZERO,
+            pending_exit_shares,
+            reject: Some(RejectReason::BelowMinimum),
+        };
+    }
+    let notional = shares * reference_price;
+    if floor > Decimal::ZERO && notional < floor {
+        return ExitPlan {
+            shares: Decimal::ZERO,
+            pending_exit_shares,
+            reject: Some(RejectReason::BelowMinimum),
+        };
+    }
+    if shares > open_shares {
+        return ExitPlan {
+            shares: Decimal::ZERO,
+            pending_exit_shares,
+            reject: Some(RejectReason::SellLargerThanOpen),
+        };
+    }
+    ExitPlan {
+        shares,
+        pending_exit_shares: Decimal::ZERO,
+        reject: None,
+    }
+}
+
 pub fn slippage_bps(reference: Decimal, actual: Decimal) -> i32 {
     if reference <= Decimal::ZERO {
         return 0;
@@ -1149,6 +1244,12 @@ mod decision_reason_tests {
         assert!(t.contains("capital"));
         assert!(!d.is_empty());
     }
+
+    #[test]
+    fn explains_fee_unknown() {
+        let (t, _) = decision_reason_explain("fee_unknown").unwrap();
+        assert!(t.to_ascii_lowercase().contains("fee"));
+    }
 }
 
 #[cfg(test)]
@@ -1175,6 +1276,8 @@ mod tests {
             source_trader_equity_usd: None,
             source_open_positions_value_usd: None,
             allow_subminimum_paper_trades: false,
+            copy_small_buys_1to1: false,
+            small_buy_threshold_usd: None,
         };
         assert_eq!(target_notional(&input).unwrap(), d("40"));
         input.strategy_remaining_usd = d("100");
@@ -1203,6 +1306,8 @@ mod tests {
             source_trader_equity_usd: None,
             source_open_positions_value_usd: None,
             allow_subminimum_paper_trades: false,
+            copy_small_buys_1to1: false,
+            small_buy_threshold_usd: None,
         };
         assert_eq!(target_notional(&proportional).unwrap(), d("20"));
         let mult = SizingInput {
@@ -1231,6 +1336,8 @@ mod tests {
             source_trader_equity_usd: Some(d("20000")),
             source_open_positions_value_usd: None,
             allow_subminimum_paper_trades: false,
+            copy_small_buys_1to1: false,
+            small_buy_threshold_usd: None,
         };
         assert_eq!(target_notional(&input).unwrap(), d("400"));
     }
@@ -1251,8 +1358,48 @@ mod tests {
             source_trader_equity_usd: None,
             source_open_positions_value_usd: Some(d("4000")),
             allow_subminimum_paper_trades: false,
+            copy_small_buys_1to1: false,
+            small_buy_threshold_usd: None,
         };
         assert_eq!(target_notional(&input).unwrap(), d("100"));
+    }
+
+    #[test]
+    fn position_value_ratio_small_buy_1to1_before_caps() {
+        let input = SizingInput {
+            mode: SizingMode::PositionValueRatio,
+            fixed_amount_usd: None,
+            proportion: None,
+            multiplier: Some(d("10")),
+            source_notional: d("4.50"),
+            max_order_usd: d("10000"),
+            min_order_usd: d("1"),
+            strategy_remaining_usd: d("2000"),
+            available_balance_usd: d("10000"),
+            strategy_allocated_capital_usd: Some(d("2000")),
+            source_trader_equity_usd: None,
+            source_open_positions_value_usd: Some(d("4000")),
+            allow_subminimum_paper_trades: false,
+            copy_small_buys_1to1: true,
+            small_buy_threshold_usd: Some(d("5")),
+        };
+        assert_eq!(target_notional(&input).unwrap(), d("45"));
+    }
+
+    #[test]
+    fn equal_copy_exit_respects_open_shares() {
+        let plan = plan_equal_copy_exit(
+            d("100"),
+            Decimal::ZERO,
+            d("20"),
+            d("0.5"),
+            d("1"),
+            false,
+        );
+        assert!(plan.reject.is_none());
+        assert_eq!(plan.shares, d("40"));
+        let capped = plan_equal_copy_exit(d("10"), Decimal::ZERO, d("20"), d("0.5"), d("1"), false);
+        assert_eq!(capped.shares, d("10"));
     }
 
     #[test]

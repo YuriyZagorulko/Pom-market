@@ -192,6 +192,8 @@ async fn migration_0019_multiplier_and_preserves_other_modes() {
         source_trader_equity_usd: None,
         source_equity_status: None,
         source_open_positions_value_usd: None,
+        copy_small_buys_1to1: false,
+        small_buy_threshold_usd: None,
     };
     assert_eq!(
         raw_copy_notional(&params, Decimal::from(100)).unwrap(),

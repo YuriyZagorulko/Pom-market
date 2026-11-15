@@ -345,6 +345,14 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn list_query_urlencoded_pagination() {
+        let q: ListQuery = serde_urlencoded::from_str("limit=25&page=2").expect("parse");
+        assert_eq!(q.limit(), 25);
+        assert_eq!(q.offset(), 25);
+    }
+
+    #[test]
     fn cap_page_size_at_100() {
         let q = ListQuery {
             limit: Some(500),

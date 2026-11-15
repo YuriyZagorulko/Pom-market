@@ -1,7 +1,9 @@
 //! Per-strategy PAPER cash ledger and virtual capital accounts.
 //!
 //! Invariant (per strategy): `funded = available + reserved + invested` (modulo rounding).
-//! Account: `paper_cash_usd >= unallocated + SUM(available + reserved)` over strategies on account.
+//! Account: `paper_cash_usd` is total virtual funding (only `account_paper_funding` changes it).
+//! Unallocated = `paper_cash_usd - SUM(funded_capital_usd)` across strategies on the account.
+//! Trading (buy/sell/reserve/settlement) moves strategy balances only, not account `paper_cash_usd`.
 //! Manual lots (`strategy_id IS NULL`) stay on account-level cash / positions only.
 
 use rust_decimal::Decimal;
@@ -34,6 +36,117 @@ pub struct StrategyCapitalRow {
     pub invested_capital_usd: Decimal,
     pub bootstrap_quality: String,
     pub bootstrap_note: Option<String>,
+}
+
+/// Capital/strategy locking errors for user-facing API paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrategyCapitalError {
+    StrategyNotFound,
+    StrategyBusy,
+    CapitalAccountMissing,
+    Business(String),
+    Db(String),
+}
+
+impl std::fmt::Display for StrategyCapitalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.user_message())
+    }
+}
+
+impl StrategyCapitalError {
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::StrategyNotFound => "strategy not found".into(),
+            Self::StrategyBusy => {
+                "strategy is being deleted or updated; try again shortly".into()
+            }
+            Self::CapitalAccountMissing => "strategy not found".into(),
+            Self::Business(msg) => msg.clone(),
+            Self::Db(_) => "request failed".into(),
+        }
+    }
+
+    pub fn business(msg: impl Into<String>) -> Self {
+        Self::Business(msg.into())
+    }
+}
+
+impl From<sqlx::Error> for StrategyCapitalError {
+    fn from(value: sqlx::Error) -> Self {
+        Self::Db(value.to_string())
+    }
+}
+
+impl From<anyhow::Error> for StrategyCapitalError {
+    fn from(value: anyhow::Error) -> Self {
+        Self::Db(value.to_string())
+    }
+}
+
+impl From<String> for StrategyCapitalError {
+    fn from(value: String) -> Self {
+        Self::Business(value)
+    }
+}
+
+fn pg_lock_not_available(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("55P03")
+    )
+}
+
+/// Lock the owned strategy row before touching `strategy_capital_accounts`.
+pub async fn lock_owned_copy_strategy(
+    tx: &mut Tx<'_>,
+    user_id: Uuid,
+    strategy_id: Uuid,
+    nowait: bool,
+) -> Result<(), StrategyCapitalError> {
+    let sql = if nowait {
+        "SELECT id FROM copy_strategies WHERE id = $1 AND user_id = $2 FOR UPDATE NOWAIT"
+    } else {
+        "SELECT id FROM copy_strategies WHERE id = $1 AND user_id = $2 FOR UPDATE"
+    };
+    match sqlx::query_scalar::<_, Uuid>(sql)
+        .bind(strategy_id)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(StrategyCapitalError::StrategyNotFound),
+        Err(e) if pg_lock_not_available(&e) => Err(StrategyCapitalError::StrategyBusy),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn try_lock_strategy_capital(
+    tx: &mut Tx<'_>,
+    strategy_id: Uuid,
+) -> Result<Option<StrategyCapitalRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT strategy_id, trading_account_id, funded_capital_usd, available_cash_usd,
+                reserved_cash_usd, invested_capital_usd, bootstrap_quality, bootstrap_note
+         FROM strategy_capital_accounts
+         WHERE strategy_id = $1
+         FOR UPDATE",
+    )
+    .bind(strategy_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+pub async fn lock_strategy_capital_scoped(
+    tx: &mut Tx<'_>,
+    strategy_id: Uuid,
+) -> Result<StrategyCapitalRow, StrategyCapitalError> {
+    match try_lock_strategy_capital(tx, strategy_id).await {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(StrategyCapitalError::CapitalAccountMissing),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,17 +183,9 @@ pub async fn lock_strategy_capital(
     tx: &mut Tx<'_>,
     strategy_id: Uuid,
 ) -> anyhow::Result<StrategyCapitalRow> {
-    let row: StrategyCapitalRow = sqlx::query_as(
-        "SELECT strategy_id, trading_account_id, funded_capital_usd, available_cash_usd,
-                reserved_cash_usd, invested_capital_usd, bootstrap_quality, bootstrap_note
-         FROM strategy_capital_accounts
-         WHERE strategy_id = $1
-         FOR UPDATE",
-    )
-    .bind(strategy_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(row)
+    lock_strategy_capital_scoped(tx, strategy_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.user_message()))
 }
 
 pub async fn is_capital_bootstrapped(tx: &mut Tx<'_>, strategy_id: Uuid) -> anyhow::Result<bool> {
@@ -324,6 +429,9 @@ pub async fn allocate_to_strategy(
     if amount <= Decimal::ZERO {
         return Err("allocation amount must be positive".into());
     }
+    lock_owned_copy_strategy(tx, user_id, strategy_id, false)
+        .await
+        .map_err(|e| e.user_message())?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::text))")
         .bind(trading_account_id)
         .execute(&mut **tx)
@@ -411,34 +519,29 @@ pub async fn sync_strategy_funded_to_target(
     strategy_id: Uuid,
     target_funded: Decimal,
     idempotency_prefix: &str,
-) -> Result<Decimal, String> {
+) -> Result<Decimal, StrategyCapitalError> {
     if target_funded < Decimal::ZERO {
-        return Err("allocation target must be non-negative".into());
+        return Err(StrategyCapitalError::business(
+            "allocation target must be non-negative",
+        ));
     }
-    ensure_strategy_capital_row(tx, user_id, trading_account_id, strategy_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    ensure_strategy_capital_row(tx, user_id, trading_account_id, strategy_id).await?;
     let funded_before = {
-        let cap = lock_strategy_capital(tx, strategy_id)
-            .await
-            .map_err(|e| e.to_string())?;
+        let cap = lock_strategy_capital_scoped(tx, strategy_id).await?;
         cap.funded_capital_usd
     };
-    let cap = lock_strategy_capital(tx, strategy_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let cap = lock_strategy_capital_scoped(tx, strategy_id).await?;
     if cap.bootstrap_quality != "pending" {
         let min_funded = cap.invested_capital_usd + cap.reserved_cash_usd;
         if target_funded < min_funded {
-            return Err(format!(
+            return Err(StrategyCapitalError::business(format!(
                 "strategy budget cannot be below capital already deployed (${min_funded} invested+reserved); close positions or withdraw reserves first"
-            ));
+            )));
         }
     } else if cap.invested_capital_usd > Decimal::ZERO || cap.reserved_cash_usd > Decimal::ZERO {
-        return Err(
-            "strategy capital is pending but has legacy exposure; run account capital bootstrap first"
-                .into(),
-        );
+        return Err(StrategyCapitalError::business(
+            "strategy capital is pending but has legacy exposure; run account capital bootstrap first",
+        ));
     }
     let delta = target_funded - cap.funded_capital_usd;
     if delta > Decimal::ZERO {
@@ -449,9 +552,7 @@ pub async fn sync_strategy_funded_to_target(
         withdraw_from_strategy(tx, user_id, trading_account_id, strategy_id, -delta, &key).await?;
     }
     let _ = funded_before;
-    let after = lock_strategy_capital(tx, strategy_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let after = lock_strategy_capital_scoped(tx, strategy_id).await?;
     Ok(after.funded_capital_usd - funded_before)
 }
 
@@ -461,28 +562,28 @@ pub async fn sync_strategy_capital_to_configured_cap(
     user_id: Uuid,
     strategy_id: Uuid,
     idempotency_prefix: &str,
-) -> Result<CapitalSyncOutcome, String> {
+) -> Result<CapitalSyncOutcome, StrategyCapitalError> {
+    lock_owned_copy_strategy(tx, user_id, strategy_id, false).await?;
     let row: Option<(Uuid, String, Decimal, Option<Decimal>, String)> = sqlx::query_as(
-        "SELECT s.trading_account_id, s.allocation_mode, s.strategy_budget_usd, s.allocation_percent, a.operating_mode
+        "SELECT s.trading_account_id, s.allocation_mode, s.strategy_budget_usd, s.allocation_percent, s.operating_mode
          FROM copy_strategies s
-         JOIN trading_accounts a ON a.id = s.trading_account_id
          WHERE s.id = $1 AND s.user_id = $2",
     )
     .bind(strategy_id)
     .bind(user_id)
     .fetch_optional(&mut **tx)
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     let Some((account_id, mode, budget, pct, operating_mode)) = row else {
-        return Err("strategy not found".into());
+        return Err(StrategyCapitalError::StrategyNotFound);
     };
     if operating_mode != "paper_trading" {
-        return Err("strategy capital sync is only available in paper_trading mode".into());
+        return Err(StrategyCapitalError::business(
+            "strategy capital sync is only available in paper_trading mode",
+        ));
     }
-    let alloc = parse_allocation_from_request(Some(&mode), budget, pct)?;
-    let equity = paper_account_equity_usd(tx, account_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let alloc = parse_allocation_from_request(Some(&mode), budget, pct)
+        .map_err(StrategyCapitalError::business)?;
+    let equity = paper_account_equity_usd(tx, account_id).await?;
     let target = effective_allocation_cap(&alloc, equity);
     let delta_applied = sync_strategy_funded_to_target(
         tx,
@@ -493,9 +594,7 @@ pub async fn sync_strategy_capital_to_configured_cap(
         idempotency_prefix,
     )
     .await?;
-    let cap = lock_strategy_capital(tx, strategy_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let cap = lock_strategy_capital_scoped(tx, strategy_id).await?;
     Ok(CapitalSyncOutcome {
         configured_capital_usd: target,
         funded_capital_usd: cap.funded_capital_usd,
@@ -516,14 +615,17 @@ pub async fn withdraw_from_strategy(
     if amount <= Decimal::ZERO {
         return Err("withdrawal amount must be positive".into());
     }
+    lock_owned_copy_strategy(tx, user_id, strategy_id, false)
+        .await
+        .map_err(|e| e.user_message())?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::text))")
         .bind(trading_account_id)
         .execute(&mut **tx)
         .await
         .map_err(|e| e.to_string())?;
-    let cap = lock_strategy_capital(tx, strategy_id)
+    let cap = lock_strategy_capital_scoped(tx, strategy_id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.user_message())?;
     if amount > cap.available_cash_usd {
         return Err(format!(
             "cannot withdraw ${amount}: only ${} available (reserved ${} invested ${})",
@@ -678,7 +780,7 @@ pub async fn release_order_reserve(
     Ok(())
 }
 
-/// PAPER BUY fill: spend reserved (then available), increase invested, debit account `paper_cash_usd`.
+/// PAPER BUY fill: spend reserved (then available), increase invested (does not change account `paper_cash_usd`).
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_paper_buy_fill(
     tx: &mut Tx<'_>,
@@ -723,15 +825,6 @@ pub async fn apply_paper_buy_fill(
     .bind(strategy_id)
     .bind(from_reserved)
     .bind(from_available)
-    .bind(total_cost)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE account_risk_limits SET paper_cash_usd = paper_cash_usd - $2, updated_at = now()
-         WHERE trading_account_id = $1",
-    )
-    .bind(trading_account_id)
     .bind(total_cost)
     .execute(&mut **tx)
     .await?;
@@ -791,16 +884,6 @@ pub async fn apply_paper_sell_fill(
         .execute(&mut **tx)
         .await?;
     }
-    if strategy_id.is_none() {
-        sqlx::query(
-            "UPDATE account_risk_limits SET paper_cash_usd = paper_cash_usd + $2, updated_at = now()
-             WHERE trading_account_id = $1",
-        )
-        .bind(trading_account_id)
-        .bind(proceeds_net)
-        .execute(&mut **tx)
-        .await?;
-    }
     insert_ledger(
         tx,
         user_id,
@@ -818,7 +901,7 @@ pub async fn apply_paper_sell_fill(
     Ok(())
 }
 
-/// Unallocated cash = account `paper_cash_usd` minus sum of strategy liquid balances.
+/// Unallocated cash = total account funding minus capital assigned to strategies (`funded_capital_usd`).
 pub async fn unallocated_cash_in_tx(
     tx: &mut Tx<'_>,
     trading_account_id: Uuid,
@@ -829,14 +912,14 @@ pub async fn unallocated_cash_in_tx(
     .bind(trading_account_id)
     .fetch_one(&mut **tx)
     .await?;
-    let strategy_liquid: Decimal = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(available_cash_usd + reserved_cash_usd), 0)
+    let strategy_funded: Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(funded_capital_usd), 0)
          FROM strategy_capital_accounts WHERE trading_account_id = $1",
     )
     .bind(trading_account_id)
     .fetch_one(&mut **tx)
     .await?;
-    Ok((paper - strategy_liquid).max(Decimal::ZERO))
+    Ok((paper - strategy_funded).max(Decimal::ZERO))
 }
 
 pub async fn strategy_available_cash(
@@ -1066,10 +1149,20 @@ async fn reconcile_account_in_tx(
         strategy_invested += line.invested_capital_usd;
         lines.push(line);
     }
-    let unallocated = (paper - strategy_liquid).max(Decimal::ZERO);
-    let expected_paper = unallocated + strategy_liquid;
-    let discrepancy = paper - expected_paper;
-    let reconciled = discrepancy.abs() < Decimal::new(1, 2);
+    let strategy_funded: Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(funded_capital_usd), 0)
+         FROM strategy_capital_accounts WHERE trading_account_id = $1",
+    )
+    .bind(trading_account_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let unallocated = (paper - strategy_funded).max(Decimal::ZERO);
+    let discrepancy = if strategy_funded > paper {
+        strategy_funded - paper
+    } else {
+        Decimal::ZERO
+    };
+    let reconciled = strategy_funded <= paper + Decimal::new(1, 2);
     let mut notes = Vec::new();
     if manual_cost > Decimal::ZERO {
         notes.push(
@@ -1086,7 +1179,7 @@ async fn reconcile_account_in_tx(
     }
     if !reconciled {
         notes.push(format!(
-            "Paper cash minus strategy liquid balances differs by ${discrepancy}; manual lots or pre-ledger history may explain the gap."
+            "Strategy funded capital (${strategy_funded}) exceeds account paper funding (${paper}) by ${discrepancy}."
         ));
     }
     Ok(AccountReconciliation {
@@ -1106,6 +1199,59 @@ async fn reconcile_account_in_tx(
 }
 
 /// Sync invested cache from open position cost basis (repair helper).
+/// PAPER resolution: release cost basis; credit payout to available (payout may be zero).
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_paper_resolution_settlement(
+    tx: &mut Tx<'_>,
+    user_id: Uuid,
+    trading_account_id: Uuid,
+    strategy_id: Uuid,
+    position_id: Uuid,
+    payout_usd: Decimal,
+    cost_released: Decimal,
+    idempotency_key: &str,
+    entry_type: &str,
+    metadata: serde_json::Value,
+) -> anyhow::Result<()> {
+    let fresh: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM capital_ledger_entries WHERE idempotency_key = $1)",
+    )
+    .bind(idempotency_key)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !fresh {
+        return Ok(());
+    }
+    let _ = lock_strategy_capital(tx, strategy_id).await?;
+    sqlx::query(
+        "UPDATE strategy_capital_accounts
+         SET invested_capital_usd = GREATEST(invested_capital_usd - $2, 0),
+             available_cash_usd = available_cash_usd + $3,
+             updated_at = now()
+         WHERE strategy_id = $1",
+    )
+    .bind(strategy_id)
+    .bind(cost_released)
+    .bind(payout_usd)
+    .execute(&mut **tx)
+    .await?;
+    insert_ledger(
+        tx,
+        user_id,
+        trading_account_id,
+        Some(strategy_id),
+        None,
+        None,
+        Some(position_id),
+        entry_type,
+        payout_usd,
+        idempotency_key,
+        metadata,
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn sync_invested_from_positions(
     tx: &mut Tx<'_>,
     strategy_id: Uuid,

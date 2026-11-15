@@ -187,7 +187,10 @@ async fn sync_two_thousand_idempotent_and_insufficient_peer() {
         .await
         .unwrap_err();
     tx.rollback().await.ok();
-    assert!(err.contains("insufficient unallocated cash"), "{err}");
+    assert!(
+        err.to_string().contains("insufficient unallocated cash"),
+        "{err}"
+    );
 
     let ledger: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM capital_ledger_entries WHERE strategy_id = $1 AND entry_type = 'strategy_allocation'",
@@ -229,7 +232,10 @@ async fn partial_fund_to_configured_cap() {
         .await
         .unwrap_err();
     tx.rollback().await.ok();
-    assert!(err.contains("insufficient unallocated cash"), "{err}");
+    assert!(
+        err.to_string().contains("insufficient unallocated cash"),
+        "{err}"
+    );
 
     sqlx::query(
         "UPDATE copy_strategies SET strategy_budget_usd = 1200 WHERE id = $1",

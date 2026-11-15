@@ -33,30 +33,19 @@ export function shortenHash(hash: string, head = 10, tail = 6): string {
   return `${v.slice(0, head)}…${v.slice(-tail)}`;
 }
 
+import { formatSharePriceUsd, formatSharesSmart, formatUsd } from "./display-format";
+
 export function formatShares(value: string | number | null | undefined): string | null {
-  if (value === null || value === undefined || value === "") return null;
-  const n = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(n)) return null;
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 }).format(n);
+  return formatSharesSmart(value);
 }
 
 export function formatUsdc(value: string | number | null | undefined): string | null {
-  if (value === null || value === undefined || value === "") return null;
-  const n = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(n)) return null;
-  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(n);
+  const s = formatUsd(value);
+  return s === "—" ? null : s;
 }
 
 export function formatPricePerShare(value: string | number | null | undefined): string | null {
-  if (value === null || value === undefined || value === "") return null;
-  const n = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(n)) return null;
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 3,
-  }).format(n);
+  return formatSharePriceUsd(value);
 }
 
 export function polymarketUrl(trade: Pick<SourceTrade, "event_slug" | "market_slug">): string | null {

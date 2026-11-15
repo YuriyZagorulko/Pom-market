@@ -207,6 +207,34 @@ impl TestApi {
             .status()
     }
 
+  /// HTTP call that returns status and parsed JSON body (or raw text wrapper).
+    pub async fn request_json(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = self
+            .http
+            .request(method.parse().unwrap(), format!("{}{path}", self.base));
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let response = req.send().await.unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        let parsed = if text.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }))
+        };
+        (status, parsed)
+    }
+
     pub async fn fund_paper(&self, token: &str, account_id: &str, delta_usd: &str) {
         self.send(
             "POST",

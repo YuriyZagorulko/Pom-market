@@ -17,7 +17,9 @@ use pommarket::security::Vault;
 async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     pommarket::init_tracing(&cfg.log_format);
-    migrate(&cfg.migration_database_url).await?;
+    if std::env::var("POM_SKIP_STARTUP_MIGRATION").unwrap_or_default() != "true" {
+        migrate(&cfg.migration_database_url).await?;
+    }
     let migration = connect(&cfg.migration_database_url).await?;
     let app_password = std::env::var("APP_DB_PASSWORD")
         .map_err(|_| anyhow::anyhow!("missing required environment variable APP_DB_PASSWORD"))?;
@@ -26,6 +28,10 @@ async fn main() -> anyhow::Result<()> {
     pommarket::ensure_login_roles(&migration, &app_password, &worker_password).await?;
     pommarket::bootstrap_admin(&migration, &cfg).await?;
     drop(migration);
+    if std::env::args().any(|arg| arg == "--migrate-only") {
+        tracing::info!("migrations applied (--migrate-only)");
+        return Ok(());
+    }
     if std::env::args().any(|arg| arg == "--rotate-keys") {
         let pool = connect(&cfg.worker_database_url).await?;
         let vault = Vault::new(

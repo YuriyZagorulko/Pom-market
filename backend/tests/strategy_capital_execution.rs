@@ -10,6 +10,7 @@ use common::TestApi;
 use pommarket::db::{begin_as, connect, migrate};
 use pommarket::engine::{BookLevel, OrderBook};
 use pommarket::hard_close::{process_pending_operations, start_hard_close};
+use pommarket::polymarket::http::PublicClient;
 use pommarket::pipeline::{ingest, process_event, Books, PipelineConfig};
 use pommarket::strategy_accounting::{reconcile_account, reserve_order_cash};
 use rust_decimal::Decimal;
@@ -17,6 +18,14 @@ use serde_json::json;
 use sqlx::PgPool;
 use test_support::{assert_all_test_database_urls, truncate_integration_tables};
 use uuid::Uuid;
+
+fn test_public_client() -> PublicClient {
+    PublicClient::new(
+        "https://data-api.polymarket.com".into(),
+        "https://clob.polymarket.com".into(),
+        "https://gamma-api.polymarket.com".into(),
+    )
+}
 
 struct DeepBook;
 #[async_trait]
@@ -94,7 +103,7 @@ async fn seed_copy_account(migration: &PgPool) -> (Uuid, Uuid, Uuid, String) {
 
 async fn run_hard_close_ticks(worker: &PgPool, books: &dyn Books, ticks: u32) {
     for _ in 0..ticks {
-        process_pending_operations(worker, books, Decimal::ZERO, 1)
+        process_pending_operations(worker, books, &test_public_client(), Decimal::ZERO, 1)
             .await
             .unwrap();
     }
@@ -217,7 +226,7 @@ async fn hard_close_strategy_position_updates_ledger_not_paper_cash() {
     .await
     .unwrap();
 
-    let op = start_hard_close(&worker, user_id, account_id, Some("hc-ledger".into()))
+    let op = start_hard_close(&worker, user_id, account_id, None, Some("hc-ledger".into()))
         .await
         .unwrap();
     run_hard_close_ticks(&worker, &DeepBook, 6).await;
@@ -298,7 +307,7 @@ async fn hard_close_retry_does_not_duplicate_ledger_fill() {
     .await
     .unwrap();
 
-    let _op = start_hard_close(&worker, user_id, account_id, None)
+    let _op = start_hard_close(&worker, user_id, account_id, None, None)
         .await
         .unwrap();
     run_hard_close_ticks(&worker, &DeepBook, 9).await;
