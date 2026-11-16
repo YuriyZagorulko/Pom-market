@@ -1,6 +1,9 @@
 FROM node:20-bookworm-slim
 WORKDIR /app
-RUN corepack enable
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY packages ./packages
 COPY apps/admin ./apps/admin
