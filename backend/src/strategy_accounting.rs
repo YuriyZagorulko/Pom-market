@@ -381,6 +381,13 @@ pub async fn ensure_strategy_capital_row(
     Ok(())
 }
 
+fn capital_entry_requires_strategy(entry_type: &str) -> bool {
+    !matches!(
+        entry_type,
+        "account_paper_funding" | "reconciliation_adjustment"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert_ledger(
     tx: &mut Tx<'_>,
@@ -395,6 +402,9 @@ async fn insert_ledger(
     idempotency_key: &str,
     metadata: serde_json::Value,
 ) -> anyhow::Result<()> {
+    if capital_entry_requires_strategy(entry_type) && strategy_id.is_none() {
+        anyhow::bail!("capital ledger entry {entry_type} requires strategy_id");
+    }
     sqlx::query(
         "INSERT INTO capital_ledger_entries (
             user_id, trading_account_id, strategy_id, order_id, fill_id, position_id,
@@ -870,17 +880,21 @@ pub async fn apply_paper_sell_fill(
         return Ok(());
     }
     if let Some(sid) = strategy_id {
-        let _ = lock_strategy_capital(tx, sid).await?;
+        let cap = lock_strategy_capital(tx, sid).await?;
+        let invested_release = cap.invested_capital_usd.min(cost_released);
+        let funded_delta = proceeds_net - invested_release;
         sqlx::query(
             "UPDATE strategy_capital_accounts
              SET invested_capital_usd = GREATEST(invested_capital_usd - $2, 0),
                  available_cash_usd = available_cash_usd + $3,
+                 funded_capital_usd = funded_capital_usd + $4,
                  updated_at = now()
              WHERE strategy_id = $1",
         )
         .bind(sid)
         .bind(cost_released)
         .bind(proceeds_net)
+        .bind(funded_delta)
         .execute(&mut **tx)
         .await?;
     }
@@ -1222,17 +1236,21 @@ pub async fn apply_paper_resolution_settlement(
     if !fresh {
         return Ok(());
     }
-    let _ = lock_strategy_capital(tx, strategy_id).await?;
+    let cap = lock_strategy_capital(tx, strategy_id).await?;
+    let invested_release = cap.invested_capital_usd.min(cost_released);
+    let funded_delta = payout_usd - invested_release;
     sqlx::query(
         "UPDATE strategy_capital_accounts
          SET invested_capital_usd = GREATEST(invested_capital_usd - $2, 0),
              available_cash_usd = available_cash_usd + $3,
+             funded_capital_usd = funded_capital_usd + $4,
              updated_at = now()
          WHERE strategy_id = $1",
     )
     .bind(strategy_id)
     .bind(cost_released)
     .bind(payout_usd)
+    .bind(funded_delta)
     .execute(&mut **tx)
     .await?;
     insert_ledger(
@@ -1256,17 +1274,24 @@ pub async fn sync_invested_from_positions(
     tx: &mut Tx<'_>,
     strategy_id: Uuid,
 ) -> anyhow::Result<()> {
+    let cap = lock_strategy_capital(tx, strategy_id).await?;
     let deployed: Decimal = sqlx::query_scalar(
         "SELECT COALESCE(SUM(cost_basis_usd), 0) FROM positions WHERE strategy_id = $1 AND open_shares > 0",
     )
     .bind(strategy_id)
     .fetch_one(&mut **tx)
     .await?;
+    let available = cap.funded_capital_usd - cap.reserved_cash_usd - deployed;
     sqlx::query(
-        "UPDATE strategy_capital_accounts SET invested_capital_usd = $2, updated_at = now() WHERE strategy_id = $1",
+        "UPDATE strategy_capital_accounts
+         SET invested_capital_usd = $2,
+             available_cash_usd = $3,
+             updated_at = now()
+         WHERE strategy_id = $1",
     )
     .bind(strategy_id)
     .bind(deployed)
+    .bind(available)
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -35,6 +35,17 @@ export type AccountRenameBody = {
   name: string;
 };
 
+export type AccountTypeValue = "paper" | "wallet";
+
+export type AccountCreateBody = {
+  name: string;
+  account_type: AccountTypeValue;
+  signature_type?: string;
+  signer_address?: string;
+  funder_address?: string;
+  private_key?: string;
+};
+
 const RISK_USD_FIELDS = ["max_order_usd", "max_daily_loss_usd"] as const;
 
 const USD_LABELS: Record<(typeof RISK_USD_FIELDS)[number], string> = {
@@ -147,6 +158,36 @@ export function buildPaperFundingRequest(
       idempotency_key: idempotencyKey,
     },
   };
+}
+
+/** POST /api/v1/accounts — paper needs only name; wallet sends Polymarket fields. */
+export function buildCreateAccountBody(
+  form: Record<string, FormDataEntryValue>,
+): FormResult<AccountCreateBody> {
+  const name = String(form.name ?? "").trim();
+  if (!name) return { ok: false, error: "Account name is required." };
+  const rawType = String(form.account_type ?? "wallet").trim();
+  if (rawType !== "paper" && rawType !== "wallet") {
+    return { ok: false, error: "Account type must be Paper Trading or Wallet." };
+  }
+  if (rawType === "paper") {
+    return { ok: true, body: { name, account_type: "paper" } };
+  }
+  const signature_type = String(form.signature_type ?? "").trim();
+  if (!signature_type) return { ok: false, error: "Signature type is required for wallet accounts." };
+  const signer_address = String(form.signer_address ?? "").trim();
+  if (!signer_address) return { ok: false, error: "Signer address is required for wallet accounts." };
+  const body: AccountCreateBody = {
+    name,
+    account_type: "wallet",
+    signature_type,
+    signer_address,
+  };
+  const funder = String(form.funder_address ?? "").trim();
+  if (funder) body.funder_address = funder;
+  const pk = String(form.private_key ?? "").trim();
+  if (pk) body.private_key = pk;
+  return { ok: true, body };
 }
 
 export function buildAccountRenameBody(form: Record<string, FormDataEntryValue>): FormResult<AccountRenameBody> {

@@ -8,7 +8,7 @@ use pommarket::strategy_accounting::{
     is_capital_bootstrapped, reconcile_account, sync_strategy_capital_to_configured_cap,
 };
 use rust_decimal::Decimal;
-use test_support::assert_test_database_url;
+use test_support::{assert_test_database_url, truncate_integration_tables};
 use uuid::Uuid;
 
 async fn seed_account(pool: &sqlx::PgPool) -> (Uuid, Uuid, Uuid) {
@@ -66,6 +66,7 @@ async fn allocate_fund_and_reconcile() {
     assert_test_database_url(&url);
     migrate(&url).await.unwrap();
     let pool = connect(&url).await.unwrap();
+    truncate_integration_tables(&pool, &url).await;
     let (user, account, strategy) = seed_account(&pool).await;
     let mut tx = begin_as(&pool, Some(user), "user").await.unwrap();
     allocate_to_strategy(
@@ -101,6 +102,7 @@ async fn sync_on_enable_target_allocates_and_bootstraps() {
     assert_test_database_url(&url);
     migrate(&url).await.unwrap();
     let pool = connect(&url).await.unwrap();
+    truncate_integration_tables(&pool, &url).await;
     let (user, _account, strategy) = seed_account(&pool).await;
     let mut tx = begin_as(&pool, Some(user), "user").await.unwrap();
     let outcome = sync_strategy_capital_to_configured_cap(&mut tx, user, strategy, "test-sync")
@@ -129,7 +131,13 @@ async fn sync_two_thousand_idempotent_and_insufficient_peer() {
     assert_test_database_url(&url);
     migrate(&url).await.unwrap();
     let pool = connect(&url).await.unwrap();
+    truncate_integration_tables(&pool, &url).await;
     let (user, account, strategy_a) = seed_account(&pool).await;
+    sqlx::query("UPDATE account_risk_limits SET paper_cash_usd = 2000 WHERE trading_account_id = $1")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE copy_strategies SET strategy_budget_usd = 2000, allocation_mode = 'fixed_usd' WHERE id = $1",
     )
@@ -209,6 +217,7 @@ async fn partial_fund_to_configured_cap() {
     assert_test_database_url(&url);
     migrate(&url).await.unwrap();
     let pool = connect(&url).await.unwrap();
+    truncate_integration_tables(&pool, &url).await;
     let (user, account, strategy) = seed_account(&pool).await;
     sqlx::query(
         "UPDATE account_risk_limits SET paper_cash_usd = 1500 WHERE trading_account_id = $1",
@@ -259,6 +268,7 @@ async fn concurrent_sync_two_strategies_respects_unallocated() {
     assert_test_database_url(&url);
     migrate(&url).await.unwrap();
     let pool = connect(&url).await.unwrap();
+    truncate_integration_tables(&pool, &url).await;
     let (user, account, strategy_a) = seed_account(&pool).await;
     sqlx::query(
         "UPDATE account_risk_limits SET paper_cash_usd = 5000 WHERE trading_account_id = $1",

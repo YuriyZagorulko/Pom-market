@@ -653,7 +653,20 @@ async fn hard_close_same_token_multi_strategy_and_manual() {
     .fetch_one(&migration)
     .await
     .unwrap();
-    assert_eq!(cash_after - cash_before, Decimal::new(275 * 50, 2));
+    assert_eq!(
+        cash_after, cash_before,
+        "paper account funding is unchanged; sell proceeds stay on strategy ledgers"
+    );
+    let proceeds: Decimal = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(f.notional_usd), 0) FROM fills f
+         JOIN orders o ON o.id = f.order_id
+         WHERE o.trading_account_id = $1 AND o.origin = 'hard_close'",
+    )
+    .bind(account_id)
+    .fetch_one(&migration)
+    .await
+    .unwrap();
+    assert_eq!(proceeds, Decimal::new(275 * 50, 2));
 }
 
 #[tokio::test]

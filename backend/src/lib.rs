@@ -28,6 +28,7 @@ pub mod strategy_performance;
 pub mod strategy_budget;
 pub mod strategy_delete;
 pub mod strategy_operating_mode;
+pub mod trading_account;
 pub mod strategy_readiness;
 pub mod trading_control;
 

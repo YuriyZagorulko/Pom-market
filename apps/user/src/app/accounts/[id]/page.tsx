@@ -169,22 +169,36 @@ function Detail({ id }: { id: string }) {
   if (error) return <p className="error">{error}</p>;
   if (!data) return <p>Loading…</p>;
   const account = data.account;
+  const isPaper = account.account_type === "paper";
+  const typeLabel = isPaper ? "Paper Trading" : "Wallet";
   const riskDefaults = accountRiskFormValues(data.risk);
 
   return (
     <section style={{ display: "grid", gap: 16 }}>
       <h1>{account.name}</h1>
       <div className="panel">
-        <div>Signer {account.signer_address}</div>
-        <div>Funder {account.funder_address}</div>
+        <div>Account type · {typeLabel}</div>
+        {isPaper ? (
+          <div className="muted">No Polymarket wallet connected — paper strategies only.</div>
+        ) : (
+          <>
+            <div>Signer {account.signer_address}</div>
+            <div>Funder {account.funder_address}</div>
+            <div>Signature {account.signature_type}</div>
+          </>
+        )}
         <div>
-          Signature {account.signature_type} · Mode {account.operating_mode} · {account.status}
+          Mode {account.operating_mode} · {account.status}
         </div>
-        <div>
-          Exchange balance {account.last_exchange_balance_usd ?? "not checked"}
-          {account.last_connection_error && <span className="error"> · {account.last_connection_error}</span>}
-        </div>
-        <div>Credentials stored: {data.credentials_stored ? "yes" : "no"}. The key itself is never shown.</div>
+        {!isPaper ? (
+          <div>
+            Exchange balance {account.last_exchange_balance_usd ?? "not checked"}
+            {account.last_connection_error && <span className="error"> · {account.last_connection_error}</span>}
+          </div>
+        ) : null}
+        {!isPaper ? (
+          <div>Credentials stored: {data.credentials_stored ? "yes" : "no"}. The key itself is never shown.</div>
+        ) : null}
         <div className="filters">
           <button type="button" onClick={test}>
             Test connection
@@ -208,25 +222,31 @@ function Detail({ id }: { id: string }) {
         <button type="submit">Save name</button>
       </form>
 
-      <form className="panel account-credentials-form" onSubmit={rotateCredentials}>
-        <h2>Polymarket credentials</h2>
-        <p className="muted">Update signer, funder, signature type, or private key. The stored key is never shown.</p>
-        <PolymarketAccountCredentialsFields
-          key={String(account.signer_address) + String(account.funder_address)}
-          signatureType={signatureType}
-          onSignatureTypeChange={setSignatureType}
-          signerDefault={String(account.signer_address ?? "")}
-          funderDefault={String(account.funder_address ?? "")}
-          privateKeyRequired
-          privateKeyPlaceholder="New private key 0x…"
-        />
-        {credentialError && <div className="error">{credentialError}</div>}
-        <button type="submit">Update credentials</button>
-      </form>
+      {!isPaper ? (
+        <form className="panel account-credentials-form" onSubmit={rotateCredentials}>
+          <h2>Polymarket credentials</h2>
+          <p className="muted">Update signer, funder, signature type, or private key. The stored key is never shown.</p>
+          <PolymarketAccountCredentialsFields
+            key={String(account.signer_address) + String(account.funder_address)}
+            signatureType={signatureType}
+            onSignatureTypeChange={setSignatureType}
+            signerDefault={String(account.signer_address ?? "")}
+            funderDefault={String(account.funder_address ?? "")}
+            privateKeyRequired
+            privateKeyPlaceholder="New private key 0x…"
+          />
+          {credentialError && <div className="error">{credentialError}</div>}
+          <button type="submit">Update credentials</button>
+        </form>
+      ) : null}
 
       <form className="panel form-stack" onSubmit={mode}>
         <h2 style={{ margin: 0 }}>Operating mode</h2>
-        {!data.credentials_stored ? (
+        {isPaper ? (
+          <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+            Paper Trading accounts are for virtual execution only. Live trading is not available on this account type.
+          </p>
+        ) : !data.credentials_stored ? (
           <p className="muted" style={{ margin: 0, fontSize: 13 }}>
             Paper and monitoring work without a private key. Live trading requires credentials — add them in the
             Polymarket credentials section above.
@@ -237,22 +257,26 @@ function Detail({ id }: { id: string }) {
           <select id="operating-mode" name="mode" defaultValue={String(account.operating_mode)}>
             <option value="monitoring">Monitoring</option>
             <option value="paper_trading">Paper trading</option>
-            <option value="live_trading">Live trading</option>
+            {!isPaper ? <option value="live_trading">Live trading</option> : null}
           </select>
         </div>
-        <label>
-          <input name="confirm_live" type="checkbox" /> I understand live orders spend real funds
-        </label>
-        <div className="form-field">
-          <SimpleFieldLabel htmlFor="live-confirmation" optional>
-            Live confirmation phrase
-          </SimpleFieldLabel>
-          <input
-            id="live-confirmation"
-            name="confirmation"
-            placeholder="Type ENABLE LIVE TRADING for live mode"
-          />
-        </div>
+        {!isPaper ? (
+          <>
+            <label>
+              <input name="confirm_live" type="checkbox" /> I understand live orders spend real funds
+            </label>
+            <div className="form-field">
+              <SimpleFieldLabel htmlFor="live-confirmation" optional>
+                Live confirmation phrase
+              </SimpleFieldLabel>
+              <input
+                id="live-confirmation"
+                name="confirmation"
+                placeholder="Type ENABLE LIVE TRADING for live mode"
+              />
+            </div>
+          </>
+        ) : null}
         <button type="submit">Update mode</button>
       </form>
 

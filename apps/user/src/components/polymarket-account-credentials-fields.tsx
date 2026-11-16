@@ -19,6 +19,8 @@ const SIGNATURE_OPTIONS: { value: SignatureTypeValue; label: string }[] = [
 type Props = {
   signatureType: SignatureTypeValue;
   onSignatureTypeChange: (value: SignatureTypeValue) => void;
+  /** Paper-only account: name field only (no wallet inputs rendered). */
+  hideWalletFields?: boolean;
   showName?: boolean;
   nameDefault?: string;
   privateKeyRequired?: boolean;
@@ -30,6 +32,7 @@ type Props = {
 export function PolymarketAccountCredentialsFields({
   signatureType,
   onSignatureTypeChange,
+  hideWalletFields,
   showName,
   nameDefault,
   privateKeyRequired,
@@ -46,6 +49,8 @@ export function PolymarketAccountCredentialsFields({
           <input id="account-name" name="name" placeholder="Name" defaultValue={nameDefault} required />
         </>
       )}
+      {hideWalletFields ? null : (
+        <>
       <FieldLabel label="Signature type" helpTitle="Signature Type" help={<SignatureTypeHelp />} htmlFor="signature_type" />
       <select
         id="signature_type"
@@ -105,6 +110,8 @@ export function PolymarketAccountCredentialsFields({
         required={privateKeyRequired}
         autoComplete="off"
       />
+        </>
+      )}
     </>
   );
 }

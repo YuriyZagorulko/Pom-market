@@ -24,6 +24,7 @@ pub enum ModeChangeReject {
     UnresolvedExecution,
     LiveNotReady,
     CredentialsMissing,
+    PaperAccountNoLive,
     InvalidMode,
     BadRequest(&'static str),
 }
@@ -40,6 +41,9 @@ impl ModeChangeReject {
             }
             Self::LiveNotReady => LIVE_TRADING_NOT_READY_CODE.into(),
             Self::CredentialsMissing => ACCOUNT_CREDENTIALS_REQUIRED_CODE.into(),
+            Self::PaperAccountNoLive => {
+                crate::trading_account::PAPER_ACCOUNT_NO_LIVE_CODE.into()
+            }
             Self::InvalidMode => {
                 "operating_mode must be paper_trading or live_trading".into()
             }
@@ -130,6 +134,17 @@ pub async fn change_operating_mode(
     }
 
     if next_mode == "live_trading" {
+        let account_type: String = sqlx::query_scalar(
+            "SELECT account_type FROM trading_accounts WHERE id = $1 AND user_id = $2",
+        )
+        .bind(row.trading_account_id)
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| ModeChangeReject::NotFound)?;
+        if crate::trading_account::is_paper_account(&account_type) {
+            return Err(ModeChangeReject::PaperAccountNoLive);
+        }
         let has_credentials: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM trading_credentials WHERE trading_account_id = $1)",
         )
@@ -222,6 +237,14 @@ mod tests {
         assert_eq!(
             ModeChangeReject::CredentialsMissing.api_message(),
             ACCOUNT_CREDENTIALS_REQUIRED_CODE
+        );
+    }
+
+    #[test]
+    fn paper_account_no_live_uses_stable_code() {
+        assert_eq!(
+            ModeChangeReject::PaperAccountNoLive.api_message(),
+            crate::trading_account::PAPER_ACCOUNT_NO_LIVE_CODE
         );
     }
 }

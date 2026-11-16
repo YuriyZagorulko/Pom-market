@@ -85,5 +85,6 @@ for url in MIGRATION_DATABASE_URL APP_DATABASE_URL WORKER_DATABASE_URL; do
 done
 
 bash scripts/verify-migration-checksums.sh
+bash scripts/verify-embedded-migrations.sh
 
 echo "validate: OK ($COMPOSE_FILE, $ENV_FILE)"

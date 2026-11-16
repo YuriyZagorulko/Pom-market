@@ -416,11 +416,12 @@ async fn process_one_operation(
     }
     tx.commit().await?;
 
+    let mut deferred_partial_items = std::collections::HashSet::<Uuid>::new();
     for _ in 0..HARD_CLOSE_ITEMS_PER_TICK {
         reclaim_stale_in_progress_items(pool, op_id).await?;
 
         let Some((item_id, position_id, token_id, remaining)) =
-            claim_next_item(pool, op_id).await?
+            claim_next_item(pool, op_id, &deferred_partial_items).await?
         else {
             break;
         };
@@ -446,36 +447,51 @@ async fn process_one_operation(
             fee_sched.as_ref(),
         )
         .await;
-        if let Err(err) = result {
-            let err_s = err.to_string();
-            if err_s.contains("404") {
-                if let Ok(Some(settled)) =
-                    paper_settlement::try_settle_position(pool, client, position_id).await
-                {
-                    if settled.status.starts_with("resolved_") {
-                        let mut tx = begin_as(pool, None, "worker").await?;
-                        sqlx::query(
-                            "UPDATE hard_close_items SET status = 'closed', closed_shares = requested_shares,
-                                remaining_shares = 0, error = NULL, updated_at = now()
-                             WHERE id = $1",
-                        )
-                        .bind(item_id)
-                        .execute(&mut *tx)
-                        .await?;
-                        tx.commit().await?;
-                        continue;
-                    }
+        match result {
+            Ok(()) => {
+                let mut status_tx = begin_as(pool, None, "worker").await?;
+                let item_status: String = sqlx::query_scalar(
+                    "SELECT status FROM hard_close_items WHERE id = $1",
+                )
+                .bind(item_id)
+                .fetch_one(&mut *status_tx)
+                .await?;
+                status_tx.commit().await?;
+                if item_status == "partial" {
+                    deferred_partial_items.insert(item_id);
                 }
             }
-            let mut tx = begin_as(pool, None, "worker").await?;
-            sqlx::query(
-                "UPDATE hard_close_items SET status = 'failed', error = $2, updated_at = now() WHERE id = $1",
-            )
-            .bind(item_id)
-            .bind(err_s)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
+            Err(err) => {
+                let err_s = err.to_string();
+                if err_s.contains("404") {
+                    if let Ok(Some(settled)) =
+                        paper_settlement::try_settle_position(pool, client, position_id).await
+                    {
+                        if settled.status.starts_with("resolved_") {
+                            let mut tx = begin_as(pool, None, "worker").await?;
+                            sqlx::query(
+                                "UPDATE hard_close_items SET status = 'closed', closed_shares = requested_shares,
+                                    remaining_shares = 0, error = NULL, updated_at = now()
+                                 WHERE id = $1",
+                            )
+                            .bind(item_id)
+                            .execute(&mut *tx)
+                            .await?;
+                            tx.commit().await?;
+                            continue;
+                        }
+                    }
+                }
+                let mut tx = begin_as(pool, None, "worker").await?;
+                sqlx::query(
+                    "UPDATE hard_close_items SET status = 'failed', error = $2, updated_at = now() WHERE id = $1",
+                )
+                .bind(item_id)
+                .bind(err_s)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+            }
         }
     }
 
@@ -568,6 +584,7 @@ async fn reclaim_stale_in_progress_items(pool: &PgPool, op_id: Uuid) -> anyhow::
 async fn claim_next_item(
     pool: &PgPool,
     op_id: Uuid,
+    exclude_item_ids: &std::collections::HashSet<Uuid>,
 ) -> anyhow::Result<Option<(Uuid, Uuid, String, Decimal)>> {
     loop {
         let mut tx = begin_as(pool, None, "worker").await?;
@@ -581,11 +598,18 @@ async fn claim_next_item(
              JOIN positions p ON p.id = hi.position_id
              WHERE hi.operation_id = $1 AND hi.status IN ('pending', 'partial')
                AND p.open_shares > 0
+               AND NOT (hi.id = ANY($2::uuid[]))
              ORDER BY hi.created_at
              FOR UPDATE OF hi SKIP LOCKED
              LIMIT 1",
         )
         .bind(op_id)
+        .bind(
+            exclude_item_ids
+                .iter()
+                .copied()
+                .collect::<Vec<Uuid>>(),
+        )
         .fetch_optional(&mut *tx)
         .await?;
         let Some((item_id, position_id, token_id, open, pending_exit, _stored)) = row else {
@@ -832,7 +856,7 @@ pub async fn retry_operation(
 ) -> anyhow::Result<()> {
     let mut tx = begin_as(pool, Some(user_id), "user").await?;
     let acct_state: String = sqlx::query_scalar(
-        "SELECT trading_control_state FROM trading_accounts WHERE id = $1 AND user_id = $2",
+        "SELECT COALESCE(trading_control_state, 'active') FROM trading_accounts WHERE id = $1 AND user_id = $2",
     )
     .bind(account_id)
     .bind(user_id)
@@ -841,20 +865,20 @@ pub async fn retry_operation(
     if acct_state == STATE_KILL_SWITCH {
         anyhow::bail!("deactivate kill switch before retry");
     }
-    let op_strategy: Option<Uuid> = sqlx::query_scalar(
+    let op_strategy: Option<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT strategy_id FROM hard_close_operations WHERE id = $1 AND trading_account_id = $2 AND user_id = $3",
     )
     .bind(op_id)
     .bind(account_id)
     .bind(user_id)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
     if op_strategy != strategy_id {
         anyhow::bail!("operation not found");
     }
     if let Some(sid) = op_strategy {
         let st: String = sqlx::query_scalar(
-            "SELECT trading_control_state FROM copy_strategies WHERE id = $1 AND user_id = $2",
+            "SELECT COALESCE(trading_control_state, 'active') FROM copy_strategies WHERE id = $1 AND user_id = $2",
         )
         .bind(sid)
         .bind(user_id)

@@ -4,6 +4,7 @@ import {
   buildAccountModeBody,
   buildAccountRenameBody,
   buildAccountRiskPatchBody,
+  buildCreateAccountBody,
   buildCredentialsRotateBody,
   buildPaperFundingRequest,
   parseStrictInt,
@@ -115,6 +116,27 @@ describe("accountRiskFormValues", () => {
     });
     expect(v.max_slippage_bps).toBe("150");
     expect(v.paper_cash_usd).toBe("5000");
+  });
+});
+
+describe("buildCreateAccountBody", () => {
+  it("paper account sends only name and account_type", () => {
+    const r = buildCreateAccountBody({ account_type: "paper", name: "Desk paper" });
+    expect(r).toEqual({ ok: true, body: { name: "Desk paper", account_type: "paper" } });
+  });
+
+  it("wallet account requires signature and signer", () => {
+    expect(buildCreateAccountBody({ account_type: "wallet", name: "W" }).ok).toBe(false);
+    const r = buildCreateAccountBody({
+      account_type: "wallet",
+      name: "W",
+      signature_type: "eoa",
+      signer_address: "0xabc",
+    });
+    expect(r).toMatchObject({
+      ok: true,
+      body: { account_type: "wallet", signature_type: "eoa", signer_address: "0xabc" },
+    });
   });
 });
 

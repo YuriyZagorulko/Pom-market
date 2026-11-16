@@ -152,7 +152,11 @@ async fn paper_mode_without_credentials() {
             }),
         )
         .await;
-    assert_eq!(strategy["operating_mode"], "paper_trading");
+    let strategy_id = strategy["id"].as_str().unwrap();
+    let (_, detail) = api
+        .get_raw(&format!("/api/v1/strategies/{strategy_id}"), &token)
+        .await;
+    assert_eq!(detail["operating_mode"], "paper_trading");
 }
 
 #[tokio::test]
@@ -181,6 +185,7 @@ async fn strategy_live_without_credentials_rejected() {
         json!({ "mode": "paper_trading" }),
     )
     .await;
+    api.fund_paper(&token, account_id, "500").await;
     let trader = api
         .send(
             "POST",
@@ -260,8 +265,14 @@ async fn account_live_mode_without_credentials_rejected() {
             })),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body.to_string().contains(ACCOUNT_CREDENTIALS_REQUIRED_CODE));
+    let text = body.to_string();
+    if std::env::var("CONFIRM_LIVE_TRADING").ok().as_deref() == Some("true") {
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains(ACCOUNT_CREDENTIALS_REQUIRED_CODE));
+    } else {
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(text.contains("CONFIRM_LIVE_TRADING"));
+    }
 }
 
 #[tokio::test]
@@ -329,6 +340,7 @@ async fn strategy_live_with_credentials_still_product_gated() {
         json!({ "mode": "paper_trading" }),
     )
     .await;
+    api.fund_paper(&token, account_id, "500").await;
     let trader = api
         .send(
             "POST",

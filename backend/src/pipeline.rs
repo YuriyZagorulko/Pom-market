@@ -1685,10 +1685,7 @@ pub async fn paper_sell_position(
     }
     let sell_shares = want_shares.min(available);
     let book = book.as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
-    if pos.operating_mode != "paper_trading"
-        && book.min_order_size > Decimal::ZERO
-        && sell_shares < book.min_order_size
-    {
+    if book.min_order_size > Decimal::ZERO && sell_shares < book.min_order_size {
         anyhow::bail!(
             "below_minimum_order_size: sellable {} < market min {}",
             sell_shares,

@@ -613,13 +613,13 @@ async fn e2e_hard_close_full_one_closed() {
     .fetch_one(&migration)
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE strategy_capital_accounts SET invested_capital_usd = 50 WHERE strategy_id = $1",
-    )
-    .bind(strategy_id)
-    .execute(&migration)
-    .await
-    .unwrap();
+    {
+        let mut tx = begin_as(&migration, None, "worker").await.unwrap();
+        pommarket::strategy_accounting::sync_invested_from_positions(&mut tx, strategy_id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
 
     let _op = start_hard_close(&worker, user_id, account_id, None, Some("hc-e2e-1".into()))
         .await

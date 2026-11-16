@@ -1,7 +1,11 @@
 export const LIVE_MODE_PHRASE = "ENABLE LIVE TRADING";
 export const ACCOUNT_CREDENTIALS_REQUIRED_CODE = "account_credentials_required";
+export const PAPER_ACCOUNT_NO_LIVE_CODE = "paper_account_no_live_trading";
 
 export function formatTradingModeApiError(raw: string): string {
+  if (raw.includes(PAPER_ACCOUNT_NO_LIVE_CODE)) {
+    return "Paper Trading accounts cannot use Live trading. Create a Polymarket Wallet account for live execution.";
+  }
   if (raw.includes(ACCOUNT_CREDENTIALS_REQUIRED_CODE)) {
     return "This account has no stored private key. Open the linked trading account → Polymarket credentials, add your key, then try Live again.";
   }

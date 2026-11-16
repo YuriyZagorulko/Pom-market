@@ -9,7 +9,7 @@ use tower_http::trace::TraceLayer;
 
 use pommarket::api::{new_app_state, router};
 use pommarket::config::Config;
-use pommarket::db::{connect, migrate};
+use pommarket::db::{connect, migrate, verify_migration_ledger, embedded_migration_head_version};
 use pommarket::polymarket::http::PublicClient;
 use pommarket::security::Vault;
 
@@ -21,6 +21,16 @@ async fn main() -> anyhow::Result<()> {
         migrate(&cfg.migration_database_url).await?;
     }
     let migration = connect(&cfg.migration_database_url).await?;
+    verify_migration_ledger(&migration).await.map_err(|e| {
+        anyhow::anyhow!(
+            "migration ledger incompatible with api binary (head v{}): {e}",
+            embedded_migration_head_version()
+        )
+    })?;
+    tracing::info!(
+        migration_head = embedded_migration_head_version(),
+        "api migration ledger verified"
+    );
     let app_password = std::env::var("APP_DB_PASSWORD")
         .map_err(|_| anyhow::anyhow!("missing required environment variable APP_DB_PASSWORD"))?;
     let worker_password = std::env::var("WORKER_DB_PASSWORD")

@@ -1291,7 +1291,7 @@ async fn dashboard(
     .await
     .map_err(internal)?;
     let account_rows = sqlx::query_as::<_, AccountCard>(
-        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
+        "SELECT id, name, account_type, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
          FROM trading_accounts WHERE user_id = $1 ORDER BY created_at",
     )
     .bind(user.id)
@@ -1327,8 +1327,12 @@ async fn dashboard(
 #[derive(Deserialize)]
 struct AccountBody {
     name: String,
-    signature_type: String,
-    signer_address: String,
+    #[serde(default)]
+    account_type: Option<String>,
+    #[serde(default)]
+    signature_type: Option<String>,
+    #[serde(default)]
+    signer_address: Option<String>,
     funder_address: Option<String>,
     private_key: Option<String>,
 }
@@ -1339,50 +1343,106 @@ async fn create_account(
     Json(body): Json<AccountBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&state, &headers, Some("user"))?;
-    validate_signature(&body.signature_type)?;
-    if !is_eth_address(&body.signer_address) {
-        return Err(bad("signer address is invalid"));
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(bad("account name is required"));
     }
-    if body.signature_type != "eoa" {
-        let funder_raw = body.funder_address.as_deref().map(str::trim).unwrap_or("");
-        if funder_raw.is_empty() {
-            return Err(bad(
-                "funder address is required for poly_proxy, poly_gnosis_safe, and poly_1271 accounts",
-            ));
-        }
-    }
-    let funder = body
-        .funder_address
-        .clone()
-        .unwrap_or_else(|| body.signer_address.clone());
-    if !is_eth_address(&funder) {
-        return Err(bad("funder address is invalid"));
-    }
-    if let Some(key) = optional_private_key(&body.private_key) {
-        let derived = crate::polymarket::credentials::derived_signer_address(key).map_err(bad)?;
-        crate::polymarket::credentials::verify_key_signer_configuration(
-            &body.signature_type,
-            &derived,
-            &body.signer_address,
-            &funder,
-        )
-        .map_err(bad)?;
-    }
+    let account_type = crate::trading_account::parse_account_type(body.account_type.as_deref())
+        .map_err(|e| bad(e))?;
     let mut tx = begin_as(&state.pool, Some(user.id), "user")
         .await
         .map_err(internal)?;
-    let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO trading_accounts (user_id, name, signature_type, signer_address, funder_address, operating_mode, status)
-         VALUES ($1,$2,$3,$4,$5,'monitoring','pending') RETURNING id",
-    )
-    .bind(user.id)
-    .bind(body.name.trim())
-    .bind(&body.signature_type)
-    .bind(normalize_address(&body.signer_address))
-    .bind(normalize_address(&funder))
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(internal)?;
+    let id: Uuid = if account_type == crate::trading_account::ACCOUNT_TYPE_PAPER {
+        if body.signature_type.is_some()
+            || body
+                .signer_address
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+            || body
+                .funder_address
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+            || optional_private_key(&body.private_key).is_some()
+        {
+            return Err(bad(
+                "paper trading accounts cannot include wallet credentials",
+            ));
+        }
+        sqlx::query_scalar(
+            "INSERT INTO trading_accounts (user_id, name, account_type, signature_type, signer_address, funder_address, operating_mode, status)
+             VALUES ($1,$2,'paper',NULL,NULL,NULL,'paper_trading','connected') RETURNING id",
+        )
+        .bind(user.id)
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?
+    } else {
+        let signature_type = body
+            .signature_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| bad("signature_type is required for wallet accounts"))?;
+        validate_signature(signature_type)?;
+        let signer_address = body
+            .signer_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| bad("signer address is required for wallet accounts"))?;
+        if !is_eth_address(signer_address) {
+            return Err(bad("signer address is invalid"));
+        }
+        if signature_type != "eoa" {
+            let funder_raw = body.funder_address.as_deref().map(str::trim).unwrap_or("");
+            if funder_raw.is_empty() {
+                return Err(bad(
+                    "funder address is required for poly_proxy, poly_gnosis_safe, and poly_1271 accounts",
+                ));
+            }
+        }
+        let funder = body
+            .funder_address
+            .clone()
+            .unwrap_or_else(|| signer_address.to_string());
+        if !is_eth_address(&funder) {
+            return Err(bad("funder address is invalid"));
+        }
+        if let Some(key) = optional_private_key(&body.private_key) {
+            let derived = crate::polymarket::credentials::derived_signer_address(key).map_err(bad)?;
+            crate::polymarket::credentials::verify_key_signer_configuration(
+                signature_type,
+                &derived,
+                signer_address,
+                &funder,
+            )
+            .map_err(bad)?;
+        }
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO trading_accounts (user_id, name, account_type, signature_type, signer_address, funder_address, operating_mode, status)
+             VALUES ($1,$2,'wallet',$3,$4,$5,'monitoring','pending') RETURNING id",
+        )
+        .bind(user.id)
+        .bind(name)
+        .bind(signature_type)
+        .bind(normalize_address(signer_address))
+        .bind(normalize_address(&funder))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if let Some(key) = optional_private_key(&body.private_key) {
+            let key = crate::polymarket::credentials::validate_private_key_format(key).map_err(bad)?;
+            store_key(&state.vault, &mut tx, user.id, id, &key)
+                .await
+                .map_err(internal)?;
+        }
+        id
+    };
     sqlx::query(
         "INSERT INTO account_risk_limits (trading_account_id, user_id, max_order_usd, max_daily_loss_usd, max_exposure_usd, max_slippage_bps, max_orders_per_interval, interval_seconds, max_stale_data_seconds, paper_cash_usd)
          VALUES ($1,$2,50,100,500,150,20,60,120,0)",
@@ -1392,12 +1452,6 @@ async fn create_account(
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
-    if let Some(key) = optional_private_key(&body.private_key) {
-        let key = crate::polymarket::credentials::validate_private_key_format(key).map_err(bad)?;
-        store_key(&state.vault, &mut tx, user.id, id, &key)
-            .await
-            .map_err(internal)?;
-    }
     audit(&mut tx, Some(user.id), "account_created", &id.to_string()).await;
     tx.commit().await.map_err(internal)?;
     Ok((StatusCode::CREATED, Json(json!({"id": id}))))
@@ -1412,7 +1466,7 @@ async fn list_accounts(
         .await
         .map_err(internal)?;
     let rows = sqlx::query_as::<_, AccountCard>(
-        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
+        "SELECT id, name, account_type, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
          FROM trading_accounts WHERE user_id = $1 ORDER BY created_at",
     )
     .bind(user.id)
@@ -1509,9 +1563,31 @@ async fn test_account(
     let account = load_account(&mut tx, user.id, id).await?;
     let secret = load_secret(&state.vault, &mut tx, user.id, id).await?;
     tx.commit().await.map_err(internal)?;
+    if crate::trading_account::is_paper_account(&account.account_type) {
+        return Ok(Json(json!({
+            "account_type": crate::trading_account::ACCOUNT_TYPE_PAPER,
+            "paper_account": true,
+            "wallet_checks_skipped": true,
+            "clob_reachable": false,
+            "balance_usd": Value::Null,
+            "error": Value::Null
+        })));
+    }
+    let signer = account
+        .signer_address
+        .as_deref()
+        .unwrap_or_default();
+    let funder = account
+        .funder_address
+        .as_deref()
+        .unwrap_or(signer);
+    let signature_type = account
+        .signature_type
+        .as_deref()
+        .unwrap_or("eoa");
     let mut report = json!({
-        "address_valid": is_eth_address(&account.signer_address),
-        "signature_type": account.signature_type,
+        "address_valid": is_eth_address(signer),
+        "signature_type": signature_type,
         "clob_reachable": clob_ok,
         "balance_usd": Value::Null,
         "error": Value::Null
@@ -1524,14 +1600,14 @@ async fn test_account(
         let probed = probe_account(
             &state.cfg.clob_host,
             key,
-            &account.signature_type,
-            Some(&account.funder_address),
+            signature_type,
+            Some(funder),
         )
         .await;
         report["balance_usd"] = serde_json::to_value(probed.balance_usd).unwrap_or(Value::Null);
         report["api_credentials_created"] = json!(probed.api_credentials_created);
         report["signer_matches"] = json!(
-            normalize_address(&probed.signer_address) == normalize_address(&account.signer_address)
+            normalize_address(&probed.signer_address) == normalize_address(signer)
         );
         if let Some(error) = &probed.error {
             report["error"] = json!(error);
@@ -1639,6 +1715,13 @@ async fn set_mode(
         .await
         .map_err(internal)?;
     let account = load_account(&mut tx, user.id, id).await?;
+    if body.mode == "live_trading"
+        && crate::trading_account::is_paper_account(&account.account_type)
+    {
+        return Err(bad(
+            crate::trading_account::PAPER_ACCOUNT_NO_LIVE_CODE,
+        ));
+    }
     if body.mode == "live_trading" {
         if body.confirm_live != Some(true)
             || body.confirmation.as_deref() != Some("ENABLE LIVE TRADING")
@@ -1792,22 +1875,32 @@ async fn rotate_credentials(
         .await
         .map_err(internal)?;
     let account = load_account(&mut tx, user.id, id).await?;
-    let signature_type = if body.signature_type.is_empty() {
-        account.signature_type.as_str()
+    if crate::trading_account::is_paper_account(&account.account_type) {
+        return Err(bad("paper trading accounts have no wallet credentials"));
+    }
+    let signature_type = if let Some(ref st) = body.signature_type {
+        validate_signature(st)?;
+        st.as_str()
     } else {
-        validate_signature(&body.signature_type)?;
-        body.signature_type.as_str()
+        account
+            .signature_type
+            .as_deref()
+            .ok_or_else(|| bad("signature_type is required"))?
     };
-    let signer = if body.signer_address.is_empty() {
-        account.signer_address.clone()
+    let signer = if let Some(ref addr) = body.signer_address {
+        normalize_address(addr)
     } else {
-        normalize_address(&body.signer_address)
+        account
+            .signer_address
+            .clone()
+            .ok_or_else(|| bad("signer address is required"))?
     };
     let funder = body
         .funder_address
         .as_ref()
         .map(|v| normalize_address(v))
-        .unwrap_or_else(|| normalize_address(&account.funder_address));
+        .or_else(|| account.funder_address.clone().map(|v| normalize_address(&v)))
+        .ok_or_else(|| bad("funder address is required"))?;
     crate::polymarket::credentials::verify_key_signer_configuration(
         signature_type,
         &derived,
@@ -1819,13 +1912,14 @@ async fn rotate_credentials(
     store_key(&state.vault, &mut tx, user.id, id, &key)
         .await
         .map_err(internal)?;
-    if !body.signer_address.is_empty() {
-        sqlx::query("UPDATE trading_accounts SET signer_address = $3, funder_address = COALESCE($4, funder_address), signature_type = $5, updated_at = now() WHERE id = $1 AND user_id = $2")
+    if body.signer_address.is_some() || body.funder_address.is_some() || body.signature_type.is_some()
+    {
+        sqlx::query("UPDATE trading_accounts SET signer_address = COALESCE($3, signer_address), funder_address = COALESCE($4, funder_address), signature_type = COALESCE($5, signature_type), updated_at = now() WHERE id = $1 AND user_id = $2")
             .bind(id)
             .bind(user.id)
-            .bind(normalize_address(&body.signer_address))
-            .bind(body.funder_address.map(|v| normalize_address(&v)))
-            .bind(&body.signature_type)
+            .bind(body.signer_address.as_ref().map(|v| normalize_address(v)))
+            .bind(body.funder_address.as_ref().map(|v| normalize_address(v)))
+            .bind(body.signature_type.as_deref())
             .execute(&mut *tx)
             .await
             .map_err(internal)?;
@@ -4133,7 +4227,7 @@ async fn load_account(
     id: Uuid,
 ) -> Result<AccountCard, ApiError> {
     sqlx::query_as::<_, AccountCard>(
-        "SELECT id, name, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
+        "SELECT id, name, account_type, signer_address, funder_address, signature_type, operating_mode, status, emergency_stop, trading_control_state, last_exchange_balance_usd, last_balance_checked_at, last_connection_error
          FROM trading_accounts WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
@@ -4229,9 +4323,10 @@ struct SystemEventRow {
 struct AccountCard {
     id: Uuid,
     name: String,
-    signer_address: String,
-    funder_address: String,
-    signature_type: String,
+    account_type: String,
+    signer_address: Option<String>,
+    funder_address: Option<String>,
+    signature_type: Option<String>,
     operating_mode: String,
     status: String,
     emergency_stop: bool,
