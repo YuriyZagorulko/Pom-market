@@ -186,6 +186,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/admin/users/{id}/suspend", post(admin_suspend))
         .route("/api/v1/admin/users/{id}/activate", post(admin_activate))
         .route("/api/v1/admin/users/{id}/invite", post(admin_invite))
+        .route(
+            "/api/v1/admin/users/{id}/password",
+            post(admin_set_user_password),
+        )
         .route("/api/v1/admin/health", get(admin_health))
         .route("/api/v1/admin/events", get(admin_events))
         .route("/api/v1/admin/settings", get(admin_settings))
@@ -1010,20 +1014,30 @@ async fn admin_create_user(
     ))
 }
 
+#[derive(Deserialize)]
+struct AdminUsersQuery {
+    q: Option<String>,
+}
+
 async fn admin_users(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<AdminUsersQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let admin = require_user(&state, &headers, Some("admin"))?;
     let mut tx = begin_as(&state.pool, Some(admin.id), "admin")
         .await
         .map_err(internal)?;
+    let search = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let rows = sqlx::query_as::<_, UserList>(
-        "SELECT u.id, u.email, u.display_name, u.role, u.status, u.created_at, u.last_login_at,
+        "SELECT u.id, u.email, u.display_name, u.role, u.status, u.created_at, u.updated_at, u.last_login_at,
                 (SELECT COUNT(*) FROM trading_accounts a WHERE a.user_id = u.id) AS accounts,
                 (SELECT COUNT(*) FROM source_traders t WHERE t.user_id = u.id) AS traders
-         FROM users u ORDER BY u.created_at DESC",
+         FROM users u
+         WHERE ($1::text IS NULL OR u.email ILIKE '%' || $1 || '%' OR u.display_name ILIKE '%' || $1 || '%' OR u.id::text ILIKE '%' || $1 || '%')
+         ORDER BY u.created_at DESC",
     )
+    .bind(search)
     .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
@@ -1040,7 +1054,7 @@ async fn admin_user(
         .await
         .map_err(internal)?;
     let row = sqlx::query_as::<_, UserList>(
-        "SELECT u.id, u.email, u.display_name, u.role, u.status, u.created_at, u.last_login_at,
+        "SELECT u.id, u.email, u.display_name, u.role, u.status, u.created_at, u.updated_at, u.last_login_at,
                 (SELECT COUNT(*) FROM trading_accounts a WHERE a.user_id = u.id) AS accounts,
                 (SELECT COUNT(*) FROM source_traders t WHERE t.user_id = u.id) AS traders
          FROM users u WHERE u.id = $1",
@@ -1056,6 +1070,7 @@ async fn admin_user(
 #[derive(Deserialize)]
 struct UpdateUser {
     display_name: Option<String>,
+    email: Option<String>,
     role: Option<String>,
 }
 
@@ -1071,19 +1086,119 @@ async fn admin_update_user(
             return Err(bad("role must be user or admin"));
         }
     }
+    let display_name = body
+        .display_name
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    if body.display_name.is_some() && display_name.is_none() {
+        return Err(bad("display_name cannot be empty"));
+    }
+    let email = body
+        .email
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if body.email.is_some() && email.is_none() {
+        return Err(bad("email cannot be empty"));
+    }
+    if let Some(ref email) = email {
+        if !email.contains('@') || email.len() < 3 {
+            return Err(bad("email is invalid"));
+        }
+    }
     let mut tx = begin_as(&state.pool, Some(admin.id), "admin")
         .await
         .map_err(internal)?;
-    sqlx::query(
-        "UPDATE users SET display_name = COALESCE($2, display_name), role = COALESCE($3, role), updated_at = now() WHERE id = $1",
+    let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+    if exists.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "user not found".into()));
+    }
+    if let Some(ref email) = email {
+        let taken: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE lower(email) = lower($1) AND id <> $2",
+        )
+        .bind(email)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if taken.is_some() {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "email is already in use".into(),
+            ));
+        }
+    }
+    let updated = sqlx::query(
+        "UPDATE users SET display_name = COALESCE($2, display_name), email = COALESCE($3, email), role = COALESCE($4, role), updated_at = now() WHERE id = $1",
     )
     .bind(id)
-    .bind(body.display_name)
-    .bind(body.role)
+    .bind(display_name)
+    .bind(email.as_deref())
+    .bind(body.role.as_deref())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => ApiError(
+            StatusCode::CONFLICT,
+            "email is already in use".into(),
+        ),
+        _ => internal(e),
+    })?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError(StatusCode::NOT_FOUND, "user not found".into()));
+    }
+    audit(&mut tx, Some(admin.id), "user_updated", &id.to_string()).await;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct AdminSetPassword {
+    new_password: String,
+}
+
+async fn admin_set_user_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AdminSetPassword>,
+) -> Result<impl IntoResponse, ApiError> {
+    let admin = require_user(&state, &headers, Some("admin"))?;
+    let new_hash = hash_password(body.new_password.trim()).map_err(|e| bad(e.to_string()))?;
+    let mut tx = begin_as(&state.pool, Some(admin.id), "admin")
+        .await
+        .map_err(internal)?;
+    let updated = sqlx::query(
+        "UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(new_hash)
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
-    audit(&mut tx, Some(admin.id), "user_updated", &id.to_string()).await;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError(StatusCode::NOT_FOUND, "user not found".into()));
+    }
+    sqlx::query(
+        "UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+    audit(
+        &mut tx,
+        Some(admin.id),
+        "user_password_set_by_admin",
+        &id.to_string(),
+    )
+    .await;
     tx.commit().await.map_err(internal)?;
     Ok(Json(json!({"ok": true})))
 }
@@ -4298,6 +4413,7 @@ struct UserList {
     role: String,
     status: String,
     created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
     last_login_at: Option<chrono::DateTime<Utc>>,
     accounts: i64,
     traders: i64,
