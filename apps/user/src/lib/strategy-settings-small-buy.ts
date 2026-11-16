@@ -1,7 +1,31 @@
 import { formatNumericInputDisplay } from "@pom/format";
 
 export const SMALL_BUY_OVERRIDE_DESCRIPTION =
-  "BUY trades below the threshold use source trade notional × trade multiplier instead of normal sizing.";
+  "BUY trades at or below the threshold use source trade notional × trade multiplier instead of normal sizing.";
+
+/** How trade multiplier is chosen for Small BUY Override per sizing mode (matches backend). */
+export function smallBuyOverrideMultiplierHint(sizingMode: string): string {
+  switch (sizingMode) {
+    case "proportional":
+      return "Small BUY Override uses your Trade multiplier (Copy %). Example: leader BUY $4, threshold $5, multiplier 50% → follower target $2.";
+    case "position_value_ratio":
+      return "Small BUY Override uses your PVR trade multiplier (1× if not set). Example: threshold $5, multiplier 0.5, leader BUY $4 → follower target $2.";
+    case "fixed_amount":
+      return "For small BUY trades, Fixed Amount sizing is bypassed. The source trade notional is copied at 1×, subject to strategy limits.";
+    case "portfolio_ratio":
+      return "For small BUY trades, Portfolio Ratio sizing is bypassed. The source trade notional is copied at 1×, subject to strategy limits.";
+    default:
+      return "";
+  }
+}
+
+/** Shown under Fixed / legacy Portfolio sizing (override is not configurable in UI for these modes). */
+export function smallBuyNoteForNonConfigurableModes(sizingMode: string): string | null {
+  if (sizingMode === "fixed_amount" || sizingMode === "portfolio_ratio") {
+    return smallBuyOverrideMultiplierHint(sizingMode);
+  }
+  return null;
+}
 
 export function formatSmallBuyThresholdFromApi(value: unknown): string {
   if (value == null || value === "") return "";

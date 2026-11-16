@@ -175,13 +175,43 @@ pub fn decision_reason_explain(code: &str) -> Option<(&'static str, &'static str
     })
 }
 
-fn small_buy_1to1_applies(input: &SizingInput) -> bool {
-    input.mode == SizingMode::PositionValueRatio
-        && input.copy_small_buys_1to1
-        && input
-            .small_buy_threshold_usd
+/// Small BUY Override: leader notional at or below threshold uses `source × trade_multiplier` only.
+pub fn small_buy_override_applies(
+    copy_small_buys_1to1: bool,
+    small_buy_threshold_usd: Option<Decimal>,
+    source_notional: Decimal,
+) -> bool {
+    copy_small_buys_1to1
+        && small_buy_threshold_usd
             .filter(|t| *t > Decimal::ZERO)
-            .is_some_and(|t| input.source_notional < t)
+            .is_some_and(|t| source_notional <= t)
+}
+
+pub fn small_buy_trade_multiplier(input: &SizingInput) -> Decimal {
+    match input.mode {
+        SizingMode::PositionValueRatio | SizingMode::FixedAmount => input
+            .multiplier
+            .filter(|m| *m > Decimal::ZERO)
+            .unwrap_or(Decimal::ONE),
+        SizingMode::Proportional => input
+            .proportion
+            .or(input.multiplier)
+            .filter(|c| *c > Decimal::ZERO)
+            .unwrap_or(Decimal::ONE),
+        SizingMode::Multiplier => input
+            .multiplier
+            .filter(|m| *m > Decimal::ZERO)
+            .unwrap_or(Decimal::ONE),
+        SizingMode::PortfolioRatio => Decimal::ONE,
+    }
+}
+
+fn small_buy_1to1_applies(input: &SizingInput) -> bool {
+    small_buy_override_applies(
+        input.copy_small_buys_1to1,
+        input.small_buy_threshold_usd,
+        input.source_notional,
+    )
 }
 
 fn position_value_ratio_raw(input: &SizingInput) -> Result<Decimal, RejectReason> {
@@ -202,41 +232,32 @@ fn position_value_ratio_raw(input: &SizingInput) -> Result<Decimal, RejectReason
 }
 
 pub fn target_notional(input: &SizingInput) -> Result<Decimal, RejectReason> {
-    let raw = match input.mode {
-        SizingMode::FixedAmount => input.fixed_amount_usd.ok_or(RejectReason::MissingSizing)?,
-        SizingMode::Proportional => {
-            input.source_notional * input.proportion.ok_or(RejectReason::MissingSizing)?
-        }
-        SizingMode::Multiplier => {
-            input.source_notional * input.multiplier.ok_or(RejectReason::MissingSizing)?
-        }
-        SizingMode::PortfolioRatio => {
-            let equity = input
-                .source_trader_equity_usd
-                .filter(|v| *v > Decimal::ZERO)
-                .ok_or(RejectReason::SourceEquityUnavailable)?;
-            let alloc = input
-                .strategy_allocated_capital_usd
-                .filter(|v| *v > Decimal::ZERO)
-                .ok_or(RejectReason::MissingSizing)?;
-            if input.source_notional <= Decimal::ZERO {
-                return Err(RejectReason::BelowMinimum);
+    if input.source_notional <= Decimal::ZERO {
+        return Err(RejectReason::BelowMinimum);
+    }
+    let raw = if small_buy_1to1_applies(input) {
+        (input.source_notional * small_buy_trade_multiplier(input)).round_dp(8)
+    } else {
+        match input.mode {
+            SizingMode::FixedAmount => input.fixed_amount_usd.ok_or(RejectReason::MissingSizing)?,
+            SizingMode::Proportional => {
+                input.source_notional * input.proportion.ok_or(RejectReason::MissingSizing)?
             }
-            (input.source_notional * alloc / equity).round_dp(8)
-        }
-        SizingMode::PositionValueRatio => {
-            if input.source_notional <= Decimal::ZERO {
-                return Err(RejectReason::BelowMinimum);
+            SizingMode::Multiplier => {
+                input.source_notional * input.multiplier.ok_or(RejectReason::MissingSizing)?
             }
-            if small_buy_1to1_applies(input) {
-                let coeff = input
-                    .multiplier
-                    .filter(|m| *m > Decimal::ZERO)
-                    .unwrap_or(Decimal::ONE);
-                (input.source_notional * coeff).round_dp(8)
-            } else {
-                position_value_ratio_raw(input)?
+            SizingMode::PortfolioRatio => {
+                let equity = input
+                    .source_trader_equity_usd
+                    .filter(|v| *v > Decimal::ZERO)
+                    .ok_or(RejectReason::SourceEquityUnavailable)?;
+                let alloc = input
+                    .strategy_allocated_capital_usd
+                    .filter(|v| *v > Decimal::ZERO)
+                    .ok_or(RejectReason::MissingSizing)?;
+                (input.source_notional * alloc / equity).round_dp(8)
             }
+            SizingMode::PositionValueRatio => position_value_ratio_raw(input)?,
         }
     };
     if raw <= Decimal::ZERO {
@@ -1438,6 +1459,65 @@ mod tests {
         assert!(!fill.complete);
         assert!(walk_book(&book, true, d("0.40"), d("5"), None, true).is_err());
         assert_eq!(fill.fee_status, "unknown");
+    }
+
+    #[test]
+    fn exit_leader_fraction_of_follower_open_shares() {
+        let plan = plan_exit(d("60"), d("100"), d("50"), Decimal::ZERO, d("0.50"), d("1"), false)
+            .unwrap_shares();
+        assert_eq!(plan, d("30"));
+    }
+
+    #[test]
+    fn proportional_small_buy_override_target_notional() {
+        let input = SizingInput {
+            mode: SizingMode::Proportional,
+            fixed_amount_usd: None,
+            proportion: Some(d("1")),
+            multiplier: None,
+            source_notional: d("4"),
+            max_order_usd: d("10000"),
+            min_order_usd: d("1"),
+            strategy_remaining_usd: d("2000"),
+            available_balance_usd: d("10000"),
+            strategy_allocated_capital_usd: None,
+            source_trader_equity_usd: None,
+            source_open_positions_value_usd: None,
+            allow_subminimum_paper_trades: false,
+            copy_small_buys_1to1: true,
+            small_buy_threshold_usd: Some(d("5")),
+        };
+        assert_eq!(target_notional(&input).unwrap(), d("4"));
+        let input_high = SizingInput {
+            source_notional: d("10"),
+            proportion: Some(d("0.1")),
+            copy_small_buys_1to1: false,
+            small_buy_threshold_usd: None,
+            ..input
+        };
+        assert_eq!(target_notional(&input_high).unwrap(), d("1"));
+    }
+
+    #[test]
+    fn small_buy_at_threshold_uses_override() {
+        let input = SizingInput {
+            mode: SizingMode::Proportional,
+            fixed_amount_usd: None,
+            proportion: Some(d("1")),
+            multiplier: None,
+            source_notional: d("5"),
+            max_order_usd: d("10000"),
+            min_order_usd: d("1"),
+            strategy_remaining_usd: d("2000"),
+            available_balance_usd: d("10000"),
+            strategy_allocated_capital_usd: None,
+            source_trader_equity_usd: None,
+            source_open_positions_value_usd: None,
+            allow_subminimum_paper_trades: false,
+            copy_small_buys_1to1: true,
+            small_buy_threshold_usd: Some(d("5")),
+        };
+        assert_eq!(target_notional(&input).unwrap(), d("5"));
     }
 
     #[test]

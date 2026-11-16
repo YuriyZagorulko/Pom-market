@@ -6,13 +6,13 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::copy_sizing::{
-    cap_equal_copy_sell_notional, capped_copy_notional, raw_copy_notional, sizing_rule_label,
-    uses_equal_copy_sell_notional, BuyNotionalLimits, StrategyModeParams,
+    capped_copy_notional, raw_copy_notional, sizing_rule_label, BuyNotionalLimits,
+    StrategyModeParams,
 };
 use crate::db::begin_as;
 use crate::engine::{
     available_after_reserve, conservative_fee_price, limit_price, order_reserves, paper_clob_diagnostic,
-    paper_shares_from_notional, plan_equal_copy_exit, plan_exit, reconcile_live_status,
+    paper_shares_from_notional, plan_exit, reconcile_live_status,
     reserves_after_execution,
     simulate_copy_fill, slippage_bps,
     trace_buy_size, truncate_lot, walk_book, FeeSchedule, OrderBook, RejectReason,
@@ -516,11 +516,21 @@ async fn decide_one(
             }
         }
         let pvr_small_buy_skip_snapshot = strategy.sizing_mode == "position_value_ratio"
-            && strategy.copy_small_buys_1to1
-            && strategy
-                .small_buy_threshold_usd
-                .filter(|t| *t > Decimal::ZERO)
-                .is_some_and(|t| leader_notional < t);
+            && crate::copy_sizing::small_buy_1to1_applies(
+                &StrategyModeParams {
+                    sizing_mode: strategy.sizing_mode.clone(),
+                    fixed_amount_usd: strategy.fixed_amount_usd,
+                    proportion: strategy.proportion,
+                    multiplier: strategy.multiplier,
+                    strategy_allocated_capital_usd: effective_budget,
+                    source_trader_equity_usd: None,
+                    source_equity_status: None,
+                    source_open_positions_value_usd: None,
+                    copy_small_buys_1to1: strategy.copy_small_buys_1to1,
+                    small_buy_threshold_usd: strategy.small_buy_threshold_usd,
+                },
+                leader_notional,
+            );
         if reason.is_none()
             && strategy.sizing_mode == "position_value_ratio"
             && !pvr_small_buy_skip_snapshot
@@ -670,6 +680,24 @@ async fn decide_one(
                         && (trace.below_min_order_size
                             || target_shares * limit < EXCHANGE_MIN_NOTIONAL)
                     {
+                        let below_shares = trace.below_min_order_size;
+                        let below_usd = target_shares * limit < EXCHANGE_MIN_NOTIONAL;
+                        if let Some(audit) = sizing_audit.as_mut() {
+                            if let Some(obj) = audit.as_object_mut() {
+                                obj.extend(
+                                    crate::copy_sizing::buy_minimum_rejection_audit(
+                                        limit,
+                                        target_shares,
+                                        min_order_size,
+                                        below_shares,
+                                        below_usd,
+                                    )
+                                    .as_object()
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                );
+                            }
+                        }
                         reason = Some(if spend_cap < notional {
                             RejectReason::StrategyBudget
                         } else {
@@ -734,90 +762,53 @@ async fn decide_one(
         let pos = position.as_ref();
         let allow_subminimum = strategy.operating_mode == "paper_trading"
             && strategy.allow_subminimum_paper_trades;
-        if uses_equal_copy_sell_notional(&strategy.sizing_mode) {
-            let mode_params = StrategyModeParams {
-                sizing_mode: strategy.sizing_mode.clone(),
-                fixed_amount_usd: strategy.fixed_amount_usd,
-                proportion: strategy.proportion,
-                multiplier: strategy.multiplier,
-                strategy_allocated_capital_usd: effective_budget,
-                source_trader_equity_usd: None,
-                source_equity_status: None,
-                source_open_positions_value_usd: None,
-                copy_small_buys_1to1: false,
-                small_buy_threshold_usd: None,
-            };
-            let sizing_rule = sizing_rule_label(&mode_params, leader_notional);
-            match raw_copy_notional(&mode_params, leader_notional) {
-                Ok(raw) => match cap_equal_copy_sell_notional(
-                    raw,
-                    strategy.max_order_usd,
-                    strategy.min_order_usd,
-                    allow_subminimum,
-                ) {
-                    Ok(capped_notional) => {
-                        let plan = plan_equal_copy_exit(
-                            pos.map(|p| p.open_shares).unwrap_or(Decimal::ZERO),
-                            pos.map(|p| p.pending_exit_shares).unwrap_or(Decimal::ZERO),
-                            capped_notional,
-                            limit,
-                            strategy.min_order_usd,
-                            allow_subminimum,
-                        );
-                        if let Some(reject) = plan.reject {
-                            reason = Some(reject);
-                        } else {
-                            target_shares = truncate_lot(plan.shares);
-                            target_notional_usd = (target_shares * limit).round_dp(2);
-                            sizing_audit = Some(json!({
-                                "sizing_mode": strategy.sizing_mode,
-                                "sizing_rule": sizing_rule,
-                                "source_notional_usd": leader_notional,
-                                "proportion_coefficient": strategy.proportion.or(strategy.multiplier),
-                                "raw_target_notional_usd": raw,
-                                "capped_target_notional_usd": capped_notional,
-                                "cap_reason": if capped_notional + Decimal::new(1, 2) < raw {
-                                    Some("max_order_usd")
-                                } else {
-                                    None::<&str>
-                                },
-                            }));
-                        }
-                    }
-                    Err(err) => reason = Some(err),
-                },
-                Err(err) => reason = Some(err),
-            }
+        let open = pos.map(|p| p.open_shares).unwrap_or(Decimal::ZERO);
+        let observed = pos
+            .map(|p| p.source_observed_shares)
+            .unwrap_or(Decimal::ZERO);
+        let pending = pos.map(|p| p.pending_exit_shares).unwrap_or(Decimal::ZERO);
+        let plan = plan_exit(
+            open,
+            observed,
+            leader_shares,
+            pending,
+            limit,
+            strategy.min_order_usd,
+            allow_subminimum,
+        );
+        let sell_fraction = if observed > Decimal::ZERO {
+            (leader_shares / observed).min(Decimal::ONE).max(Decimal::ZERO)
         } else {
-            let plan = plan_exit(
-                pos.map(|p| p.open_shares).unwrap_or(Decimal::ZERO),
-                pos.map(|p| p.source_observed_shares)
-                    .unwrap_or(Decimal::ZERO),
-                leader_shares,
-                pos.map(|p| p.pending_exit_shares).unwrap_or(Decimal::ZERO),
-                limit,
-                strategy.min_order_usd,
-                allow_subminimum,
-            );
-            if let Some(reject) = plan.reject {
-                if let Some(pos) = pos {
-                    sqlx::query("UPDATE positions SET pending_exit_shares = $2, updated_at = now() WHERE id = $1")
-                        .bind(pos.id)
-                        .bind(plan.pending_exit_shares)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                reason = Some(reject);
-            } else {
-                target_shares = truncate_lot(plan.shares);
-                target_notional_usd = (target_shares * limit).round_dp(2);
-                if let Some(pos) = pos {
-                    sqlx::query("UPDATE positions SET pending_exit_shares = $2, updated_at = now() WHERE id = $1")
-                        .bind(pos.id)
-                        .bind(plan.pending_exit_shares)
-                        .execute(&mut *tx)
-                        .await?;
-                }
+            Decimal::ZERO
+        };
+        if let Some(reject) = plan.reject {
+            if let Some(pos) = pos {
+                sqlx::query("UPDATE positions SET pending_exit_shares = $2, updated_at = now() WHERE id = $1")
+                    .bind(pos.id)
+                    .bind(plan.pending_exit_shares)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            reason = Some(reject);
+        } else {
+            target_shares = truncate_lot(plan.shares);
+            target_notional_usd = (target_shares * limit).round_dp(2);
+            sizing_audit = Some(json!({
+                "sizing_mode": strategy.sizing_mode,
+                "sizing_rule": "share_fraction_exit",
+                "source_sold_shares": leader_shares.to_string(),
+                "source_observed_shares": observed.to_string(),
+                "follower_open_shares": open.to_string(),
+                "sell_fraction": sell_fraction.to_string(),
+                "planned_sell_shares": target_shares.to_string(),
+                "copy_limit_price": limit.to_string(),
+            }));
+            if let Some(pos) = pos {
+                sqlx::query("UPDATE positions SET pending_exit_shares = $2, updated_at = now() WHERE id = $1")
+                    .bind(pos.id)
+                    .bind(plan.pending_exit_shares)
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
     }

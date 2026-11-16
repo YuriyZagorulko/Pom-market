@@ -15,6 +15,8 @@ import { SimpleFieldLabel } from "@/components/simple-field-label";
 import { useToast } from "@/components/toast";
 import { BUDGET_PRESETS } from "@/lib/copy-sizing";
 import { useSession } from "@/lib/session";
+import { SmallBuyOverrideHelp } from "@/components/small-buy-override-help";
+import { smallBuyNoteForNonConfigurableModes } from "@/lib/strategy-settings-small-buy";
 
 type PreviewRow = {
   side: string;
@@ -423,9 +425,7 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
                   />
                 </div>
               )}
-              <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-                BUY trades below this threshold use source trade notional × trade multiplier instead of normal sizing.
-              </p>
+              <SmallBuyOverrideHelp sizingMode="position_value_ratio" showMultiplierHint={copySmallBuys1to1} />
             </div>
           </>
         )}
@@ -462,18 +462,27 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
                   />
                 </div>
               )}
-              <p className="muted" style={{ margin: 0, fontSize: 12 }}>
-                BUY trades below this threshold use source trade notional × trade multiplier instead of normal sizing.
-              </p>
+              <SmallBuyOverrideHelp sizingMode="proportional" showMultiplierHint={copySmallBuys1to1} />
             </div>
           </>
         )}
         {sizingMode === "fixed_amount" && (
-          <input
-            value={fixedAmountUsd}
-            onChange={(e) => setFixedAmountUsd(e.target.value)}
-            placeholder="Fixed amount USD per trade"
-          />
+          <>
+            <input
+              value={fixedAmountUsd}
+              onChange={(e) => setFixedAmountUsd(e.target.value)}
+              placeholder="Fixed amount USD per trade"
+            />
+            {smallBuyNoteForNonConfigurableModes("fixed_amount") && (
+              <p
+                className="muted"
+                data-testid="fixed-small-buy-note"
+                style={{ margin: "4px 0 0", fontSize: 12 }}
+              >
+                {smallBuyNoteForNonConfigurableModes("fixed_amount")}
+              </p>
+            )}
+          </>
         )}
         <h2 style={{ margin: "12px 0 0" }}>Risk limits</h2>
         <div className="form-field">

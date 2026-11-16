@@ -8,7 +8,10 @@
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::display_format::{fmt_coef, fmt_usd};
-use crate::engine::{target_notional, RejectReason, SizingInput, SizingMode, EXCHANGE_MIN_NOTIONAL};
+use crate::engine::{
+    small_buy_override_applies, small_buy_trade_multiplier, target_notional, RejectReason, SizingInput,
+    SizingMode, EXCHANGE_MIN_NOTIONAL,
+};
 use crate::source_equity::EquityStatus;
 
 #[derive(Clone, Debug)]
@@ -54,12 +57,64 @@ pub fn parse_small_buy_threshold(value: Option<Decimal>) -> Result<Option<Decima
 }
 
 pub fn small_buy_1to1_applies(params: &StrategyModeParams, source_notional: Decimal) -> bool {
-    params.sizing_mode == "position_value_ratio"
-        && params.copy_small_buys_1to1
-        && params
-            .small_buy_threshold_usd
-            .filter(|t| *t > Decimal::ZERO)
-            .is_some_and(|t| source_notional < t)
+    small_buy_override_applies(
+        params.copy_small_buys_1to1,
+        params.small_buy_threshold_usd,
+        source_notional,
+    )
+}
+
+fn small_buy_trade_multiplier_params(params: &StrategyModeParams) -> Decimal {
+    let mode = parse_mode(&params.sizing_mode);
+    let input = SizingInput {
+        mode,
+        fixed_amount_usd: params.fixed_amount_usd,
+        proportion: params.proportion,
+        multiplier: params.multiplier,
+        source_notional: Decimal::ONE,
+        max_order_usd: Decimal::ONE,
+        min_order_usd: Decimal::ZERO,
+        strategy_remaining_usd: Decimal::ONE,
+        available_balance_usd: Decimal::ONE,
+        strategy_allocated_capital_usd: None,
+        source_trader_equity_usd: None,
+        source_open_positions_value_usd: None,
+        allow_subminimum_paper_trades: false,
+        copy_small_buys_1to1: false,
+        small_buy_threshold_usd: None,
+    };
+    small_buy_trade_multiplier(&input)
+}
+
+/// Audit fields when a BUY is rejected due to market min shares or USD floor.
+pub fn buy_minimum_rejection_audit(
+    limit_price: Decimal,
+    computed_shares: Decimal,
+    market_min_shares: Decimal,
+    below_min_shares: bool,
+    below_min_notional: bool,
+) -> serde_json::Value {
+    let minimum_required_notional = if market_min_shares > Decimal::ZERO && limit_price > Decimal::ZERO
+    {
+        Some((market_min_shares * limit_price).round_dp(2))
+    } else {
+        None
+    };
+    let detail = if below_min_shares {
+        "below_market_min_shares"
+    } else if below_min_notional {
+        "below_exchange_min_notional"
+    } else {
+        "below_minimum"
+    };
+    serde_json::json!({
+        "below_minimum_detail": detail,
+        "copy_limit_price": limit_price,
+        "computed_shares": computed_shares.to_string(),
+        "market_min_order_size": market_min_shares.to_string(),
+        "minimum_required_notional": minimum_required_notional.map(|n| n.to_string()),
+        "exchange_min_notional_usd": EXCHANGE_MIN_NOTIONAL,
+    })
 }
 
 /// Trade multiplier for Equal Copy (`proportional`) and legacy `multiplier` sizing modes.
@@ -80,7 +135,7 @@ pub fn uses_equal_copy_sell_notional(sizing_mode: &str) -> bool {
 
 pub fn sizing_rule_label(params: &StrategyModeParams, source_notional: Decimal) -> &'static str {
     if small_buy_1to1_applies(params, source_notional) {
-        "pvr_small_buy_override"
+        "small_buy_override"
     } else {
         match parse_mode(&params.sizing_mode) {
             SizingMode::PositionValueRatio => "pvr",
@@ -124,6 +179,11 @@ pub fn raw_copy_notional(
     if params.strategy_allocated_capital_usd <= Decimal::ZERO {
         return Err(RejectReason::MissingSizing);
     }
+    if small_buy_1to1_applies(params, source_notional) {
+        return Ok(
+            (source_notional * small_buy_trade_multiplier_params(params)).round_dp(8),
+        );
+    }
     if mode == SizingMode::PortfolioRatio {
         let status = params
             .source_equity_status
@@ -138,9 +198,6 @@ pub fn raw_copy_notional(
         return Ok((source_notional * params.strategy_allocated_capital_usd / equity).round_dp(8));
     }
     if mode == SizingMode::PositionValueRatio {
-        if small_buy_1to1_applies(params, source_notional) {
-            return Ok((source_notional * pvr_trade_multiplier(params.multiplier)).round_dp(8));
-        }
         let positions = match params.source_open_positions_value_usd {
             None => return Err(RejectReason::SourcePositionValueUnavailable),
             Some(v) if v <= Decimal::ZERO => return Err(RejectReason::SourcePositionValueZero),
@@ -271,7 +328,7 @@ pub fn explain_sizing_audit(audit: &serde_json::Value) -> Option<String> {
     let sizing_rule = audit.get("sizing_rule").and_then(|v| v.as_str());
     let small_buy_rule = matches!(
         sizing_rule,
-        Some("pvr_small_buy_override") | Some("small_buy_1to1")
+        Some("small_buy_override") | Some("pvr_small_buy_override") | Some("small_buy_1to1")
     );
     if small_buy_rule {
         let thresh = audit
@@ -343,20 +400,6 @@ pub fn explain_sizing_audit(audit: &serde_json::Value) -> Option<String> {
                 fmt_coef(coef),
                 fmt_usd(raw_disp),
             );
-            if audit.get("copy_small_buys_1to1").and_then(|v| v.as_bool()) == Some(true) {
-                if let Some(thresh) = audit
-                    .get("small_buy_threshold_usd")
-                    .and_then(json_decimal)
-                    .filter(|t| *t > Decimal::ZERO)
-                {
-                    if source < thresh {
-                        line.push_str(&format!(
-                            " Leader BUY below {} threshold; Equal Copy sizing unchanged.",
-                            fmt_usd(thresh),
-                        ));
-                    }
-                }
-            }
             lines.push(line);
         }
         "fixed_amount" => {
@@ -762,21 +805,19 @@ mod tests {
     }
 
     #[test]
-    fn explain_equal_copy_below_threshold_note_only() {
+    fn explain_proportional_small_buy_override() {
         let audit = serde_json::json!({
             "sizing_mode": "proportional",
-            "sizing_rule": "equal_copy",
+            "sizing_rule": "small_buy_override",
             "source_notional_usd": "4",
-            "proportion_coefficient": "0.5",
-            "copy_small_buys_1to1": true,
+            "proportion_coefficient": "0.1",
             "small_buy_threshold_usd": "5",
-            "raw_target_notional_usd": "2",
+            "pvr_trade_multiplier": "1",
+            "raw_target_notional_usd": "4",
         });
         let s = explain_sizing_audit(&audit).unwrap();
-        assert!(s.contains("Equal Copy"));
-        assert!(s.contains("below"));
-        assert!(s.contains("unchanged"));
-        assert!(!s.contains("Small BUY Override"));
+        assert!(s.contains("Small BUY Override"));
+        assert!(s.contains("4"));
     }
 
     #[test]
@@ -852,7 +893,7 @@ mod tests {
         let on = pvr_params(true, Some("5"));
         assert_eq!(raw_copy_notional(&on, d("3")).unwrap(), d("3"));
         assert_eq!(raw_copy_notional(&on, d("4.99")).unwrap(), d("4.99"));
-        assert_eq!(raw_copy_notional(&on, d("5")).unwrap(), d("2.5"));
+        assert_eq!(raw_copy_notional(&on, d("5")).unwrap(), d("5"));
         assert_eq!(raw_copy_notional(&on, d("10")).unwrap(), d("5"));
         let mut on_half = pvr_params(true, Some("5"));
         on_half.multiplier = Some(d("0.5"));
@@ -865,11 +906,11 @@ mod tests {
     }
 
     #[test]
-    fn small_buy_ignored_for_proportional_and_fixed() {
+    fn small_buy_applies_for_proportional_not_fixed_above_threshold() {
         let mut prop = StrategyModeParams {
             sizing_mode: "proportional".into(),
             fixed_amount_usd: None,
-            proportion: Some(d("0.5")),
+            proportion: Some(d("0.1")),
             multiplier: None,
             strategy_allocated_capital_usd: d("2000"),
             source_trader_equity_usd: None,
@@ -878,10 +919,15 @@ mod tests {
             copy_small_buys_1to1: true,
             small_buy_threshold_usd: Some(d("5")),
         };
-        assert_eq!(raw_copy_notional(&prop, d("3")).unwrap(), d("1.5"));
+        assert_eq!(raw_copy_notional(&prop, d("4")).unwrap(), d("0.4"));
+        assert_eq!(
+            sizing_rule_label(&prop, d("4")),
+            "small_buy_override"
+        );
+        assert_eq!(raw_copy_notional(&prop, d("6")).unwrap(), d("0.6"));
         prop.copy_small_buys_1to1 = false;
-        assert_eq!(raw_copy_notional(&prop, d("3")).unwrap(), d("1.5"));
-        assert!(!small_buy_1to1_applies(&prop, d("3")));
+        assert_eq!(raw_copy_notional(&prop, d("4")).unwrap(), d("0.4"));
+        assert!(!small_buy_1to1_applies(&prop, d("4")));
         let fixed = StrategyModeParams {
             sizing_mode: "fixed_amount".into(),
             fixed_amount_usd: Some(d("25")),
@@ -894,7 +940,8 @@ mod tests {
             copy_small_buys_1to1: true,
             small_buy_threshold_usd: Some(d("5")),
         };
-        assert_eq!(raw_copy_notional(&fixed, d("3")).unwrap(), d("25"));
+        assert_eq!(raw_copy_notional(&fixed, d("3")).unwrap(), d("3"));
+        assert_eq!(raw_copy_notional(&fixed, d("6")).unwrap(), d("25"));
     }
 
     #[test]
@@ -925,7 +972,7 @@ mod tests {
     fn explain_small_buy_1to1_audit() {
         let audit = serde_json::json!({
             "sizing_mode": "position_value_ratio",
-            "sizing_rule": "pvr_small_buy_override",
+            "sizing_rule": "small_buy_override",
             "source_notional_usd": "4.50",
             "small_buy_threshold_usd": "5",
             "pvr_trade_multiplier": "0.5",
@@ -977,11 +1024,40 @@ mod tests {
     }
 
     #[test]
-    fn small_buy_strict_threshold_boundary() {
+    fn small_buy_threshold_boundary_inclusive() {
         let on = pvr_params(true, Some("5"));
-        assert!(!small_buy_1to1_applies(&on, d("5")));
-        assert!(small_buy_1to1_applies(&on, d("4.99999999")));
-        assert!(!small_buy_1to1_applies(&on, d("5.00000001")));
+        assert!(small_buy_1to1_applies(&on, d("5")));
+        assert!(small_buy_1to1_applies(&on, d("4.99")));
+        assert!(!small_buy_1to1_applies(&on, d("5.01")));
+        assert_eq!(raw_copy_notional(&on, d("5.01")).unwrap(), d("2.505"));
+    }
+
+    #[test]
+    fn small_buy_threshold_matrix_all_modes() {
+        let prop = StrategyModeParams {
+            sizing_mode: "proportional".into(),
+            fixed_amount_usd: None,
+            proportion: Some(d("0.5")),
+            multiplier: None,
+            strategy_allocated_capital_usd: d("2000"),
+            source_trader_equity_usd: None,
+            source_equity_status: None,
+            source_open_positions_value_usd: None,
+            copy_small_buys_1to1: true,
+            small_buy_threshold_usd: Some(d("5")),
+        };
+        assert_eq!(raw_copy_notional(&prop, d("4.99")).unwrap(), d("2.495"));
+        assert!(!small_buy_1to1_applies(&prop, d("5.01")));
+        let pvr = pvr_params(true, Some("5"));
+        assert!(small_buy_1to1_applies(&pvr, d("5")));
+        assert!(!small_buy_1to1_applies(&pvr, d("5.01")));
+    }
+
+    #[test]
+    fn buy_minimum_rejection_audit_shape() {
+        let v = buy_minimum_rejection_audit(d("0.63"), d("2.38"), d("5"), true, false);
+        assert_eq!(v["below_minimum_detail"], "below_market_min_shares");
+        assert_eq!(v["minimum_required_notional"], "3.15");
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub fn is_user_sizing_mode(mode: &str) -> bool {
     USER_SIZING_MODES.contains(&mode)
 }
 
-/// Modes where Small BUY Override can be stored (PVR applies it; Equal Copy stores prefs only).
+/// Modes where Small BUY Override can be stored in API/DB (sizing applies it for all stored modes).
 pub fn supports_small_buy_override_storage(mode: &str) -> bool {
     mode == "position_value_ratio" || mode == "proportional"
 }

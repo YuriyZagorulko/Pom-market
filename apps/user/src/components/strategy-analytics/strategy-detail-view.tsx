@@ -39,10 +39,11 @@ import {
 import {
   formatSmallBuyThresholdFromApi,
   showSmallBuyOverrideSettings,
-  SMALL_BUY_OVERRIDE_DESCRIPTION,
   smallBuyFieldsForPatch,
+  smallBuyNoteForNonConfigurableModes,
   validateSmallBuyBeforeSave,
 } from "@/lib/strategy-settings-small-buy";
+import { SmallBuyOverrideHelp } from "@/components/small-buy-override-help";
 
 type Tab = "overview" | "positions" | "activity" | "performance" | "settings";
 
@@ -733,7 +734,17 @@ export function StrategySettingsForm({
               name="fixed_amount_usd"
               defaultValue={data.fixed_amount_usd as string | number | null | undefined}
             />
+            {smallBuyNoteForNonConfigurableModes("fixed_amount") && (
+              <p className="muted" data-testid="fixed-small-buy-note" style={{ margin: "4px 0 0", fontSize: 12 }}>
+                {smallBuyNoteForNonConfigurableModes("fixed_amount")}
+              </p>
+            )}
           </div>
+        )}
+        {sizingMode === "portfolio_ratio" && smallBuyNoteForNonConfigurableModes("portfolio_ratio") && (
+          <p className="muted" data-testid="portfolio-small-buy-note" style={{ margin: 0, fontSize: 12 }}>
+            {smallBuyNoteForNonConfigurableModes("portfolio_ratio")}
+          </p>
         )}
         {sizingMode === "proportional" && (
           <div className="form-field">
@@ -759,13 +770,9 @@ export function StrategySettingsForm({
                 checked={copySmallBuys1to1}
                 onChange={(e) => setCopySmallBuys1to1(e.target.checked)}
               />
-              <span>
-                Enable Small BUY Override
-                <span className="muted" style={{ display: "block", fontSize: 12, marginTop: 4 }}>
-                  {SMALL_BUY_OVERRIDE_DESCRIPTION}
-                </span>
-              </span>
+              <span>Enable Small BUY Override</span>
             </label>
+            <SmallBuyOverrideHelp sizingMode={sizingMode} showMultiplierHint={copySmallBuys1to1} />
             {copySmallBuys1to1 && (
               <div>
                 <SimpleFieldLabel htmlFor="small_buy_threshold_usd">Small BUY threshold (USD)</SimpleFieldLabel>
@@ -778,11 +785,6 @@ export function StrategySettingsForm({
                   onChange={(e) => setSmallBuyThresholdUsd(e.target.value)}
                   placeholder="5.00"
                 />
-                {sizingMode === "position_value_ratio" && (
-                  <p className="muted" style={{ margin: "4px 0 0", fontSize: 12 }}>
-                    Example: threshold $5, multiplier 0.5, leader BUY $4 → target $2.
-                  </p>
-                )}
               </div>
             )}
           </div>

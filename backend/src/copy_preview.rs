@@ -7,10 +7,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::copy_sizing::{
-    cap_equal_copy_sell_notional, capped_copy_notional, raw_copy_notional, source_trade_percent,
-    uses_equal_copy_sell_notional, BuyNotionalLimits, StrategyModeParams,
+    capped_copy_notional, raw_copy_notional, source_trade_percent, BuyNotionalLimits,
+    StrategyModeParams,
 };
-use crate::engine::{plan_equal_copy_exit, plan_exit, truncate_lot, RejectReason, SizingMode, EXCHANGE_MIN_NOTIONAL};
+use crate::engine::{plan_exit, truncate_lot, RejectReason, SizingMode, EXCHANGE_MIN_NOTIONAL};
 use crate::source_equity::EquityStatus;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -272,65 +272,16 @@ pub fn simulate_copy_preview(
         } else {
             let lot = lots.get(&event.token_id);
             let allow_submin = params.paper_trading && params.allow_subminimum_paper_trades;
-            let plan = if uses_equal_copy_sell_notional(&params.sizing_mode) {
-                let mode_params = StrategyModeParams {
-                    sizing_mode: params.sizing_mode.clone(),
-                    fixed_amount_usd: params.fixed_amount_usd,
-                    proportion: params.proportion,
-                    multiplier: params.multiplier,
-                    strategy_allocated_capital_usd: params.effective_allocation_cap_usd,
-                    source_trader_equity_usd: None,
-                    source_equity_status: None,
-                    source_open_positions_value_usd: None,
-                    copy_small_buys_1to1: false,
-                    small_buy_threshold_usd: None,
-                };
-                match raw_copy_notional(&mode_params, event.notional_usd) {
-                    Ok(raw) => match cap_equal_copy_sell_notional(
-                        raw,
-                        params.max_order_usd,
-                        params.min_order_usd,
-                        allow_submin,
-                    ) {
-                        Ok(capped) => {
-                            raw_copy = Some(raw);
-                            plan_equal_copy_exit(
-                                lot.map(|l| l.open_shares).unwrap_or(Decimal::ZERO),
-                                lot.map(|l| l.pending_exit_shares).unwrap_or(Decimal::ZERO),
-                                capped,
-                                event.price,
-                                params.min_order_usd,
-                                allow_submin,
-                            )
-                        }
-                        Err(reject) => crate::engine::ExitPlan {
-                            shares: Decimal::ZERO,
-                            pending_exit_shares: lot
-                                .map(|l| l.pending_exit_shares)
-                                .unwrap_or(Decimal::ZERO),
-                            reject: Some(reject),
-                        },
-                    },
-                    Err(reject) => crate::engine::ExitPlan {
-                        shares: Decimal::ZERO,
-                        pending_exit_shares: lot
-                            .map(|l| l.pending_exit_shares)
-                            .unwrap_or(Decimal::ZERO),
-                        reject: Some(reject),
-                    },
-                }
-            } else {
-                plan_exit(
-                    lot.map(|l| l.open_shares).unwrap_or(Decimal::ZERO),
-                    lot.map(|l| l.source_observed_shares)
-                        .unwrap_or(Decimal::ZERO),
-                    event.size_shares,
-                    lot.map(|l| l.pending_exit_shares).unwrap_or(Decimal::ZERO),
-                    event.price,
-                    params.min_order_usd,
-                    allow_submin,
-                )
-            };
+            let plan = plan_exit(
+                lot.map(|l| l.open_shares).unwrap_or(Decimal::ZERO),
+                lot.map(|l| l.source_observed_shares)
+                    .unwrap_or(Decimal::ZERO),
+                event.size_shares,
+                lot.map(|l| l.pending_exit_shares).unwrap_or(Decimal::ZERO),
+                event.price,
+                params.min_order_usd,
+                allow_submin,
+            );
             if let Some(reject) = plan.reject {
                 if let Some(lot) = lots.get_mut(&event.token_id) {
                     lot.pending_exit_shares = plan.pending_exit_shares;
