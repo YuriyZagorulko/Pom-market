@@ -295,8 +295,11 @@ function Detail({ id }: { id: string }) {
           <NumericInput id="max_daily_loss_usd" name="max_daily_loss_usd" defaultValue={riskDefaults.max_daily_loss_usd} />
         </div>
         <div className="form-field">
-          <SimpleFieldLabel htmlFor="max_slippage_bps">Max slippage (basis points)</SimpleFieldLabel>
-          <NumericInput id="max_slippage_bps" name="max_slippage_bps" defaultValue={riskDefaults.max_slippage_bps} inputMode="numeric" />
+          <SimpleFieldLabel htmlFor="max_slippage_bps">Max slippage</SimpleFieldLabel>
+          <NumericInput id="max_slippage_bps" name="max_slippage_bps" defaultValue={riskDefaults.max_slippage_bps} inputMode="decimal" />
+          <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+            Maximum allowed price deviation from the leader&apos;s execution price. Enter percent (1.5 = 1.5%).
+          </p>
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="paper_cash_usd">Total paper funding (USD)</SimpleFieldLabel>

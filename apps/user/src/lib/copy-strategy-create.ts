@@ -1,4 +1,5 @@
 import { type UserSizingMode } from "@/lib/sizing-mode";
+import { parseMaxSlippagePercentToBps } from "./max-slippage";
 
 export type { UserSizingMode as SizingMode };
 export type AllocationMode = "fixed_usd" | "percent_of_account";
@@ -95,7 +96,10 @@ export function buildCopyStrategyCreateBody(input: CopyStrategyCreateInput): Rec
     strategy_budget_usd: budget,
     max_position_usd: num(input.maxPositionUsd),
     max_open_positions: intField(input.maxOpenPositions),
-    max_slippage_bps: intField(input.maxSlippageBps),
+    max_slippage_bps: (() => {
+      const p = parseMaxSlippagePercentToBps(input.maxSlippageBps);
+      return p.ok ? p.bps : 150;
+    })(),
     min_order_usd: num(input.minOrderUsd),
     cooldown_seconds: intField(input.cooldownSeconds),
     copy_buy: input.copyBuy,

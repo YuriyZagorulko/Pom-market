@@ -22,6 +22,7 @@ use crate::polymarket::live::{place_fak, LiveOrderRequest};
 use crate::polymarket::RawTrade;
 use crate::security::{credential_aad, redact, Vault};
 use crate::strategy_budget::strategy_exposure_with_cap;
+use crate::liquidity_retry::{initial_retry_blob, merge_retry_checks};
 use crate::trading_control;
 use secrecy::SecretString;
 
@@ -866,8 +867,17 @@ async fn decide_one(
     }
 
     let approved = reason.is_none();
+    let paper_mode = strategy.operating_mode == "paper_trading";
+    let allow_subminimum = paper_mode && strategy.allow_subminimum_paper_trades;
+    let awaiting_liquidity = !approved
+        && side_buy
+        && reason.as_ref().is_some_and(|r| {
+            RejectReason::liquidity_retry_eligible(r, side_buy, paper_mode, allow_subminimum)
+        });
     let status = if approved {
         "approved"
+    } else if awaiting_liquidity {
+        "awaiting_liquidity"
     } else if matches!(
         reason,
         Some(RejectReason::MonitoringMode) | Some(RejectReason::StrategyDisabled)
@@ -942,6 +952,11 @@ async fn decide_one(
         if let Some(stale) = stale_eval {
             checks["stale_data_audit"] = json!(stale);
         }
+        if awaiting_liquidity {
+            if let Some(r) = reason.as_ref() {
+                merge_retry_checks(&mut checks, initial_retry_blob(r));
+            }
+        }
         checks
     })
     .bind(event.received_at)
@@ -970,6 +985,40 @@ async fn decide_one(
         return Ok(decision_id);
     }
 
+    fulfill_approved_decision_in_tx(
+        pool,
+        vault,
+        cfg,
+        strategy,
+        event,
+        tx,
+        decision_id,
+        side_buy,
+        limit,
+        fee,
+        fee_price,
+        kill,
+        sim.expect("approved simulation"),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fulfill_approved_decision_in_tx(
+    pool: &PgPool,
+    vault: &Vault,
+    cfg: &PipelineConfig,
+    strategy: &StrategyRow,
+    event: &EventRow,
+    mut tx: crate::db::Tx<'_>,
+    decision_id: Uuid,
+    side_buy: bool,
+    limit: Decimal,
+    fee: Option<&FeeSchedule>,
+    fee_price: Decimal,
+    kill: bool,
+    sim_result: crate::engine::CopyFillSim,
+) -> anyhow::Result<Uuid> {
     let (acct_ctl, strat_ctl): (String, String) = sqlx::query_as(
         "SELECT a.trading_control_state, s.trading_control_state
          FROM copy_strategies s
@@ -1007,7 +1056,6 @@ async fn decide_one(
         return Ok(decision_id);
     }
 
-    let sim_result = sim.expect("approved simulation");
     let fill = &sim_result.fill;
     let order_id: Uuid = sqlx::query_scalar(
         "INSERT INTO orders (
@@ -1061,12 +1109,97 @@ async fn decide_one(
         .await?;
     } else if strategy.operating_mode == "live_trading" {
         submit_live(
-            pool, vault, cfg, strategy, event, order_id, &fill, side_buy, limit,
+            pool, vault, cfg, strategy, event, order_id, fill, side_buy, limit,
         )
         .await?;
     }
     let _ = notify(pool, strategy.user_id, "order", order_id).await;
     Ok(decision_id)
+}
+
+pub async fn fulfill_approved_decision(
+    pool: &PgPool,
+    vault: &Vault,
+    cfg: &PipelineConfig,
+    _data: &crate::polymarket::http::PublicClient,
+    _app_cfg: &crate::config::Config,
+    decision_id: Uuid,
+    sim_result: crate::engine::CopyFillSim,
+    fee: Option<FeeSchedule>,
+) -> anyhow::Result<()> {
+    let mut tx = begin_as(pool, None, "worker").await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("decision-fulfill:{decision_id}"))
+        .execute(&mut *tx)
+        .await?;
+    let meta: (Uuid, Uuid) = sqlx::query_as(
+        "SELECT strategy_id, source_event_id FROM copy_decisions WHERE id = $1 AND status = 'approved'",
+    )
+    .bind(decision_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let strategy = sqlx::query_as::<_, StrategyRow>(
+        "SELECT s.id, s.user_id, s.trading_account_id, s.source_trader_id, s.enabled, s.sizing_mode,
+                s.allocation_mode, s.allocation_percent,
+                s.fixed_amount_usd, s.proportion, s.multiplier, s.strategy_budget_usd, s.max_position_usd,
+                s.max_exposure_usd, s.max_open_positions, s.max_slippage_bps, s.min_order_usd,
+                s.allow_subminimum_paper_trades,
+                s.copy_small_buys_1to1, s.small_buy_threshold_usd,
+                s.copy_buy, s.copy_sell, s.cooldown_seconds, s.allowed_markets, s.created_at,
+                s.operating_mode,
+                a.operating_mode AS account_operating_mode,
+                a.emergency_stop, a.trading_control_state AS account_trading_control_state,
+                s.trading_control_state AS strategy_trading_control_state,
+                a.live_confirmed_at, a.signature_type, a.funder_address,
+                a.last_exchange_balance_usd, a.status AS account_status,
+                r.max_order_usd, r.max_daily_loss_usd, r.max_exposure_usd AS account_max_exposure,
+                r.max_slippage_bps AS account_max_slippage, r.max_orders_per_interval, r.interval_seconds,
+                r.max_stale_data_seconds, r.paper_cash_usd,
+                t.wallet_address
+         FROM copy_strategies s
+         JOIN source_traders t ON t.id = s.source_trader_id
+         JOIN trading_accounts a ON a.id = s.trading_account_id
+         JOIN account_risk_limits r ON r.trading_account_id = a.id
+         WHERE s.id = $1",
+    )
+    .bind(meta.0)
+    .fetch_one(&mut *tx)
+    .await?;
+    let event = sqlx::query_as::<_, EventRow>(
+        "SELECT id, source_wallet, token_id, condition_id, outcome, market_title, market_slug, side, price, size_shares, notional_usd, usdc_size, event_ts, received_at, origin
+         FROM source_events WHERE id = $1",
+    )
+    .bind(meta.1)
+    .fetch_one(&mut *tx)
+    .await?;
+    let limit: Decimal = sqlx::query_scalar("SELECT limit_price FROM copy_decisions WHERE id = $1")
+        .bind(decision_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let kill: bool = sqlx::query_scalar(
+        "SELECT COALESCE((value->>'enabled')::boolean, false) FROM system_settings WHERE key = 'global_kill_switch'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let side_buy = event.side.eq_ignore_ascii_case("buy");
+    let fee_price = conservative_fee_price(limit, event.price);
+    let _ = fulfill_approved_decision_in_tx(
+        pool,
+        vault,
+        cfg,
+        &strategy,
+        &event,
+        tx,
+        decision_id,
+        side_buy,
+        limit,
+        fee.as_ref(),
+        fee_price,
+        kill,
+        sim_result,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn settle_paper(

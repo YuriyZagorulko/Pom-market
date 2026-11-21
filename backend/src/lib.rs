@@ -13,6 +13,7 @@ pub mod db;
 pub mod email;
 pub mod engine;
 pub mod hard_close;
+pub mod liquidity_retry;
 pub mod paper_settlement;
 pub mod pipeline;
 pub mod position_close;

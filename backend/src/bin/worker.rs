@@ -164,6 +164,18 @@ async fn main() -> anyhow::Result<()> {
         {
             tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "paper settlement tick failed");
         }
+        if let Err(err) = pommarket::liquidity_retry::process_liquidity_retries(
+            &pool,
+            &vault,
+            &books,
+            &pipeline,
+            &client,
+            &cfg,
+        )
+        .await
+        {
+            tracing::warn!(error = %pommarket::security::redact(&err.to_string()), "liquidity retry tick failed");
+        }
         if let Err(err) = pommarket::pipeline::reconcile_live_orders(
             &pool,
             &vault,

@@ -1,4 +1,7 @@
 import { formatNumericInputDisplay } from "@pom/format";
+import { bpsToPercentInputValue, parseMaxSlippagePercentToBps, MAX_SLIPPAGE_HINT } from "./max-slippage";
+
+export { MAX_SLIPPAGE_HINT };
 
 /**
  * Shared serialization for Account Edit → API (avoid FormData stringifying all fields).
@@ -58,7 +61,7 @@ export function accountRiskFormValues(risk: Record<string, string | number>): Ac
   return {
     max_order_usd: formatNumericInputDisplay(risk.max_order_usd),
     max_daily_loss_usd: formatNumericInputDisplay(risk.max_daily_loss_usd),
-    max_slippage_bps: formatNumericInputDisplay(risk.max_slippage_bps),
+    max_slippage_bps: bpsToPercentInputValue(risk.max_slippage_bps),
     paper_cash_usd: formatNumericInputDisplay(risk.paper_cash_usd),
   };
 }
@@ -122,12 +125,9 @@ export function buildAccountRiskPatchBody(form: Record<string, FormDataEntryValu
     if (!parsed.ok) return parsed;
     body[field] = formatNumericInputDisplay(parsed.body);
   }
-  const slippage = parseStrictInt(String(form.max_slippage_bps ?? ""), "Max slippage (bps)", {
-    min: 0,
-    max: 50_000,
-  });
-  if (!slippage.ok) return slippage;
-  body.max_slippage_bps = slippage.body;
+  const slippage = parseMaxSlippagePercentToBps(String(form.max_slippage_bps ?? ""));
+  if (!slippage.ok) return { ok: false, error: slippage.error };
+  body.max_slippage_bps = slippage.bps;
   return { ok: true, body: body as AccountRiskPatchBody };
 }
 

@@ -68,6 +68,9 @@ pub enum RejectReason {
     CredentialsMissing,
     ExchangeUnknown,
     FeeUnknown,
+    InsufficientDepth,
+    LeaderSoldBeforeExecution,
+    RetryTimeout,
     SourceEquityUnavailable,
     SourcePositionValueUnavailable,
     SourcePositionValueStale,
@@ -76,6 +79,24 @@ pub enum RejectReason {
 }
 
 impl RejectReason {
+    pub fn liquidity_retry_eligible(
+        reason: &RejectReason,
+        side_buy: bool,
+        paper_trading: bool,
+        allow_subminimum_paper_trades: bool,
+    ) -> bool {
+        if !side_buy {
+            return false;
+        }
+        if paper_trading && allow_subminimum_paper_trades {
+            return false;
+        }
+        matches!(
+            reason,
+            RejectReason::NoLiquidity | RejectReason::InsufficientDepth
+        )
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::MissingSizing => "missing_sizing",
@@ -85,6 +106,9 @@ impl RejectReason {
             Self::ExposureCap => "exposure_capped",
             Self::Slippage => "slippage_exceeded",
             Self::NoLiquidity => "no_liquidity",
+            Self::InsufficientDepth => "insufficient_depth",
+            Self::LeaderSoldBeforeExecution => "leader_sold_before_execution",
+            Self::RetryTimeout => "retry_timeout",
             Self::NoPosition => "no_position",
             Self::SellLargerThanOpen => "sell_exceeds_open_shares",
             Self::CopySideDisabled => "copy_side_disabled",
@@ -154,6 +178,18 @@ pub fn decision_reason_explain(code: &str) -> Option<(&'static str, &'static str
         "no_liquidity" => (
             "No liquidity within allowed price",
             "The Polymarket CLOB has no depth at or inside your copy limit. Paper mode does not fill at the leader price unless PAPER_ALLOW_SYNTHETIC_FILLS is explicitly enabled.",
+        ),
+        "insufficient_depth" => (
+            "Insufficient book depth",
+            "Some liquidity exists within your limit, but not enough to fill the full copy size at once.",
+        ),
+        "retry_timeout" => (
+            "Liquidity retry timed out",
+            "No fillable liquidity appeared within the short retry window while respecting max slippage.",
+        ),
+        "leader_sold_before_execution" => (
+            "Leader sold before execution",
+            "The leader reduced or closed the position before the copy buy could execute; remaining buy attempts were stopped.",
         ),
         "slippage_exceeded" => (
             "Slippage limit",
@@ -947,6 +983,19 @@ pub fn walk_book(
             .collect()
     };
     if levels.is_empty() {
+        let best = if side_buy {
+            book.asks.iter().find(|l| l.price > Decimal::ZERO)
+        } else {
+            book.bids.iter().find(|l| l.price > Decimal::ZERO)
+        };
+        if let Some(l) = best {
+            if side_buy && l.price > limit {
+                return Err(RejectReason::Slippage);
+            }
+            if !side_buy && l.price < limit {
+                return Err(RejectReason::Slippage);
+            }
+        }
         return Err(RejectReason::NoLiquidity);
     }
     let mut left = want_shares;
@@ -971,6 +1020,10 @@ pub fn walk_book(
     if enforce_exchange_minimums && notional < EXCHANGE_MIN_NOTIONAL {
         return Err(RejectReason::NoLiquidity);
     }
+    let complete = left <= Decimal::new(1, 5);
+    if enforce_exchange_minimums && !complete {
+        return Err(RejectReason::InsufficientDepth);
+    }
     let vwap = (notional / shares).round_dp(6);
     let assessment = match schedule {
         Some(schedule) => taker_fee(shares, vwap, schedule),
@@ -982,7 +1035,7 @@ pub fn walk_book(
         vwap,
         fee_usd: assessment.amount,
         fee_status: assessment.status,
-        complete: left <= Decimal::new(1, 5),
+        complete,
     })
 }
 
@@ -1454,11 +1507,11 @@ mod tests {
             min_order_size: Decimal::ZERO,
         }
         .normalized();
-        let fill = walk_book(&book, true, d("0.50"), d("20"), None, true).unwrap();
-        assert_eq!(fill.shares, d("4"));
-        assert!(!fill.complete);
+        assert_eq!(
+            walk_book(&book, true, d("0.50"), d("20"), None, true).unwrap_err(),
+            RejectReason::InsufficientDepth
+        );
         assert!(walk_book(&book, true, d("0.40"), d("5"), None, true).is_err());
-        assert_eq!(fill.fee_status, "unknown");
     }
 
     #[test]

@@ -60,7 +60,7 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
   const [smallBuyThresholdUsd, setSmallBuyThresholdUsd] = useState("5");
   const [maxTrade, setMaxTrade] = useState("200");
   const [maxOpenPositions, setMaxOpenPositions] = useState("10");
-  const [maxSlippageBps, setMaxSlippageBps] = useState("150");
+  const [maxSlippageBps, setMaxSlippageBps] = useState("1.5");
   const [minOrder, setMinOrder] = useState("1");
   const [cooldownSeconds, setCooldownSeconds] = useState("0");
   const [copyBuy, setCopyBuy] = useState(true);
@@ -494,8 +494,17 @@ export function CopyStrategyCreateWizard({ fixedTraderId, backHref, backLabel }:
           <input id="wiz-max-positions" value={maxOpenPositions} onChange={(e) => setMaxOpenPositions(e.target.value)} />
         </div>
         <div className="form-field">
-          <SimpleFieldLabel htmlFor="wiz-slippage">Max slippage (basis points)</SimpleFieldLabel>
-          <input id="wiz-slippage" value={maxSlippageBps} onChange={(e) => setMaxSlippageBps(e.target.value)} />
+          <SimpleFieldLabel htmlFor="wiz-slippage">Max slippage</SimpleFieldLabel>
+          <input
+            id="wiz-slippage"
+            inputMode="decimal"
+            aria-describedby="wiz-slippage-hint"
+            value={maxSlippageBps}
+            onChange={(e) => setMaxSlippageBps(e.target.value)}
+          />
+          <span id="wiz-slippage-hint" className="muted" style={{ fontSize: 13 }}>
+            Percent (%). Example: 1.5 = 1.5% (150 bps).
+          </span>
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="wiz-min-order">Min order (USD)</SimpleFieldLabel>

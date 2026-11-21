@@ -40,6 +40,18 @@ const REASONS: Record<string, { title: string; detail: string }> = {
     detail:
       "The best available CLOB price is too far from the leader trade or your limit. Paper copy was not executed.",
   },
+  insufficient_depth: {
+    title: "Insufficient book depth",
+    detail: "Some liquidity was within your limit, but not enough to fill the full copy size.",
+  },
+  retry_timeout: {
+    title: "Liquidity retry timed out",
+    detail: "No fillable liquidity appeared within the short retry window while respecting max slippage.",
+  },
+  leader_sold_before_execution: {
+    title: "Leader sold before execution",
+    detail: "The leader exited before the copy buy could execute; remaining attempts were stopped.",
+  },
   fee_unknown: {
     title: "Unable to determine market trading fee",
     detail:

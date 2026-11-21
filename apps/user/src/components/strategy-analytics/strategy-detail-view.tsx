@@ -10,6 +10,7 @@ import { useToast } from "@/components/toast";
 import { CopyDecisionActivityCard, type CopyDecisionActivityRow } from "@/components/copy-decision-activity-card";
 import { StrategyActivityPanel } from "@/components/strategy-activity-panel";
 import { formatNumericInputDisplay } from "@pom/format";
+import { bpsToPercentInputValue, MAX_SLIPPAGE_HINT, parseMaxSlippagePercentToBps } from "@/lib/max-slippage";
 import { pnlClass, pct, usd } from "@/lib/strategy-analytics-format";
 import { useSession } from "@/lib/session";
 import type { CapitalFundingStatus } from "@/lib/strategy-capital-status";
@@ -561,6 +562,14 @@ export function StrategySettingsForm({
       return;
     }
     const form = Object.fromEntries(new FormData(event.currentTarget).entries());
+    if (form.max_slippage_bps !== undefined) {
+      const slip = parseMaxSlippagePercentToBps(String(form.max_slippage_bps));
+      if (!slip.ok) {
+        toast.error(slip.error);
+        return;
+      }
+      form.max_slippage_bps = String(slip.bps);
+    }
     const body: Record<string, unknown> = {
       ...form,
       copy_buy: form.copy_buy === "on",
@@ -841,8 +850,16 @@ export function StrategySettingsForm({
           </label>
         </div>
         <div className="form-field">
-          <SimpleFieldLabel htmlFor="max_slippage_bps">Max slippage (bps)</SimpleFieldLabel>
-          <NumericInput id="max_slippage_bps" name="max_slippage_bps" inputMode="numeric" defaultValue={data.max_slippage_bps as string | number} />
+          <SimpleFieldLabel htmlFor="max_slippage_bps">Max slippage</SimpleFieldLabel>
+          <NumericInput
+            id="max_slippage_bps"
+            name="max_slippage_bps"
+            inputMode="decimal"
+            defaultValue={bpsToPercentInputValue(data.max_slippage_bps as string | number)}
+          />
+          <p className="muted" style={{ margin: 0, fontSize: 13 }}>
+            {MAX_SLIPPAGE_HINT} Enter as percent (1.5 = 1.5%).
+          </p>
         </div>
         <div className="form-field">
           <SimpleFieldLabel htmlFor="cooldown_seconds">Cooldown between decisions (seconds)</SimpleFieldLabel>
